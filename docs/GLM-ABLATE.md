@@ -14,7 +14,7 @@ Per-layer mode, the one I use: before layer `l`'s FFN output is written into the
 x = x - scale * (x . v) v      for each of the layer's directions v
 ```
 
-After the write every stream is orthogonal to the directions of that layer. It is the same operation my [exllamav3 fork](https://github.com/alesha-pro/exllamav3) does after each block. The MTP draft block is left alone.
+After the write every stream is orthogonal to the directions of that layer. It is the same operation my [exllamav3 fork](https://github.com/alesha-pro/exllamav3-glm53-4x3090) does after each block. The MTP draft block is left alone.
 
 There is also an "outputs" mode: one set of directions for all layers, removed from the token embedding and from every attention and FFN output.
 
@@ -48,7 +48,7 @@ Refusals, 178 answers (64 held-out AdvBench and 82 JailbreakBench requests witho
 |---|---:|---:|---:|
 | Maya-M with the vector | 2 | 4 | 0 |
 
-The 2 refusals are requests about suicide and self-harm that the model turns into text about prevention. I left them as they are. The directions were found on the EXL3 2.05 bpw quant of the same model, where the full run (146 requests in 3 modes) gives 0 refused of 438 answers. How they were found: [abliteration write-up](https://github.com/alesha-pro/exllamav3/blob/glm53-4x3090/glm53/abliteration/README.md).
+The 2 refusals are requests about suicide and self-harm that the model turns into text about prevention. I left them as they are. The directions were found on the EXL3 2.05 bpw quant of the same model, where the full run (146 requests in 3 modes) gives 0 refused of 438 answers. How they were found: [abliteration write-up](https://github.com/alesha-pro/exllamav3-glm53-4x3090/blob/glm53-4x3090/glm53/abliteration/README.md).
 
 Speed through the chat API (answers run to their natural end, thinking off, temperature 0):
 
