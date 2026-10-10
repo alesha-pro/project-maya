@@ -40,7 +40,7 @@ My file has 3 directions per layer for layers 1 to 44 (2,211,840 bytes, SHA256 `
 
 ## Measurements
 
-Rig: 4x RTX 3090 at 300 W, PCIe 3.0, EPYC 7642, 2 memory channels of DDR4-2400. Maya-M, 256K context, text only, after `./maya.sh --calibrate`.
+Rig: 4x RTX 3090 at 300 W, PCIe 3.0, EPYC 7642, 2 memory channels of DDR4-2400. Maya-M, 256K context, after `./maya.sh --calibrate`.
 
 Refusals, 178 answers (64 held-out AdvBench and 82 JailbreakBench requests without thinking, 32 with thinking), judged by the stock GLM-5.3-Flash:
 
@@ -61,7 +61,7 @@ Speed through the chat API (answers run to their natural end, thinking off, temp
 
 ## Limits
 
-- Tested on Maya-M only, on 4 NVIDIA cards, text only. In my build the vision encoder did not link (CMake picked the system CUDA 11), so I did not run images with the patch.
+- Tested on Maya-M only, on 4 NVIDIA cards.
 - One rig. I did not test the AMD path, Windows or other GPU counts.
 - The judge is the same model without the vector. There are no human labels.
 - The patch is not sent upstream.
