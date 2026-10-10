@@ -4,12 +4,9 @@ This branch is Project Maya v1.0.27 plus one small patch. The patch removes chos
 
 Maya and its quants are the work of mw00 and PeasantSmith: [mw00/project-maya](https://github.com/mw00/project-maya), [peasantsmith/GLM-5.3-Flash-Maya-GGUF](https://huggingface.co/peasantsmith/GLM-5.3-Flash-Maya-GGUF). Maya grew out of [Strata](https://github.com/Niko1221/Strata) by Niko1221. My part is the 3 files listed below and the vector.
 
-## What the patch does
+## The patch
 
-Strata has control vectors for Qwen. Maya's GLM path had none. I added:
-
-- `src/core/glm_ablate.cuh`: a CUDA kernel that projects K orthonormal directions out of every row it is given, and the loader for the vector file;
-- calls in `src/core/glm_fast_path.cu` (decode) and `src/core/glm_prefill.cu` (the batched prompt path).
+Strata has control vectors for Qwen. Maya's GLM path had none. I added `src/core/glm_ablate.cuh`, which holds a CUDA kernel that projects K orthonormal directions out of every row it is given and the loader for the vector file. The kernel is called from the decode path in `src/core/glm_fast_path.cu` and from the batched prompt path in `src/core/glm_prefill.cu`.
 
 Per-layer mode, the one I use: before layer `l`'s FFN output is written into the hyper-connection streams, both operands of that write (the FFN output and the 4 streams) lose their components along layer `l`'s directions:
 
@@ -41,7 +38,7 @@ The script adds 2 entries to the `env` section of the config:
 
 My file has 3 directions per layer for layers 1 to 44 (2,211,840 bytes, SHA256 `b0debc326b06c956039fd75dc1cb759dd46c4aa5e868bbfef1a5b0607c3552b7`).
 
-## What I measured
+## Measurements
 
 Rig: 4x RTX 3090 at 300 W, PCIe 3.0, EPYC 7642, 2 memory channels of DDR4-2400. Maya-M, 256K context, text only, after `./maya.sh --calibrate`.
 
