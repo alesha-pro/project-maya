@@ -1,3 +1,5 @@
+> **This is a fork.** Branch `glm-ablate` is [mw00/project-maya](https://github.com/mw00/project-maya) v1.0.27 plus a small patch that projects refusal directions out of GLM-5.3-Flash at run time. See [docs/GLM-ABLATE.md](docs/GLM-ABLATE.md). The text below is the upstream README, unchanged. For Maya itself use upstream.
+
 <h1 align="center">Project Maya</h1>
 
 <p align="center"><b>Run GLM-5.3-Flash - a 321-billion-parameter AI model - on your own GPU(s)</b><br>
