@@ -146,6 +146,8 @@ struct Shard {
 struct Model::Impl {
     Options o;
     std::vector<std::unique_ptr<strata::GgufFile>> files;
+    std::vector<std::unique_ptr<strata::GgufFile>> draft_files;
+    std::map<std::string, std::pair<const strata::GgufFile*, const strata::TensorInfo*>> draft_tensors;
     int E = 0, hc = 0, L = 0, V = 0, q_lora = 0, kvl = 0, nope = 0, rope = 0, vh = 0, Hd = 0, Hs = 0, win = 0, IH = 0,
         IK = 0, top_k = 0, kpool = 0, tail = 0, n_exp = 0, n_used = 0, n_ffx = 0, latent = 0, dense_lead = 0, n_ff = 0;
     float eps = 1e-5f, hc_eps = 1e-6f, hc_mag = 2.0f, w_scale = 1.0f, clampv = 10.0f, theta = 1e7f, theta_swa = 1e4f;
@@ -168,12 +170,37 @@ struct Model::Impl {
 #endif
 
     const strata::TensorInfo* find(const std::string& n, const strata::GgufFile** f) const {
+        auto draft = draft_tensors.find(n);
+        if (draft != draft_tensors.end()) {
+            *f = draft->second.first;
+            return draft->second.second;
+        }
         for (const auto& g : files)
             if (const strata::TensorInfo* t = g->find(n)) {
                 *f = g.get();
                 return t;
             }
         return nullptr;
+    }
+    void load_draft_experts(const char* path, bool down_only) {
+        if (!path || !*path) return;
+        auto file = std::make_unique<strata::GgufFile>(path);
+        int gate_type = -1;
+        for (const char* part : {"gate", "up", "down"}) {
+            if (down_only && std::strcmp(part, "down")) continue;
+            const std::string name = "blk." + std::to_string(L) + ".ffn_" + part + "_exps.weight";
+            const strata::GgufFile* base = nullptr;
+            const auto* original = find(name, &base);
+            const auto* replacement = file->find(name);
+            if (!original || !replacement || original->shape != replacement->shape ||
+                (replacement->type != T_Q3_K && replacement->type != T_Q4_K))
+                throw std::runtime_error("hy4f: incompatible draft expert tensor " + name);
+            if (!std::strcmp(part, "gate")) gate_type = (int) replacement->type;
+            if (!std::strcmp(part, "up") && (int) replacement->type != gate_type)
+                throw std::runtime_error("hy4f: incompatible draft gate/up types");
+            draft_tensors[name] = {file.get(), replacement};
+        }
+        draft_files.emplace_back(std::move(file));
     }
     uint64_t mu_(const std::string& k) const {
         const strata::MetaValue* v = files[0]->get("hy_v4_flash." + k);
@@ -942,6 +969,8 @@ bool Model::load(const Options& o, std::string& err) {
         d.S = (int) devs.size();
         if (d.S != 4 && d.S != 2 && d.S != 1) throw std::runtime_error("hy4f: 1, 2 or 4 GPUs");
         d.geometry();
+        d.load_draft_experts(std::getenv("HY4F_MTP_EXPERT_GGUF"), false);
+        d.load_draft_experts(std::getenv("HY4F_MTP_DOWN_GGUF"), true);
         d.load_engram();
         HY_CK(cudaHostAlloc((void**) &d.hio, sizeof(Io), cudaHostAllocPortable));
         HY_CK(cudaHostAlloc((void**) &d.hlogits, sizeof(float) * d.V, cudaHostAllocPortable));
