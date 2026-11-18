@@ -327,7 +327,7 @@ struct Sampler {
             acc += v.second;
             if (u <= acc) return v.first;
         }
-        return p.back().first;
+        return p.empty() ? 0 : p.back().first;
     }
     static void residual(const Sparse& p, const Sparse& q, Sparse& out) {
         out.clear();
