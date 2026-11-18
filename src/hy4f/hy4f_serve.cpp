@@ -42,6 +42,7 @@
 #include "hy4f_serve.hpp"
 #include "hy4f_draft_width.hpp"
 #include "hy4f_prompt_lookup.hpp"
+#include "hy4f_jacobi_probe.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -738,11 +739,13 @@ int serve(Model& m, const ServeOptions& so) {
         };
         // one token out: false when the answer ends with it (an end token, max_new)
         PromptLookup lookup(r.ids, spec && !rows);
+        JacobiProbe jacobi(spec && !rows);
         bool borrowed = false;
         auto emit = [&](int t) -> bool {
             lookup.append(t);
             std::printf("T %d\n", t);
             ++produced;
+            jacobi.emitted(t);
             if (in_think && t == r.think_end) in_think = false;
             if (produced % 8 == 0) stat_line();
             std::fflush(stdout);
@@ -870,6 +873,7 @@ int serve(Model& m, const ServeOptions& so) {
                 if (!emit(y)) more = false;
                 break;
             }
+            jacobi.step(int(pos - (int64_t)n), kk, acc, am, dr);
             d_off += kk;
             d_acc += acc;
             if (!more || !spec) continue;
@@ -882,6 +886,7 @@ int serve(Model& m, const ServeOptions& so) {
         }
         stat_line();
         const double t2 = now_ms();
+        jacobi.report(counter, n);
         in.finished();   // A WRAP after DONE can only belong to a later queued request.
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, n, t1 - t0, t2 - t1, finish, d_acc, d_off,
                     from);
