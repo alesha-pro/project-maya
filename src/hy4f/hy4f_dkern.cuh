@@ -442,6 +442,14 @@ __global__ void kd_ar_tail(const float* __restrict__ x1, const float* __restrict
     }
     kd_post_done(counter, arrive, step);
 }
+// Stream-ordered after the peer DMA operation. The following sublayer's
+// all-reduce orders every receiver before this receive slot is reused.
+__global__ void kd_cb_publish(int* flag, int me, const int* counter) {
+    if (threadIdx.x == 0) {
+        const int step = *counter + 1;
+        asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(flag+me), "r"(step) : "memory");
+    }
+}
 // combine tail: block b = (t, hl)
 __global__ void kd_cb_tail(const float* __restrict__ part, int T, int H, int kvl, int W, int h0, int Hl,
                            const float* __restrict__ sinks_all, PeersD P, int me, int n_shards, int* counter, int* arrive,

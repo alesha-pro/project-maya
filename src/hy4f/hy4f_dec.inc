@@ -448,7 +448,26 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                 kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp,
                                                         win, S, s.g, nullptr, scale, nullptr, d.part, Hd);
             }
-            if (push_seq)
+            PeersD cb = d.cb;
+            if (std::getenv("HY4F_CB_DMA") && push_seq) {
+                // This exchange is followed by a blocking residual reduction
+                // on every rank. A single receive slot therefore suffices.
+                const size_t slice = (size_t) Hl * CBW();
+                for (int j=0;j<S;++j) cb.buf[j][1]=cb.buf[j][0];
+                for (int r=1;r<S;++r) {
+                    const int j=(s.g+r)%S;
+                    cudaMemcpy3DPeerParms copy{};
+                    copy.srcDevice=s.dev;
+                    copy.dstDevice=sh[j].dev;
+                    copy.srcPtr=make_cudaPitchedPtr(d.part+(size_t)j*slice,
+                        (size_t)Hd*CBW()*sizeof(float),(size_t)Hd*CBW()*sizeof(float),T);
+                    copy.dstPtr=make_cudaPitchedPtr(cb.buf[j][0]+(size_t)s.g*T*slice,
+                        slice*sizeof(float),slice*sizeof(float),T);
+                    copy.extent=make_cudaExtent(slice*sizeof(float),T,1);
+                    HY_CK(cudaMemcpy3DPeerAsync(&copy,s.st));
+                    kd_cb_publish<<<1,32,0,s.st>>>(cb.flag[j],s.g,d.cb_ctr);
+                }
+            } else if (push_seq)
                 (push_one ? kd_push_seq1 : kd_push_seq)<<<ar_push_blocks, 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd,
                                                                                     CBW(), Hl, d.cb, s.g, S, d.cb_ctr, d.arrive + 8);
             else if (push_all)
@@ -459,7 +478,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                     kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd, CBW(), Hl, d.cb, s.g,
                                                                (s.g + r) % S, d.cb_ctr, d.arrive + 8);
             kd_cb_tail<<<T * Hl, 256, 0, s.st>>>(d.part, T, Hd, kvl, CBW(), s.g * Hl, Hl, f32(s, P + "attn_sinks.weight"),
-                                                 d.cb, s.g, S, d.cb_ctr, d.arrive + 12, d.o);
+                                                 cb, s.g, S, d.cb_ctr, d.arrive + 12, d.o);
         } else {
             kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp, win,
                                                     1, 0, f32(s, P + "attn_sinks.weight"), scale, d.o, nullptr, Hd);
