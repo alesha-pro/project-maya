@@ -5,7 +5,7 @@
 namespace strata::hy4f::kern {
 template<int H>
 __global__ void kb_mqa_queries(const float* qabs, const float* q, int ldq, int qs,
-                               int nope, float theta, int start, float scale, __half* dst) {
+                               int nope, float theta, int start, float scale, __half* dst, const int* device_start = nullptr) {
     constexpr int D = 576;
     const int t = blockIdx.y, c0 = blockIdx.x * blockDim.x + threadIdx.x;
     if (c0 >= H*D) return;
@@ -16,7 +16,8 @@ __global__ void kb_mqa_queries(const float* qabs, const float* q, int ldq, int q
         int j = c-512, jj=j/2;
         const float* pe = q + (size_t)t*ldq + h*qs + nope + 2*jj;
         float sn, cs;
-        sincosf((float)(start+t) * powf(theta, -2.0f*jj/64), &sn, &cs);
+        const int pos = (device_start ? *device_start : start) + t;
+        sincosf((float)pos * powf(theta, -2.0f*jj/64), &sn, &cs);
         v = (j&1) ? pe[0]*sn + pe[1]*cs : pe[0]*cs - pe[1]*sn;
     }
     dst[(size_t)t*H*D+c0] = __float2half_rn(v*scale);

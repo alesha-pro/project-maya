@@ -100,6 +100,7 @@ struct DShard {
     cudaStream_t side = nullptr;
     cudaEvent_t fork = nullptr, projected = nullptr, shared_done = nullptr;
     Q81* shq = nullptr;
+    __half* packed_query = nullptr;
     IoT *dio_v = nullptr, *dio_m = nullptr;
     float *X = nullptr, *x = nullptr, *h = nullptr, *post = nullptr, *hcp = nullptr, *hcs = nullptr, *ones = nullptr;
     float *xp = nullptr, *qr = nullptr, *qp = nullptr, *qabs = nullptr, *o = nullptr, *part = nullptr, *a = nullptr,
@@ -205,6 +206,8 @@ void dec_alloc(Shard& s, DShard& d) {
     d.eloc = ia((size_t) DT * K);
     d.xm = dalloc((size_t) DT * xml);
     d.ga16 = dalloc((size_t) DT * K * 2 * n_ffx);
+    if (std::getenv("HY4F_PACK_QUERY"))
+        HY_CK(cudaMalloc(&d.packed_query, sizeof(__half) * size_t(DT) * Ha * 576));
     d.dn16 = dalloc((size_t) DT * K * latent);
     d.moe = dalloc((size_t) DT * latent);
     d.mu = dalloc((size_t) DT * E);
@@ -462,9 +465,9 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     const bool split = !std::getenv("HY4F_DEC_ATTN2");
     const bool pack_query = std::getenv("HY4F_PACK_QUERY") && split && kb.type==T_Q8_0 && kvl==512 && rope==64
         && ((sw && Hl==16) || (!sw && S>1 && Hd==32)) && (size_t)Ha*576<=size_t(n_used)*2*n_ffx*2;
-    __half* qh=pack_query ? reinterpret_cast<__half*>(d.ga16) : nullptr;
+    __half* qh = pack_query ? d.packed_query : nullptr;
     if (kb.packed_projection) {
-        ProjectionArgs args{(const uint8_t*)kb.d, d.qp, Ha, qpc, QH, d.qabs, qh, pp, th, scale};
+        ProjectionArgs args{(const uint8_t*)kb.d, d.qp, Ha, qpc, QH, d.qabs, nullptr, pp, th, scale};
         if (local_queries) {
             const size_t first_row=(size_t)query_first*kvl;
             args.w+=first_row*nope;
@@ -476,16 +479,22 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         const uint8_t* kw = (const uint8_t*)kb.d + (size_t)query_first*kvl*kb.rb;
         const int g = nb(Ha * kvl * 32);
         switch (T) {
-        case 1: (pack_query ? kd_absorb<1,true> : kd_absorb<1,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
-        case 2: (pack_query ? kd_absorb<2,true> : kd_absorb<2,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
-        case 3: (pack_query ? kd_absorb<3,true> : kd_absorb<3,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
-        case 4: (pack_query ? kd_absorb<4,true> : kd_absorb<4,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
-        case 5: (pack_query ? kd_absorb<5,true> : kd_absorb<5,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
-        default: (pack_query ? kd_absorb<6,true> : kd_absorb<6,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
+        case 1: kd_absorb<1><<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
+        case 2: kd_absorb<2><<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
+        case 3: kd_absorb<3><<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
+        case 4: kd_absorb<4><<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
+        case 5: kd_absorb<5><<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
+        default: kd_absorb<6><<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
         }
     }
     else
         kb_absorb_bf16<<<dim3(nb(Ha * kvl), T), 256, 0, s.st>>>((const uint16_t*) kb.d, d.qp, qpc, QH, d.qabs, nope, kvl, Ha);
+    if (qh) {
+        const dim3 grid(nb(Ha * 576), T);
+        if (Ha == 32) kb_mqa_queries<32><<<grid,256,0,s.st>>>(d.qabs,d.qp,qpc,QH,nope,th,0,scale,qh,pp);
+        else if (Ha == 16) kb_mqa_queries<16><<<grid,256,0,s.st>>>(d.qabs,d.qp,qpc,QH,nope,th,0,scale,qh,pp);
+        else kb_mqa_queries<8><<<grid,256,0,s.st>>>(d.qabs,d.qp,qpc,QH,nope,th,0,scale,qh,pp);
+    }
     if (side) HY_CK(cudaStreamWaitEvent(s.st, d.attention_join));
     const int value_groups = T<=2 && std::getenv("HY4F_VALUE_GROUPS") ? 4 : 1;
     if (sw) {
