@@ -80,7 +80,7 @@ public:
     /// past it aliases a row it needs) or where mark()'s copy does, else the start of pos's indexer group where that is
     /// enough, else 0.  The MTP layer's caches follow best effort (a stale row only costs draft acceptance).  Returns
     /// the position kept (<= pos), -1 on a CUDA error (err).
-    int64_t rewind(int64_t pos, std::string& err);
+    int64_t rewind(int64_t pos, std::string& err, bool restore_prompt = false);
     /// back to position 0 (no copy: the caches are overwritten as the positions come again)
     void reset();
     /// copy the rings (trunk and MTP layer) as they are now (the prompt read, before the answer): a later rewind to

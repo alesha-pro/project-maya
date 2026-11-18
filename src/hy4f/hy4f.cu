@@ -1394,6 +1394,13 @@ bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
 // stale MTP row only costs draft acceptance, never a token (every draft is verified by the trunk).
 struct Model::Snap {
     int64_t pos = -1;                                   // the position mark() copied at (-1: none)
+    std::vector<int> devices;
+    ~Snap() {
+        for (size_t i=0; i<devices.size(); ++i) {
+            cudaSetDevice(devices[i]);
+            for (const auto& item : rows[i]) cudaFree(item.second);
+        }
+    }
     std::vector<std::map<int, void*>> rows;             // per shard: layer -> its ring's copy
 };
 
@@ -1473,8 +1480,15 @@ bool Model::mark(std::string& err) {
         if (!snap_) {
             snap_ = std::make_shared<Snap>();
             snap_->rows.resize(d.S);
+            snap_->devices.reserve(d.S);
             for (auto& s : d.sh) {
                 HY_CK(cudaSetDevice(s.dev));
+                snap_->devices.push_back(s.dev);
+                if (d.has_mtp && std::getenv("HY4F_PREFIX_TURN_MARK")) {
+                    void* hidden = nullptr;
+                    HY_CK(cudaMalloc(&hidden, sizeof(float) * d.E));
+                    snap_->rows[s.g][Lm] = hidden;
+                }
                 for (int il = 0; il < Lm; ++il) {
                     void* p = nullptr;
                     HY_CK(cudaMalloc(&p, serve_ring(s, il, d.swa[il] != 0, d.win, d.kpool, d.IK).second));
@@ -1484,6 +1498,9 @@ bool Model::mark(std::string& err) {
         }
         for (auto& s : d.sh) {
             HY_CK(cudaSetDevice(s.dev));
+            const auto hidden = snap_->rows[s.g].find(Lm);
+            if (hidden != snap_->rows[s.g].end())
+                HY_CK(cudaMemcpyAsync(hidden->second, d.bsh[s.g].hprev, sizeof(float)*d.E, cudaMemcpyDeviceToDevice, s.st));
             for (int il = 0; il < Lm; ++il) {
                 const auto r = serve_ring(s, il, d.swa[il] != 0, d.win, d.kpool, d.IK);
                 HY_CK(cudaMemcpyAsync(snap_->rows[s.g][il], r.first, r.second, cudaMemcpyDeviceToDevice, s.st));
@@ -1502,7 +1519,7 @@ bool Model::mark(std::string& err) {
     }
 }
 
-int64_t Model::rewind(int64_t pos, std::string& err) {
+int64_t Model::rewind(int64_t pos, std::string& err, bool restore_prompt) {
     try {
         Impl& d = *d_;
         const int Lm = d.L + (d.has_mtp ? 1 : 0);
@@ -1517,10 +1534,21 @@ int64_t Model::rewind(int64_t pos, std::string& err) {
             return swa_ok && idx_ok;
         };
         const int64_t m = snap_ ? snap_->pos : -1;
-        if (pos > 0 && !keeps(pos, hw_)) {
-            if (m > 0 && (pos == m || pos == m - 1) && keeps(pos, m)) {
+        if (pos > 0 && ((restore_prompt && pos == m) || !keeps(pos, hw_))) {
+            const int64_t down = has_dsa ? pos - pos % d.kpool : 0;
+            const bool can_round = down > 0 && keeps(down, hw_);
+            const bool earlier_turn = std::getenv("HY4F_PREFIX_TURN_MARK") && m > 0 && m < pos &&
+                                      !can_round && m >= prefix_pos_;
+            if (earlier_turn || (m > 0 && (pos == m || pos == m - 1) && keeps(pos, m))) {
+                if (earlier_turn) pos = m;
                 for (auto& s : d.sh) {
                     HY_CK(cudaSetDevice(s.dev));
+                    const auto hidden = snap_->rows[s.g].find(Lm);
+                    if (pos == m && hidden != snap_->rows[s.g].end()) {
+                        HY_CK(cudaMemcpyAsync(d.bsh[s.g].hprev, hidden->second, sizeof(float)*d.E, cudaMemcpyDeviceToDevice, s.st));
+                        if (!d.dsh.empty())
+                            HY_CK(cudaMemcpyAsync(d.dsh[s.g].h, hidden->second, sizeof(float)*d.E, cudaMemcpyDeviceToDevice, s.st));
+                    }
                     for (int il = 0; il < Lm; ++il) {
                         const auto r = serve_ring(s, il, d.swa[il] != 0, d.win, d.kpool, d.IK);
                         HY_CK(cudaMemcpyAsync(r.first, snap_->rows[s.g][il], r.second, cudaMemcpyDeviceToDevice, s.st));
@@ -1531,7 +1559,7 @@ int64_t Model::rewind(int64_t pos, std::string& err) {
                     HY_CK(cudaStreamSynchronize(s.st));
                 }
                 hw_ = m;                                // (the rings as they were at m)
-            } else if (const int64_t down = has_dsa ? pos - pos % d.kpool : 0; down > 0 && keeps(down, hw_)) {
+            } else if (can_round) {
                 pos = down;                             // (the indexer group's start: < kpool tokens read again)
             } else if (prefix_pos_ > 0 && prefix_pos_ <= pos) {
                 transfer_prefix(false);

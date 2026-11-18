@@ -512,6 +512,8 @@ int serve(Model& m, const ServeOptions& so) {
     Sampler sampler;
     unsigned long long counter = 0;
     bool mark_ok = true;
+    const bool turn_mark = std::getenv("HY4F_PREFIX_TURN_MARK") != nullptr;
+    size_t saved_prompt = 0;
     bool prefix_mark = std::getenv("HY4F_PREFIX_CHECKPOINT") != nullptr;
     std::string line;
     std::vector<float> lgT((size_t) 4 * V);   // verify's rows (sampling, penalties, a bias)
@@ -574,7 +576,7 @@ int serve(Model& m, const ServeOptions& so) {
         // the cache's shared start (the last prompt token is always read again); a picture before it in the cache or
         // the request must be in both, the same pixels at the same start (its rows have no token ids to compare)
         size_t from = 0;
-        while (from < state.size() && from + 1 < n && state[from] == r.ids[from]) ++from;
+        while (from < state.size() && from < n && state[from] == r.ids[from]) ++from;
         for (const Held& q : held)
             if (q.start < (long long) from && std::none_of(pics.begin(), pics.end(), [&](const Pic& x) {
                     return x.start == q.start && x.hash == q.hash; }))
@@ -583,7 +585,12 @@ int serve(Model& m, const ServeOptions& so) {
             if (x.start < (long long) from && std::none_of(held.begin(), held.end(), [&](const Held& q) {
                     return x.start == q.start && x.hash == q.hash; }))
                 from = (size_t) x.start;
-        const int64_t kept = m.rewind((int64_t) from, err);
+        const bool full_hit = turn_mark && saved_prompt == n && from == n;
+        if (!full_hit) {
+            saved_prompt = 0;
+            from = std::min(from, n - 1);
+        }
+        const int64_t kept = m.rewind((int64_t) from, err, full_hit);
         if (kept < 0) fatal("rewind: " + err, 0, n);
         if ((size_t) kept != from)
             std::fprintf(stderr, "maya hy4f serve: the prompt departs from the cache at %zu (the rings no longer hold it): "
@@ -634,6 +641,7 @@ int serve(Model& m, const ServeOptions& so) {
             std::printf("PP %zu %zu %.1f %.1f %zu\n", done, n, ms, ms > 0 ? 1000.0 * (double) (done - from) / ms : 0.0, from);
             std::fflush(stdout);
         };
+        if (full_hit && from == n) pp_line(n);
         for (size_t a = from; a < n;) {
             const int T = (int) std::min<size_t>((size_t) CH, n - a);
             const bool last = a + (size_t) T == n;
@@ -665,11 +673,12 @@ int serve(Model& m, const ServeOptions& so) {
             std::fflush(stdout);
             continue;
         }
-        if (mark_ok && !m.mark(err)) {   // (the rings at the prompt's end: the next turn may go back here)
+        if (mark_ok && !full_hit && !m.mark(err)) {   // (the rings at the prompt's end: the next turn may go back here)
             std::fprintf(stderr, "maya hy4f serve: no copy of the rings (%s) - a turn that departs from the answer "
                                  "reads its prompt again\n", err.c_str());
             mark_ok = false;
         }
+        if (turn_mark && mark_ok) saved_prompt = n;
         ++counter;
         std::mt19937_64 rng(r.seed != 0 ? r.seed : 0x9E3779B97F4A7C15ull * counter);
         long long produced = 0;
