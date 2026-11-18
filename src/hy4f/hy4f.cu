@@ -1593,8 +1593,15 @@ bool Model::load_host_prefix(int i, int64_t pos, std::string& err) {
         prefix_pos_ = -1;
         if (snap_) snap_->pos = -1;
         d_->pos_next = hw_ = 0;
+        // The host checkpoint contains the canonical rows and short dense
+        // prefix. Borrowed sparse stripes belong to the previous branch.
+        if (d_->sparse_limit) {
+            d_->sparse_valid = false;
+            d_->sparse_high = 0;
+        }
         transfer_host_prefix(*host_prefixes_[i], pos, false);
         d_->pos_next = hw_ = pos;
+        d_->sparse_high = (int)std::min<int64_t>(pos,d_->sparse_limit);
         return true;
     } catch (const std::exception& e) { err = e.what(); return false; }
 }
