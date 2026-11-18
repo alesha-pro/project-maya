@@ -340,6 +340,7 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
             for (int parity = 0; parity < 2; ++parity)
                 ar.buf[j][parity] += offset;
     }
+    const bool scatter = std::getenv("HY4F_HC_SCATTER") != nullptr;
     const bool overlap = ll_overlap && ar.bf == 2 && nx && !mtp && E == 3072 && T <= 4 && !tail_old;
     if (overlap) {
         dim3 grid(E / 256 + 1, T);
@@ -349,7 +350,7 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
                                     *nx, d.ysc, d.tpart, d.tppost);
         std::apply([&](auto&... val) {
             void* params[] = { (void*)&val... };
-            HY_CK(cudaLaunchCooperativeKernel((const void*)kd_art_a<true>, grid, dim3(256), params, 0, s.st));
+            HY_CK(cudaLaunchCooperativeKernel((const void*)(scatter ? kd_art_a<true,false,true> : kd_art_a<true>), grid, dim3(256), params, 0, s.st));
         }, args);
     } else if (ar.bf == 4)
         kd_push_ll4<<<1, 256, 0, s.st>>>(x1, x2, tn, ar, s.g, S, counter, generations);
@@ -368,7 +369,7 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
         if (!overlap && !d.hc_side && ar.bf>=2 && std::getenv("HY4F_HC_COLUMNS"))
             kd_art_columns<<<dim3(E/256,T,4),256,0,s.st>>>(x1,x2,T,E,ar,s.g,S,counter,d.arrive+4,
                 f32(s,norm),d.X,d.post,hc,*nx,d.ysc,d.tpart,d.tppost);
-        else if (!overlap) (d.hc_side ? kd_art_a<false,true> : kd_art_a<false,false>)<<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, ar, s.g, S, counter, d.arrive + 4, f32(s, norm), d.X, d.post,
+        else if (!overlap) (d.hc_side ? kd_art_a<false,true> : scatter ? kd_art_a<false,false,true> : kd_art_a<false,false>)<<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, ar, s.g, S, counter, d.arrive + 4, f32(s, norm), d.X, d.post,
                                                      hc, *nx, d.ysc, d.tpart, d.tppost);
         if (d.hc_side) HY_CK(cudaStreamWaitEvent(s.st,d.hc_join));
         kd_art_b<<<dim3(E / 256, T), 256, 0, s.st>>>(E, f32(s, norm), eps, d.X, d.post, hc, *nx, hc_eps, d.ysc, d.tpart, d.tppost,

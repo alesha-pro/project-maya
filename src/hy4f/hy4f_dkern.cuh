@@ -1390,7 +1390,21 @@ __global__ void kd_art_prepare(const float* X, int n, int hc, HcNext nx, float* 
         part[((size_t)t*gridDim.x+b)*32+(tid<8?1+tid:9+tid)]=v;
     }
 }
-template<bool FusedSend = false, bool Prepared = false>
+// Each lane keeps only the columns with its own bit at each XOR stage.
+template<int Distance>
+__device__ __forceinline__ void art_reduce_columns(float (&a)[32], int lane) {
+    const bool high = (lane & Distance) != 0;
+#pragma unroll
+    for (int j = 0; j < Distance; ++j) {
+        const float low_value = a[j], high_value = a[j + Distance];
+        const float kept = high ? high_value : low_value;
+        const float remote = __shfl_xor_sync(0xffffffffu, high ? low_value : high_value, Distance);
+        // Lower-indexed input is added first, just as in lane zero's tree.
+        a[j] = high ? remote + kept : kept + remote;
+    }
+    if constexpr (Distance > 1) art_reduce_columns<Distance / 2>(a, lane);
+}
+template<bool FusedSend = false, bool Prepared = false, bool Scatter = false>
 __global__ void __launch_bounds__(256) kd_art_a(const float* __restrict__ x1, const float* __restrict__ x2, int T, int n,
                                                 PeersD P, int me, int n_shards, int* counter, int* arrive,
                                                 const float* __restrict__ nw, const float* __restrict__ X,
@@ -1461,11 +1475,17 @@ __global__ void __launch_bounds__(256) kd_art_a(const float* __restrict__ x1, co
     for (int s2 = 0; s2 < 4; ++s2) a[27 + s2] = xs[s2] * yp;
     a[31] = yp * yp;
     __shared__ float red[8][33];
+    if constexpr (Scatter) {
+        static_assert(!Prepared);
+        art_reduce_columns<16>(a, lane);
+        red[wid][lane] = a[0];
+    } else {
 #pragma unroll
-    for (int q = 0; q < 32; ++q) {
-        if constexpr (Prepared) if ((q >= 1 && q <= 8) || (q >= 17 && q <= 26)) continue;
-        const float w = warp_sum(a[q]);
-        if (lane == 0) red[wid][q] = w;
+        for (int q = 0; q < 32; ++q) {
+            if constexpr (Prepared) if ((q >= 1 && q <= 8) || (q >= 17 && q <= 26)) continue;
+            const float w = warp_sum(a[q]);
+            if (lane == 0) red[wid][q] = w;
+        }
     }
     __syncthreads();
     if (tid < 32 && (!Prepared || !((tid >= 1 && tid <= 8) || (tid >= 17 && tid <= 26)))) {
