@@ -23,13 +23,31 @@ template <int H> constexpr size_t mqa_smem() {
            MQA_TR * sizeof(void*) + 2048 * 4 + 64;
 }
 
+// Expand each Q8 row once for all overlapping query windows in the chunk.
+__global__ void kb_swa_expand(const uint8_t* ring, const uint8_t* chunk,
+                              const int* pos0p, int win, int first, __half* expanded) {
+    const int r = blockIdx.x, group = threadIdx.x, pos = first + r, pos0 = *pos0p;
+    if (group >= KV_ROW / 8) return;
+    const uint8_t* row = pos < pos0 ? ring + (size_t)(pos % (win + RING_PAD)) * KV_RB
+                                    : chunk + (size_t)(pos - pos0) * KV_RB;
+    const int col = group * 8;
+    const float scale = __half2float(reinterpret_cast<const __half*>(row + KV_ROW)[col / 64]);
+    int2 packed = *reinterpret_cast<const int2*>(row + col);
+    const auto* bytes = reinterpret_cast<const int8_t*>(&packed);
+    uint4 out;
+    auto* halves = reinterpret_cast<__half2*>(&out);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) halves[i] = __floats2half2_rn(bytes[2*i] * scale, bytes[2*i+1] * scale);
+    reinterpret_cast<uint4*>(expanded + (size_t)r * KV_ROW)[group] = out;
+}
+
 template <int H>
 __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qabs, const float* __restrict__ q, int ldq,
                                                    int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                    const uint8_t* __restrict__ chunk, const int* __restrict__ cells,
                                                    int n_cap, const int* pos0p, int t0, int win, int n_shards, int shard,
                                                    const float* __restrict__ sinks, float scale, float* __restrict__ o,
-                                                   float* __restrict__ part, int W) {
+                                                   float* __restrict__ part, int W, const __half* expanded = nullptr, int first = 0, bool cache_scores = false) {
     const int pos0 = *pos0p;
     using namespace nvcuda;
     constexpr int KVL = 512, ROPE = 64, D = 576, LD = MQA_LD, TR = MQA_TR;
@@ -99,9 +117,21 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
 #pragma unroll
     for (int i = 0; i < OPW; ++i) wmma::fill_fragment(acc[i], 0.0f);
 
+    // Each CTA can reuse its own partial-output row until the final stores.
+    const bool saved = cache_scores && part && n <= W / TR * TR;
     for (int pass = 0; pass < 2; ++pass) {
         for (int r0 = 0; r0 < n; r0 += TR) {
             __syncthreads();   // (the previous tile's readers are done)
+            if (expanded) {
+                for (int i = tid; i < TR * (D / 8); i += 256) {
+                    const int row = i / (D / 8), group = i % (D / 8);
+                    const int r = r0 + row;
+                    uint4 data = make_uint4(0, 0, 0, 0);
+                    if (r < n)
+                        data = reinterpret_cast<const uint4*>(expanded + (size_t)(lo + r - first) * D)[group];
+                    *reinterpret_cast<uint4*>(Ks + (size_t)row * LD + 8 * group) = data;
+                }
+            } else {
             if (tid < TR) {
                 const int s = r0 + tid;
                 const uint8_t* p = nullptr;
@@ -130,8 +160,9 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
                 }
                 *reinterpret_cast<uint4*>(Ks + (size_t) r * LD + c) = out;
             }
+            }
             __syncthreads();
-            {   // S partials
+            if (!saved || pass == 0) {   // S partials
                 const int st = w % NST, kp = w / NST, hi = st >> 1, ni = st & 1;
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
@@ -148,8 +179,14 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
             __syncthreads();
             for (int h = w; h < H; h += 8) {
                 float s = 0.0f;
+                const size_t si = ((size_t)t * H + h) * W + r0 + lane;
+                if (saved && pass == 1) {
+                    s = part[si];
+                } else {
 #pragma unroll
-                for (int k = 0; k < KS; ++k) s += Sp[(size_t) k * H * 32 + h * 32 + lane];
+                    for (int k = 0; k < KS; ++k) s += Sp[(size_t) k * H * 32 + h * 32 + lane];
+                    if (saved) part[si] = s;
+                }
                 const bool valid = r0 + lane < n;
                 if (pass == 0) {
                     const float mx = warp_max(valid ? s : -INFINITY);

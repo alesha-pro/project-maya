@@ -56,6 +56,7 @@ bool paired = !std::getenv("HY4F_RING_PUSH");   // exchanges in XOR-paired phase
 int peer_of(int g, int r) const { return paired && (S & (S - 1)) == 0 ? (g ^ r) : (g + r) % S; }
 int cap_num = 3, cap_den = 2;   // expert rows buffered per shard: cap_num/cap_den x the even share (ranges past it)
 int attn_tile = 512;
+int mqa_opt = std::getenv("HY4F_PF_MQA") ? std::atoi(std::getenv("HY4F_PF_MQA")) : 0;
 int64_t idx_split_from = std::getenv("HY4F_IDX_SPLIT_FROM") ? std::atoll(std::getenv("HY4F_IDX_SPLIT_FROM")) : 16384;   // indexer split by tokens from this depth   // tokens per attention tile (q_abs / o / partials / cells / the combine are tile-sized)
 int CBW() const { return kvl + 4; }   // a combine partial's row: kvl accumulators, M, L, 2 pad (float4 / WMMA aligned)
 size_t xp_ld = 0, qp_ld = 0, xm_ld = 0;
@@ -374,6 +375,17 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
     float* wvb = b.wdq + (size_t) Ha * kvl * nope;   // (v_b after k_b in the scratch)
     kb_deq<<<std::min(nb(Hl * vh * kvl), 1024), 256, 0, b.st>>>(vb.d, vb.type, (size_t) Hl * vh * kvl, wvb);
     const float* sinks = f32(s, P + "attn_sinks.weight");
+    // b.cells is otherwise unused during SWA. Stay inside its allocation even
+    // when loading short contexts or using nonstandard tile/chunk sizes.
+    const int first_row = std::max(0, pos0 - win + 1);
+    const int expand_rows = pos0 + T - first_row;
+    const __half* expanded = nullptr;
+    if ((mqa_opt & 2) && sw && mqa && b.chunk_cur == b.chunk && b.pp_attn == b.pp
+        && (size_t)expand_rows * KV_ROW * sizeof(__half) <= (size_t)std::min(b.Tmax, attn_tile) * n_cap * sizeof(int)) {
+        auto* dst = reinterpret_cast<__half*>(b.cells);
+        kb_swa_expand<<<expand_rows, 96, 0, b.st>>>(s.kv[il], b.chunk_cur, b.pp_attn, win, first_row, dst);
+        expanded = dst;
+    }
     for (int t0 = 0; t0 < T; t0 += TA) {
         const int tt = std::min(TA, T - t0);
         // q_abs[t][h] = k_b_h q_nope[t][h]: k_b_h [kvl][nope] row-major
@@ -384,11 +396,11 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
             if (Hl == 16)
                 kb_mqa_attn<16><<<tt, 256, mqa_smem<16>(), b.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk_cur,
                                                                  nullptr, 0, b.pp_attn, b.toff + t0, win, 1, 0, sinks + s.g * Hl, scale,
-                                                                 b.o, nullptr, 0);
+                                                                 b.o, b.part, CBW(), expanded, first_row, (mqa_opt & 1) && Hd >= Hl);
             else if (Hl == 32)
                 kb_mqa_attn<32><<<tt, 256, mqa_smem<32>(), b.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk_cur,
                                                                  nullptr, 0, b.pp_attn, b.toff + t0, win, 1, 0, sinks + s.g * Hl, scale,
-                                                                 b.o, nullptr, 0);
+                                                                 b.o, b.part, CBW(), expanded, first_row, (mqa_opt & 1) && Hd >= Hl);
             else
                 kb_attn2<<<dim3(Hl, T), 256, 0, b.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk, nullptr, 0,
                                                         b.pp, win, 1, 0, sinks + s.g * Hl, scale, b.o, nullptr, Hl);
@@ -435,7 +447,7 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
             if (mqa) {
                 kb_mqa_attn<32><<<tt, 256, mqa_smem<32>(), b.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], nullptr,
                                                                  cells, n_cap, b.pp, t0, win, S, s.g, nullptr, scale,
-                                                                 nullptr, b.part, CBW());
+                                                                 nullptr, b.part, CBW(), nullptr, 0, mqa_opt & 1);
                 ++b.step;
                 if (std::getenv("HY4F_CB32")) {
                     const size_t per = (size_t) tt * Hl * CBW();
