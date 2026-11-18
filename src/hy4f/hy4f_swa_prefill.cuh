@@ -23,7 +23,7 @@ __global__ void kb_swa_queries(const float* qabs, const float* q, int ldq, int q
 
 __global__ void kb_swa_scores(const __half* queries, const __half* kv, int base, int nt, float* scores) {
     using namespace nvcuda;
-    constexpr int Q=4, N=32, H=16, D=576, K=144, LD=152;
+    constexpr int Q=4, N=32, H=16, D=576, K=144, LD=160;
     __shared__ __align__(32) __half a[Q][H][LD], b[N+Q-1][LD];
     const int tid=threadIdx.x, warp=tid/32, ti=warp/2, nj=(warp%2)*16;
     const int tb=Q*blockIdx.y, gb=N*blockIdx.x;
