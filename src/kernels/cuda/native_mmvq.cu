@@ -1455,8 +1455,39 @@ __global__ void __launch_bounds__(128) hy4_q80_rows(const Q80Block* __restrict__
     }
 }
 } // namespace
+// Keep lane assignments, K traversal and four-warp accumulation identical
+// while amortizing activation loads over more output rows in each block.
+namespace {
+template<int T> void q8_tiled(int tile, const Q80Block* w, const Q81Block* x, float* y, int n, int rows, cudaStream_t st) {
+    using F = SmallTraits<Q80Block, 8>;
+    const dim3 threads(32, 4);
+    switch (tile) {
+    case 1: native_mmvq_multi_kernel<F,T,4,1><<<rows,threads,0,st>>>(w,x,y,n,rows); break;
+    case 2: native_mmvq_multi_kernel<F,T,4,2><<<(rows+1)/2,threads,0,st>>>(w,x,y,n,rows); break;
+    case 4: native_mmvq_multi_kernel<F,T,4,4><<<(rows+3)/4,threads,0,st>>>(w,x,y,n,rows); break;
+    case 8: native_mmvq_multi_kernel<F,T,4,8><<<(rows+7)/8,threads,0,st>>>(w,x,y,n,rows); break;
+    }
+}
+}
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
+    const char* requested = std::getenv("HY4F_Q8_TILE");
+    if (requested && ncols >= 1 && ncols <= 4 && n_in > 0 && n_in % 32 == 0 && n_out > 0) {
+        int tile = std::atoi(requested);
+        if (tile == 1 || tile == 2 || tile == 4 || tile == 8) {
+            const auto* w = static_cast<const Q80Block*>(weights);
+            const auto* x = static_cast<const Q81Block*>(x_q8_1);
+            const auto st = static_cast<cudaStream_t>(stream);
+            switch (ncols) {
+            case 1: q8_tiled<1>(tile,w,x,y,n_in,n_out,st); break;
+            case 2: q8_tiled<2>(tile,w,x,y,n_in,n_out,st); break;
+            case 3: q8_tiled<3>(tile,w,x,y,n_in,n_out,st); break;
+            case 4: q8_tiled<4>(tile,w,x,y,n_in,n_out,st); break;
+            }
+            launch_check();
+            return;
+        }
+    }
     if (std::getenv("HY4F_Q80_ROWS") && n_in > 0 && n_in % 32 == 0 && n_out > 0 && ncols >= 1 && ncols <= 4) {
         const unsigned blocks = (n_out + 3) / 4;
         auto st = static_cast<cudaStream_t>(stream);
