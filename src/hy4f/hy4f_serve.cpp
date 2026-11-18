@@ -698,11 +698,11 @@ int serve(Model& m, const ServeOptions& so) {
         (void) 0;   // (default: the same temperature - measured best: 0.6 and 0.8 accepted less)
         std::vector<float> mlg(ssamp ? (size_t) V : 0);
         std::vector<std::vector<float>> Q(ssamp ? 4 : 0);
-        DraftWidth width(V, adapt && spec && !rows);
+        DraftWidth width(adapt && spec && !rows);
         if (width.enabled()) kc.k = 3;
         int offered = kc.k;
         auto draft = [&](const int32_t* nt, int T, int64_t mpos) {
-            if (!m.mtp(nt, T, mpos, &dr[0], err, ssamp ? mlg.data() : width.logits()))
+            if (!m.mtp(nt, T, mpos, &dr[0], err, ssamp ? mlg.data() : nullptr))
                 fatal("mtp at " + std::to_string(mpos) + ": " + err, produced, n);
             if (sparse_sample) {
                 sampler.sparse_probs(mlg.data(), V, rq, state, sq[0]);
@@ -714,13 +714,13 @@ int serve(Model& m, const ServeOptions& so) {
             const int64_t next = mpos + T;
             width.begin();
             offered = 1;
-            width.offer(0, dr[0]);
+            width.offer(0, m, dr[0]);
             const int room = width.enabled() ? (int) std::min<long long>({(long long) kc.k, C - next - 1, r.max_new - produced}) : kc.k;
             const int copied = lookup.extend(dr[0], room-1, dr+1);
             borrowed = copied > 0;
             if (borrowed) { offered += copied; return; }
             for (int i = 1; i < room && width.extend(i - 1); ++i) {
-                if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err, ssamp ? mlg.data() : width.logits()))
+                if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err, ssamp ? mlg.data() : nullptr))
                     fatal("mtp_chain at " + std::to_string(next + i - 1) + ": " + err, produced, n);
                 if (sparse_sample) {
                     sampler.sparse_probs(mlg.data(), V, rq, state, sq[i]);
@@ -729,7 +729,7 @@ int serve(Model& m, const ServeOptions& so) {
                     sampler.probs(mlg.data(), V, rq, state, Q[i]);
                     dr[i] = Sampler::draw(Q[i], rng);
                 }
-                if (!width.offer(i, dr[i])) break;
+                if (!width.offer(i, m, dr[i])) break;
                 ++offered;
             }
         };

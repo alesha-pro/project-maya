@@ -418,7 +418,7 @@ int main(int argc, char** argv) {
         std::vector<int32_t> out;
         int32_t last = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin()), dr[4] = {}, am[4];
         out.push_back(last);
-        strata::hy4f::DraftWidth width(m.vocab(), true);
+        strata::hy4f::DraftWidth width(k >= 2);
         strata::hy4f::PromptLookup lookup(toks, true);
         lookup.append(last);
         int offered = 0, total_offered = 0, lookup_steps = 0, lookup_kept = 0, lookup_candidates = 0;
@@ -426,20 +426,20 @@ int main(int argc, char** argv) {
         auto draft_chain = [&](int64_t mpos_next) {
             width.begin();
             offered = 1;
-            width.offer(0, dr[0]);
+            width.offer(0, m, dr[0]);
             const int copied = lookup.extend(dr[0], k-1, dr+1);
             borrowed = copied > 0;
             if (borrowed) { offered += copied; return; }
             for (int i = 1; i < k && width.extend(i - 1); ++i) {
-                if (!m.mtp_chain(dr[i - 1], mpos_next + i - 1, &dr[i], err, width.logits())) {
+                if (!m.mtp_chain(dr[i - 1], mpos_next + i - 1, &dr[i], err, nullptr)) {
                     std::fprintf(stderr, "maya-hy4f: mtp_chain failed: %s\n", err.c_str());
                     std::exit(1);
                 }
-                if (!width.offer(i, dr[i])) break;
+                if (!width.offer(i, m, dr[i])) break;
                 ++offered;
             }
         };
-        if (!m.mtp(&last, 1, pos - 1, &dr[0], err, width.logits())) {
+        if (!m.mtp(&last, 1, pos - 1, &dr[0], err, nullptr)) {
             std::fprintf(stderr, "maya-hy4f: mtp failed: %s\n", err.c_str());
             return 1;
         }
@@ -467,7 +467,7 @@ int main(int argc, char** argv) {
             for (int i = 0; i < n; ++i) nt[i] = dr[i];
             nt[n] = am[n];
             for (int i = 0; i <= n; ++i) { out.push_back(nt[i]); lookup.append(nt[i]); }
-            if (!m.mtp(nt, n + 1, pos, &dr[0], err, width.logits())) {
+            if (!m.mtp(nt, n + 1, pos, &dr[0], err, nullptr)) {
                 std::fprintf(stderr, "maya-hy4f: mtp failed: %s\n", err.c_str());
                 return 1;
             }

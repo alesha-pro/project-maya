@@ -4,8 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
-#include <limits>
-#include <vector>
+#include "hy4f.hpp"
 
 namespace strata::hy4f {
 
@@ -17,28 +16,18 @@ class DraftWidth {
     std::array<std::array<Bin, 4>, 3> bins_{};
     std::array<int, 3> bin_{};
     std::array<double, 3> probabilities_{};
-    std::vector<float> logits_;
+    bool enabled_;
     double prefix_ = 1.0;
 
 public:
-    explicit DraftWidth(int vocab, bool allow) {
-        if (allow && std::getenv("HY4F_DYNAMIC_SPEC")) logits_.resize(vocab);
-    }
-    bool enabled() const { return !logits_.empty(); }
-    float* logits() { return enabled() ? logits_.data() : nullptr; }
+    explicit DraftWidth(bool allow) : enabled_(allow && std::getenv("HY4F_DYNAMIC_SPEC")) {}
+    bool enabled() const { return enabled_; }
     void begin() { prefix_ = 1.0; }
 
     // Given a draft already computed, decide if adding its verify row is worthwhile.
-    bool offer(int depth, int token) {
+    bool offer(int depth, const Model& model, int token) {
         if (!enabled()) return true;
-        // The graph returns the full MTP row even in greedy mode. One max-reduction
-        // either side of its argmax supplies a token-independent ambiguity measure.
-        const float* row = logits_.data();
-        float second = -std::numeric_limits<float>::infinity();
-        if (token) second = *std::max_element(row, row + token);
-        if ((size_t) token + 1 < logits_.size())
-            second = std::max(second, *std::max_element(row + token + 1, row + logits_.size()));
-        const float margin = row[token] - second;
+        const float margin = model.draft_margin(token);
         int b = (margin >= 0.5f) + (margin >= 1.5f) + (margin >= 3.0f);
         const Bin& obs = bins_[depth][b];
         constexpr double prior[3][4] = {{0.60, 0.75, 0.87, 0.96},

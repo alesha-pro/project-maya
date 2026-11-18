@@ -58,6 +58,8 @@ public:
     /// the next draft from the MTP's own last state (after mtp() or a previous mtp_chain()) and the previous draft
     /// token at position mpos
     bool mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& err, float* logits = nullptr);
+    /// Gap between the last greedy MTP token and its runner-up in the already transferred draft logits.
+    float draft_margin(int token) const;
     bool has_mtp() const;
     /// DFly2 drafts: n (1..5) draft tokens after `bonus` (the token at position `anchor`, not yet in the cache), from the
     /// last verify's row `src_row` (the last accepted token: its final hidden state and its top-k cells at the drafter's

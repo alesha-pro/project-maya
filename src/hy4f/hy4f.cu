@@ -1134,6 +1134,17 @@ bool Model::mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& er
         return false;
     }
 }
+float Model::draft_margin(int token) const {
+    const Impl& d = *d_;
+    const int rows = d.V / d.S, owner = token / rows;
+    float runner_up = -INFINITY;
+    for (int g = 0; g < d.S; ++g) if (g != owner) runner_up = std::max(runner_up, d.hmargv[g]);
+    const float* logits = d.hmlog;
+    const int begin = owner * rows, end = begin + rows;
+    if (begin < token) runner_up = std::max(runner_up, *std::max_element(logits + begin, logits + token));
+    if (token + 1 < end) runner_up = std::max(runner_up, *std::max_element(logits + token + 1, logits + end));
+    return logits[token] - runner_up;
+}
 bool Model::has_mtp() const { return d_->has_mtp; }
 bool Model::has_dfly() const { return d_->df_nl > 0 && !d_->dfs.empty(); }
 bool Model::dfly(int src_row, int32_t bonus, int64_t anchor, int n, int32_t* drafts, std::string& err, float* logits) {
