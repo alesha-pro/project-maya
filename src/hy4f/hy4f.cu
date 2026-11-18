@@ -975,8 +975,9 @@ struct Model::Impl {
         }
         for (size_t g = 0; g < bsh.size(); ++g) {
             auto& b = bsh[g];
-            if (!b.ag_compute) continue;
             cudaSetDevice(sh[g].dev);
+            if (b.routing_ready) cudaEventDestroy(b.routing_ready);
+            if (!b.ag_compute) continue;
             for (auto event : b.ag_slice) if (event) cudaEventDestroy(event);
             if (b.ag_complete) cudaEventDestroy(b.ag_complete);
             cudaStreamDestroy(b.ag_compute);

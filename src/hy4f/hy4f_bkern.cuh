@@ -495,6 +495,11 @@ __global__ void kb_score(const float* iq, int ldq, const __half* pooled, const f
 // kb_moe_count (blockIdx.x = local expert) -> kb_moe_scan (one block) -> kb_moe_place (blockIdx.x = local expert).
 // bounds [n_local + 1], rows_tok [rows] (the activation row of each), row_of [T*k] (each (token, slot)'s row, -1 if
 // another shard's expert).
+__global__ void kb_zero_padded_rows(float* output, int cols, const int* rows) {
+    const int r = blockIdx.x;
+    if (r < *rows) return;
+    for (int c = threadIdx.x; c < cols; c += blockDim.x) output[(size_t)r * cols + c] = 0.f;
+}
 __global__ void kb_moe_count(const int* ids, int n, int e0, int* cnt) {
     const int e = blockIdx.x + e0;
     int c = 0;

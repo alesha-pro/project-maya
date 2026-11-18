@@ -26,6 +26,7 @@ struct BShard {
     float *lg = nullptr, *ew = nullptr, *xm = nullptr, *gu = nullptr, *dn = nullptr, *moe = nullptr, *mu = nullptr,
           *shh = nullptr, *shd = nullptr, *ffo = nullptr;
     int *eids = nullptr, *mb = nullptr, *mb2 = nullptr, *mcnt = nullptr, *rows_tok = nullptr, *row_of = nullptr;
+    cudaEvent_t routing_ready = nullptr;
     int* hmb = nullptr;   // pinned copy of the bounds (the MMQ grid and the rows are host values)
     int64_t cap = 0;      // rows of the expert buffers
     float *eg_r = nullptr, *eg_kv = nullptr;
@@ -96,6 +97,8 @@ struct Bump {
 void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_CK(cudaSetDevice(s.dev));
     b.Tmax = Tmax;
+    if (std::getenv("HY4F_PF_ROUTE_EVENT"))
+        HY_CK(cudaEventCreateWithFlags(&b.routing_ready, cudaEventDisableTiming));
     if (std::any_of(s.w.begin(), s.w.end(), [](const auto& e) { return e.second.type == T_ROUTER_PACKED; }))
         b.unpacked_router = dalloc(size_t(n_exp) * E);
     if (!b.st) b.st = s.st;
@@ -722,21 +725,31 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
     router(s, b.lg, f32(s, P + "exp_probs_b.bias"), T, b.eids, b.ew, b.st);
     kb_moe_count<<<nl, 256, 0, b.st>>>(b.eids, T * K, e0, b.mcnt);
     kb_moe_scan<<<1, std::max(nl, 32), 0, b.st>>>(b.mcnt, nl, b.mb);
+    // A short chunk fits all possible slots in the existing prefill arena.
+    // The MMQ kernels still take each expert's exact boundaries from the GPU.
+    const bool pad = std::getenv("HY4F_PF_SHORT_ROUTE") && T <= 64 && int64_t(T) * K <= b.cap;
+    if (pad) HY_CK(cudaMemsetAsync(b.rows_tok, 0, sizeof(int) * T * K, b.st));
     kb_moe_place<<<nl, 256, 0, b.st>>>(b.eids, T * K, K, e0, nl, b.mb, b.rows_tok, b.row_of);
-    HY_CK(cudaMemcpyAsync(b.hmb, b.mb, sizeof(int) * (nl + 1), cudaMemcpyDeviceToHost, b.st));
+    if (!pad) {
+        HY_CK(cudaMemcpyAsync(b.hmb, b.mb, sizeof(int) * (nl + 1), cudaMemcpyDeviceToHost, b.st));
+        if (b.routing_ready) HY_CK(cudaEventRecord(b.routing_ready, b.st));
+    }
     blin(s, b, P + "xmoe", b.x, E, b.xm, (int) xm_ld, T);
-    HY_CK(cudaStreamSynchronize(b.st));   // (the xmoe product queued behind it keeps the GPU busy meanwhile)
+    if (!pad) {
+        if (b.routing_ready) HY_CK(cudaEventSynchronize(b.routing_ready));
+        else HY_CK(cudaStreamSynchronize(b.st));
+    }
     const DW& wgu = s.w.at(P + "ffn_gu_exps");
     const DW& wd = s.w.at(P + "ffn_down_exps.weight");
     // the experts in ranges of at most cap rows (one range unless the routing piles onto this shard)
     for (int ea = 0; ea < nl;) {
-        int eb = ea;
-        int64_t mx = 0;
+        int eb = pad ? nl : ea;
+        int64_t mx = pad ? T : 0;
         while (eb < nl && (eb == ea || b.hmb[eb + 1] - b.hmb[ea] <= b.cap)) {
             mx = std::max<int64_t>(mx, b.hmb[eb + 1] - b.hmb[eb]);
             ++eb;
         }
-        const int ra = b.hmb[ea], rb = b.hmb[eb];
+        const int ra = pad ? 0 : b.hmb[ea], rb = pad ? T * K : b.hmb[eb];
         const int64_t rows = rb - ra;
         if (rows > b.cap) throw std::runtime_error("hy4f: one expert has more rows than the buffers");
         const int* bounds = b.mb + ea;
@@ -761,6 +774,7 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
             p.dst = b.gu;
             p.ld_dst = n_ffx;   // (the fused product writes h = silu(g) * u, n_ff values per row)
             b.mmq->run_glu(p, clampv, b.st);
+            if (pad) kb_zero_padded_rows<<<(unsigned)rows, 256, 0, b.st>>>(b.gu, n_ffx, b.mb + nl);
             mq::quantize(b.gu, nullptr, b.xq2, wd.type, n_ffx, n_ffx, rows, b.st);
             p.w = static_cast<const uint8_t*>(wd.d) + (size_t) ea * wd.rb * (size_t) wd.ne[1];
             p.type = wd.type;
