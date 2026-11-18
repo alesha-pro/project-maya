@@ -60,6 +60,13 @@ class ChatTemplate:
         # MiniMax-M3.1 (tools/mm3/chat_template.jinja: MiniMax's own plus thinking_mode "disabled"): reasoning_effort
         # low .. max; <mm:think> reasoning and ]<]minimax[>[-tagged tool calls (OutputParser(minimax=True) reads them)
         self.minimax = MINIMAX_NS in self.source
+        # Tencent Hy4 flash (maya-hy4f): its tags carry the template's HYTK suffix (<think:opensource>, <tool_call:...>,
+        # <arg_key:...>: GLM's call form otherwise - Hy4Rewriter reads them), reasoning_effort no_think / high / max (its
+        # default high), the generation prompt opening <think:...>.  self.hy4: the suffix ("" for every other template)
+        m_hy4 = re.search(r"set\s+HYTK\s*=\s*'([^']*)'", self.source)
+        self.hy4 = m_hy4.group(1) if m_hy4 and "hy_start" in self.source else ""
+        # the tag that opens a reasoning block, as this template writes it
+        self.think_open = f"<think{self.hy4}>" if self.hy4 else "<think>"
         # CYBER-FROST-3.8-PS (a Qwen3.8 template that sets enable_thinking = true itself): it opens <think> whatever it
         # is told.  Thinking off (a client's, or a forced tool call's) closes the block the way its Qwen base's template
         # writes thinking off - <think>\n\n</think>\n\n - so the prompt and the server's parser agree
@@ -113,6 +120,17 @@ class ChatTemplate:
                 if opens_turn and last.get("task") is None and prompt.endswith(header):
                     prompt = prompt[:-len(header)]
             return prompt
+        if self.hy4:
+            # Hy4 flash: no_think (thinking off: the turn opened with an empty think block), high (its default, also for
+            # low - it has no lower level) or max; auto / none named: the template's default
+            off = kwargs.pop("enable_thinking", None) is False
+            level = kwargs.pop("reasoning_effort", None)
+            if off:
+                kwargs["reasoning_effort"] = "no_think"
+            elif level is not None:
+                kwargs["reasoning_effort"] = "max" if level == "max" else "high"
+            return self.template.render(messages=messages, tools=tools, add_generation_prompt=add_generation_prompt,
+                                        **kwargs)
         if self.minimax:
             # MiniMax's card: "set reasoning_effort in the chat template: low, medium, high, xhigh or max" - its
             # template has one thinking mode, adaptive (the model decides whether to think), and writes the effort
@@ -1088,6 +1106,41 @@ def may_be_string(schema, defs: dict | None = None, seen: frozenset = frozenset(
     return False
 
 
+class Hy4Rewriter:
+    """Hy4 flash's output rewritten, as it streams, into the GLM forms OutputParser reads: its tags carry a suffix (the
+    template's HYTK, ":opensource") - </think:S> is </think>, <tool_call:S> / <arg_key:S> / <arg_value:S> (and their
+    closings) are GLM's (the call is GLM's `NAME<arg_key>K</arg_key><arg_value>V</arg_value>`, a non-string value as
+    JSON: the template writes them so), the <tool_calls:S> wrapper goes, and <think:S> opening reasoning again is
+    THINK_AGAIN.  A tag split across deltas is held until it is whole."""
+
+    def __init__(self, suffix: str):
+        self.map = {}
+        for name in ("think", "tool_calls", "tool_call", "arg_key", "arg_value"):
+            for close in ("", "/"):
+                tag = f"<{close}{name}{suffix}>"
+                self.map[tag] = ("" if name == "tool_calls" else THINK_AGAIN if name == "think" and not close
+                                 else f"<{close}{name}>")
+        self.buf = ""
+
+    def feed(self, text: str) -> str:
+        self.buf += text
+        out = []
+        while True:
+            hits = [(i, t) for t in self.map for i in (self.buf.find(t),) if i >= 0]
+            if not hits:
+                keep = max((n for t in self.map for n in range(1, len(t)) if self.buf.endswith(t[:n])), default=0)
+                out.append(self.buf[:len(self.buf) - keep])
+                self.buf = self.buf[len(self.buf) - keep:]
+                return "".join(out)
+            i, t = min(hits)
+            out.append(self.buf[:i] + self.map[t])
+            self.buf = self.buf[i + len(t):]
+
+    def finish(self) -> str:
+        rest, self.buf = self.buf, ""
+        return rest
+
+
 class MinimaxRewriter:
     """MiniMax-M3.1's output rewritten, as it streams, into what OutputParser reads (DeepSeek's path: GLM's tool-call
     form with JSON values).  `<mm:think>` opens reasoning: THINK_AGAIN for the parser, which drops it while it is
@@ -1267,7 +1320,7 @@ class OutputParser:
 
     def __init__(self, thinking: bool = True, tools: list[dict] | None = None, stream_tools: bool = False,
                  dsml: bool = False, strict_tools: bool = False, single_tool: bool = False, minimax: bool = False,
-                 token_only_end: bool = False, unions: bool = False):
+                 token_only_end: bool = False, unions: bool = False, hy4: str = ""):
         self.state = "reasoning" if thinking else "content"
         # token_only_end: the vocabulary has the end of thinking as a token (DeepSeek's), so only that token closes the
         # reasoning - the text "</think>" in it does not (a model that quotes the tag while it talks about it, as in
@@ -1279,6 +1332,7 @@ class OutputParser:
         # DeepSeek-V4.1's tool calls, read as GLM's (DsmlRewriter); MiniMax-M3.1's the same way (MinimaxRewriter):
         # both send JSON values, so the parser takes them without the tools' schemas
         self.dsml = DsmlRewriter() if dsml else MinimaxRewriter(tools) if minimax else None
+        self.hy4 = Hy4Rewriter(hy4) if hy4 else None   # (Hy4 flash: its tags as GLM's, then the GLM path as is)
         self.buf = ""
         self._call_resume = 0        # where the CALL_END search in call state resumes (see _feed)
         self.lead = False
@@ -1531,6 +1585,8 @@ class OutputParser:
             return []
         if self.dsml is not None:
             delta = self.dsml.feed(delta)
+        if self.hy4 is not None:
+            delta = self.hy4.feed(delta)
         return self._feed(delta)
 
     def _feed(self, delta: str) -> list[Event]:
@@ -1667,6 +1723,8 @@ class OutputParser:
         if self.finished:
             return []
         out = self._feed(self.dsml.finish()) if self.dsml is not None else []
+        if self.hy4 is not None and not self.finished:
+            out += self._feed(self.hy4.finish())
         if self.finished:
             return out
         if self.state == "call" and self.stream_tools and self.scall is not None:

@@ -2,11 +2,16 @@
 //
 //   maya-hy4f --gguf <shard-00001.gguf> [--gguf <shard-00002.gguf>] (--tokens-i32 FILE | --ids 1,2,3)
 //             [--gen N] [--dump DIR] [--max-context N] [--gpus 0,1,2,3] [--split 11,22,33] [-v]
+//   maya-hy4f --serve --gguf ... [--max-context N] [--eos 120025] [--chunk 2048] [--spec-k auto|0..3] [--mmproj F]
+//             [--model-name NAME]
+//
+// --serve: Maya's engine protocol on stdin / stdout for serve/server.py (hy4f_serve.cpp has the protocol).
 //
 // --tokens-i32: a raw int32 file (tools/hy4f_ref_dump's tokens.i32).  --dump: the seams appended per token under the
 // llama.cpp cb names (attn_norm-N, attn_out-N, ffn_out-N, ffn_moe_out-N, ffn_shexp-N, kv_cmpr-N, engram_delta-N,
 // result_norm, logits).  The decode rate is printed over the steps after the first.
 #include "hy4f.hpp"
+#include "hy4f_serve.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -30,6 +35,8 @@ int main(int argc, char** argv) {
     strata::hy4f::Options o;
     std::vector<int32_t> toks;
     int gen = 0, pchunk = 0, ptail = 0, repeat = 1, spec = 0, vtail = 0, vbench = 0;
+    bool serve_mode = false;
+    strata::hy4f::ServeOptions so;
     std::string mmproj, image;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -59,15 +66,31 @@ int main(int argc, char** argv) {
         else if (a == "--max-context") o.max_context = std::atoll(next());
         else if (a == "--gpus") o.gpus = csv(next());
         else if (a == "--split") o.split = csv(next());
+        else if (a == "--layer-split") {   // (serve/server.py adds it with several GPUs: "auto", or as --split)
+            const std::string v = next();
+            if (v != "auto") o.split = csv(v.c_str());
+        }
         else if (a == "-v") o.verbose = true;
+        else if (a == "--serve") serve_mode = true;
+        else if (a == "--eos") {
+            so.eos.clear();
+            for (int t : csv(next())) so.eos.push_back(t);
+        } else if (a == "--chunk") so.chunk = std::atoi(next());
+        else if (a == "--spec-k") {   // --serve: MTP drafts per step: auto (adaptive 1..3), 0 (none), 1..3
+            const std::string v = next();
+            so.spec = v == "auto" ? -1 : std::atoi(v.c_str());
+        }
+        else if (a == "--model-name") so.model_name = next();
         else {
             std::fprintf(stderr, "maya-hy4f: unknown argument %s\n", a.c_str());
             return 2;
         }
     }
-    if (o.shards.empty() || toks.empty()) {
+    if (o.shards.empty() || (toks.empty() && !serve_mode)) {
         std::fprintf(stderr, "usage: maya-hy4f --gguf SHARD1 [--gguf SHARD2] (--tokens-i32 F | --ids a,b) [--gen N] "
-                             "[--dump DIR] [--max-context N] [--gpus ..] [--split ..] [-v]\n");
+                             "[--dump DIR] [--max-context N] [--gpus ..] [--split ..] [-v]\n"
+                             "       maya-hy4f --serve --gguf SHARD1 [--gguf SHARD2] [--max-context N] [--eos ID,..] "
+                             "[--chunk N] [--spec-k auto|0..3] [--mmproj F] [--model-name NAME]\n");
         return 2;
     }
     strata::hy4f::Model m;
@@ -78,6 +101,19 @@ int main(int argc, char** argv) {
         return 1;
     }
     const double load_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    if (serve_mode) {   // (stdout is the protocol's: the load's note goes as a NOTE line, and to the log)
+        std::fprintf(stderr, "maya-hy4f: %s (loaded in %.1f s)\n", m.summary().c_str(), load_s);
+        std::printf("NOTE maya-hy4f: %s (loaded in %.1f s)\n", m.summary().c_str(), load_s);
+        if (!mmproj.empty()) {   // (pictures: GENI; the encoder's weights in pinned host RAM)
+            if (!m.load_vision(mmproj, err)) {
+                std::fprintf(stderr, "maya-hy4f: vision: %s\n", err.c_str());
+                std::printf("NOTE maya-hy4f: the vision encoder did not load (%s): text only\n", err.c_str());
+            } else {
+                std::printf("NOTE maya-hy4f: vision encoder %s loaded\n", mmproj.c_str());
+            }
+        }
+        return strata::hy4f::serve(m, so);
+    }
     std::printf("%s (loaded in %.1f s)\n", m.summary().c_str(), load_s);
     std::vector<float> logits((size_t) m.vocab());
     int64_t pos = 0;
