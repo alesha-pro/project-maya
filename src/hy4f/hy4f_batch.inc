@@ -475,9 +475,13 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
         blin(s, b, P + "indexer.proj.weight", b.x, E, b.iw, IH, T);
         k_scale<<<nb(T * IH), 256, 0, b.st>>>(b.iw, T * IH, 1.0f / std::sqrt((float) (IK * IH)));
     }
-    kb_deq<<<std::min(nb(Ha * kvl * nope), 1024), 256, 0, b.st>>>(kb.d, kb.type, (size_t) Ha * kvl * nope, b.wdq);
+    if (kb.packed_projection)
+        kb_deq_project<192><<<nb(Ha * kvl * 2 * 32), 256, 0, b.st>>>((const uint8_t*)kb.d, b.wdq, Ha * kvl);
+    else kb_deq<<<std::min(nb(Ha * kvl * nope), 1024), 256, 0, b.st>>>(kb.d, kb.type, (size_t) Ha * kvl * nope, b.wdq);
     float* wvb = b.wdq + (size_t) Ha * kvl * nope;   // (v_b after k_b in the scratch)
-    kb_deq<<<std::min(nb(Hl * vh * kvl), 1024), 256, 0, b.st>>>(vb.d, vb.type, (size_t) Hl * vh * kvl, wvb);
+    if (vb.packed_projection)
+        kb_deq_project<512><<<nb(Hl * vh * 4 * 32), 256, 0, b.st>>>((const uint8_t*)vb.d, wvb, Hl * vh);
+    else kb_deq<<<std::min(nb(Hl * vh * kvl), 1024), 256, 0, b.st>>>(vb.d, vb.type, (size_t) Hl * vh * kvl, wvb);
     const float* sinks = f32(s, P + "attn_sinks.weight");
     // b.cells is otherwise unused during SWA. Stay inside its allocation even
     // when loading short contexts or using nonstandard tile/chunk sizes.

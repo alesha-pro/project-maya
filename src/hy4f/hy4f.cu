@@ -20,6 +20,7 @@
 #include "hy4f_swa_prefill.cuh"
 #include "hy4f_dsa_prefill.cuh"
 #include "hy4f_dkern.cuh"
+#include "hy4f_project.cuh"
 #include "hy4f_q3packed.cuh"
 
 #include "strata/artifact/gguf_reader.hpp"
@@ -101,6 +102,7 @@ struct DW {
     int64_t ne[3] = {1, 1, 1};
     void* d = nullptr;
     size_t rb = 0;
+    bool packed_projection = false;
 };
 
 struct Shard {
@@ -285,7 +287,7 @@ struct Model::Impl {
         if (!t) throw std::runtime_error("hy4f: missing tensor " + n);
         return t;
     }
-    DW up_rows(Shard& s, const std::string& n, int64_t r0, int64_t r1) {
+    DW up_rows(Shard& s, const std::string& n, int64_t r0, int64_t r1, bool pack = false) {
         const strata::GgufFile* f = nullptr;
         const strata::TensorInfo* t = T(n, &f);
         DW w;
@@ -299,7 +301,12 @@ struct Model::Impl {
         else w.ne[1] = r1 - r0;
         const size_t bytes = w.rb * (size_t) (r1 - r0);
         w.d = walloc(bytes);
-        HY_CK(cudaMemcpy(w.d, f->tensor_data(*t) + w.rb * (size_t) r0, bytes, cudaMemcpyHostToDevice));
+        const uint8_t* src = f->tensor_data(*t) + w.rb * (size_t)r0;
+        if (pack && w.type == T_Q8_0) {
+            const auto packed = pack_projection(src, (int)w.ne[0], (int)(r1 - r0));
+            HY_CK(cudaMemcpy(w.d, packed.data(), bytes, cudaMemcpyHostToDevice));
+            w.packed_projection = true;
+        } else HY_CK(cudaMemcpy(w.d, src, bytes, cudaMemcpyHostToDevice));
         s.w[n] = w;
         return w;
     }
@@ -465,6 +472,10 @@ struct Model::Impl {
         for (const char* n : {"output_norm.weight", "output_hc_fn.weight", "output_hc_scale.weight", "output_hc_base.weight"})
             up_full(s, n);
         up_rows(s, "output.weight", (int64_t) g * V / S, (int64_t) (g + 1) * V / S);
+        const char* project_env = std::getenv("HY4F_Q8_KV_PROJ");
+        const int project_mask = project_env ? std::atoi(project_env) : 0;
+        const bool pack_k = (project_mask & 1) && nope == 192 && kvl == 512;
+        const bool pack_v = (project_mask & 2) && kvl == 512 && vh == 256;
         const int Hsl = Hs / S, Hdl = Hd / S, QH = nope + rope;
         for (int il = 0; il < L + (has_mtp ? 1 : 0); ++il) {
             const std::string P = "blk." + std::to_string(il) + ".";
@@ -494,17 +505,17 @@ struct Model::Impl {
             up_concat(s, P + "xproj", xpieces);
             if (sw) {
                 up_concat(s, P + "qproj", {{P + "attn_q_b.weight", (int64_t) h0 * QH, (int64_t) (h0 + Hl) * QH}});
-                up_rows(s, P + "attn_k_b.weight", (int64_t) h0 * kvl, (int64_t) (h0 + Hl) * kvl);
+                up_rows(s, P + "attn_k_b.weight", (int64_t) h0 * kvl, (int64_t) (h0 + Hl) * kvl, pack_k);
             } else {
                 up_concat(s, P + "qproj", {{P + "attn_q_b.weight", 0, -1}, {P + "indexer.attn_q_b.weight", 0, -1}});
-                up_full(s, P + "attn_k_b.weight");
+                up_rows(s, P + "attn_k_b.weight", 0, -1, pack_k);
                 up_concat(s, P + "ivg", {{P + "indexer_compressor_value.weight", 0, -1},
                                          {P + "indexer_compressor_gate.weight", 0, -1}});
                 for (const char* n : {"indexer.k_norm.weight", "indexer.proj.weight", "indexer_compressor_ape.weight",
                                       "indexer_compressor_norm.weight"})
                     up_full(s, P + n);
             }
-            up_rows(s, P + "attn_v_b.weight", (int64_t) h0 * vh, (int64_t) (h0 + Hl) * vh);
+            up_rows(s, P + "attn_v_b.weight", (int64_t) h0 * vh, (int64_t) (h0 + Hl) * vh, pack_v);
             up_cols(s, P + "attn_output.weight", (int64_t) h0 * vh, (int64_t) (h0 + Hl) * vh);
             if (il < dense_lead) {
                 const int64_t f0 = (int64_t) g * n_ff / S, f1 = (int64_t) (g + 1) * n_ff / S;
@@ -738,7 +749,9 @@ struct Model::Impl {
         const DW& vb = s.w.at(P + "attn_v_b.weight");
         const float scale = 1.0f / std::sqrt((float) QH);
         if (sw) {
-            if (kb.type == T_Q8_0) k_absorb_q8<<<nb(Hl * kvl), 256, 0, s.st>>>((const uint8_t*) kb.d, s.qp, QH, s.qabs, nope, kvl, Hl);
+            if (kb.packed_projection)
+                k_project_eager<192><<<nb(Hl * kvl), 256, 0, s.st>>>((const uint8_t*)kb.d, s.qp, nullptr, s.qabs, Hl, QH);
+            else if (kb.type == T_Q8_0) k_absorb_q8<<<nb(Hl * kvl), 256, 0, s.st>>>((const uint8_t*) kb.d, s.qp, QH, s.qabs, nope, kvl, Hl);
             else k_absorb_bf16<<<nb(Hl * kvl), 256, 0, s.st>>>((const uint16_t*) kb.d, s.qp, QH, s.qabs, nope, kvl, Hl);
             k_attn2<<<Hl, 256, 0, s.st>>>(s.qabs, s.qp, QH, nope, th, s.kv[il], nullptr, 0, s.dio, win, 1, 0,
                                           f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, s.o, nullptr);
@@ -756,7 +769,9 @@ struct Model::Impl {
                                                                                     top_k, s.dio, s.score);
             k_select_kpool<1024><<<1, 1024, 0, s.st>>>(s.score, &s.dio->pos, kpool, top_k, top_k / kpool - tail, n_cap,
                                                        s.cells);
-            if (kb.type == T_Q8_0) k_absorb_q8<<<nb(Hd * kvl), 256, 0, s.st>>>((const uint8_t*) kb.d, s.qp, QH, s.qabs, nope, kvl, Hd);
+            if (kb.packed_projection)
+                k_project_eager<192><<<nb(Hd * kvl), 256, 0, s.st>>>((const uint8_t*)kb.d, s.qp, nullptr, s.qabs, Hd, QH);
+            else if (kb.type == T_Q8_0) k_absorb_q8<<<nb(Hd * kvl), 256, 0, s.st>>>((const uint8_t*) kb.d, s.qp, QH, s.qabs, nope, kvl, Hd);
             else k_absorb_bf16<<<nb(Hd * kvl), 256, 0, s.st>>>((const uint16_t*) kb.d, s.qp, QH, s.qabs, nope, kvl, Hd);
             if (S > 1) {
                 k_attn2<<<Hd, 256, 0, s.st>>>(s.qabs, s.qp, QH, nope, th, s.kv[il], s.cells, n_cap, s.dio, win, S, s.g,
@@ -768,7 +783,9 @@ struct Model::Impl {
                                               f32(s, P + "attn_sinks.weight"), scale, s.o, nullptr);
             }
         }
-        if (vb.type == T_Q8_0)
+        if (vb.packed_projection)
+            k_project_eager<512><<<nb(Hl * vh * 32), 256, 0, s.st>>>((const uint8_t*)vb.d, s.o, s.xp + og, s.a, Hl, kvl);
+        else if (vb.type == T_Q8_0)
             k_vb_gate_q8<<<nb(Hl * vh * 32), 256, 0, s.st>>>((const uint8_t*) vb.d, s.o, s.xp + og, s.a, kvl, vh, Hl);
         else
             k_vb_gate_bf16<<<nb(Hl * vh * 32), 256, 0, s.st>>>((const uint16_t*) vb.d, s.o, s.xp + og, s.a, kvl, vh, Hl);

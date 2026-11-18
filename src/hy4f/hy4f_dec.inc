@@ -414,7 +414,10 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     const bool pack_query = std::getenv("HY4F_PACK_QUERY") && split && kb.type==T_Q8_0 && kvl==512 && rope==64
         && ((sw && Hl==16) || (!sw && S>1 && Hd==32)) && (size_t)Ha*576<=size_t(n_used)*2*n_ffx*2;
     __half* qh=pack_query ? reinterpret_cast<__half*>(d.ga16) : nullptr;
-    if (kb.type == T_Q8_0) {
+    if (kb.packed_projection) {
+        ProjectionArgs args{(const uint8_t*)kb.d, d.qp, Ha, qpc, QH, d.qabs, qh, pp, th, scale};
+        launch_projection<192>(T, args, s.st);
+    } else if (kb.type == T_Q8_0) {
         const uint8_t* kw = (const uint8_t*) kb.d;
         const int g = nb(Ha * kvl * 32);
         switch (T) {
@@ -530,7 +533,13 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                                                     1, 0, f32(s, P + "attn_sinks.weight"), scale, d.o, nullptr, Hd);
         }
     }
-    if (vb.type == T_Q8_0) {
+    if (vb.packed_projection) {
+        ProjectionArgs args{(const uint8_t*)vb.d, d.o, Hl, Hl * kvl, kvl};
+        args.gate = d.xp + og;
+        args.gate_stride = xpc;
+        args.qout = d.xq;
+        launch_projection<512>(T, args, s.st);
+    } else if (vb.type == T_Q8_0) {
         const uint8_t* vw = (const uint8_t*) vb.d;
         const int g = nb(Hl * vh * 32);
         switch (T) {
@@ -545,7 +554,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     else
         kb_vb_gate_bf16<<<dim3(nb(Hl * vh * 32), T), 256, 0, s.st>>>((const uint16_t*) vb.d, d.o, d.xp + og, xpc, d.a, kvl, vh,
                                                                      Hl);
-    k_q8<<<nb(T * Hl * vh), 256, 0, s.st>>>(d.a, T * Hl * vh, d.xq);
+    if (!vb.packed_projection) k_q8<<<nb(T * Hl * vh), 256, 0, s.st>>>(d.a, T * Hl * vh, d.xq);
     dec_mmvq(s, P + "attn_output.weight", d.xq, d.ao, T);
     if (!mtp && fuse_ok()) {   // (the FFN's input comes out of the all-reduce tail)
         const HcNext nx = hc_next(s, P, "hc_ffn", P + "ffn_norm.weight", 2 * hc, hc_mag);
