@@ -489,7 +489,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     if (sw) {
         if (split && Hl == 16) {
             (value_groups==4 ? kd_mqa_dec<16,false,4> : kd_mqa_dec<16>)<<<dim3(NSP*value_groups, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
-                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh);
+                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh, false);
             if (std::getenv("HY4F_MQA_FOLD"))
                 kd_mqa_fold<false><<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hl,
                     f32(s,P+"attn_sinks.weight")+s.g*Hl,d.o,nullptr,0,d.cb,s.g,S,nullptr);
@@ -515,7 +515,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
             if (split && Hd == 32) {
                 (value_groups==4 ? (dense_dsa ? kd_mqa_dec<32,true,4> : kd_mqa_dec<32,false,4>) : (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>))<<<dim3(NSP*value_groups, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
                                                                            n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
-                                                                           d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail, qh);
+                                                                           d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail, qh, false);
                 if (std::getenv("HY4F_HEAD_SEND")) {
                     kd_mqa_fold<true><<<dim3(Hd,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hd,nullptr,nullptr,
                                                                d.part,CBW(),d.head_cb,s.g,S,d.cb_ctr);
