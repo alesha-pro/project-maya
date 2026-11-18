@@ -392,7 +392,10 @@ void d_indexer_select(Shard& s, DShard& d, const std::string& P, int il, const i
     kb_f32_gemv<<<dim3(nb(IH * 32), T), 256, 0, st>>>(f32(s, P + "indexer.proj.weight"), d.x, E, d.iw, IH, E, IH,
                                                         1.0f / std::sqrt((float) (IK * IH)));
     const int ld_sc = (int) (o.max_context / kpool + 1);
-    if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))   // (grid for the whole context: the graph is fixed)
+    if (IH == 16 && IK == 128 && T <= 4 && std::getenv("HY4F_DEC_SCORE_TILE")) {
+        const auto kernel = T == 1 ? kd_score_tile<1> : T == 2 ? kd_score_tile<2> : kd_score_tile<4>;
+        kernel<<<dec_score_blocks,256,0,st>>>(iq,qpc,s.pooled[il],d.iw,IH,kpool,top_k,pp,0,T,ld_sc-1,d.score,ld_sc);
+    } else if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))   // (grid for the whole context: the graph is fixed)
         (T <= 4 ? kb_score_tc : kd_score_tc8)<<<dim3(dec_score_blocks, 1), 256, 0, st>>>(iq, qpc, s.pooled[il], d.iw, IH, kpool,
                                                                                      top_k, pp, 0, T, ld_sc - 1, d.score, ld_sc);
     else

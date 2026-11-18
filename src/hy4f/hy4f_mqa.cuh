@@ -766,6 +766,61 @@ __global__ void __launch_bounds__(256) kb_score_prefill(const float* iq, int ldq
     }
 }
 
+// Decode index scores share a coalesced key tile across one to four queries.
+// Keep the same WMMA operations and head reduction as kb_score_tc.
+template<int Rows>
+__global__ void __launch_bounds__(256) kd_score_tile(const float* iq, int ldq, const __half* pooled,
+        const float* weights, int stride_w, int kpool, int top_k, const int* pos0p,
+        int t0, int nt, int capacity, float* score, int ld_score) {
+    using namespace nvcuda;
+    constexpr int D=128, LD=136, H=16, KeyWarps=8/Rows, Groups=16*KeyWarps;
+    __shared__ __align__(32) __half qs[Rows][H][LD], keys[Groups][LD];
+    __shared__ __align__(32) float dots[8][16][20];
+    __shared__ float weight[Rows][H];
+    const int tid=threadIdx.x, warp=tid/32, lane=tid%32;
+    const int pos0=*pos0p+t0;
+    const int groups=min(capacity,(pos0+nt-1)/kpool);
+    if ((int)blockIdx.x*Groups>=groups || pos0+nt<=top_k) return;
+    const int token=warp/KeyWarps, key_start=16*(warp%KeyWarps);
+    for (int i=tid; i<Rows*H*D; i+=256) {
+        const int row=i/(H*D), h=i/D%H, d=i%D;
+        qs[row][h][d]=row<nt ? __float2half_rn(iq[(size_t)(t0+row)*ldq+h*D+d]) : __float2half(0);
+    }
+    if (tid<Rows*H) weight[tid/H][tid%H]=tid/H<nt ? weights[(size_t)(t0+tid/H)*stride_w+tid%H] : 0;
+    __syncthreads();
+    wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> q[D/16];
+#pragma unroll
+    for (int k=0; k<D/16; ++k) wmma::load_matrix_sync(q[k],&qs[token][0][k*16],LD);
+    for (int gb=blockIdx.x*Groups; gb<groups; gb+=gridDim.x*Groups) {
+        for (int i=tid; i<Groups*(D/8); i+=256) {
+            const int g=i/(D/8), c=8*(i%(D/8));
+            const uint4 v=gb+g<groups ? *reinterpret_cast<const uint4*>(pooled+(size_t)(gb+g)*D+c) : make_uint4(0,0,0,0);
+            *reinterpret_cast<uint4*>(&keys[g][c])=v;
+        }
+        __syncthreads();
+        if (token<nt) {
+            wmma::fragment<wmma::accumulator,16,16,16,float> a;
+            wmma::fill_fragment(a,0.f);
+#pragma unroll
+            for (int k=0; k<D/16; ++k) {
+                wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> b;
+                wmma::load_matrix_sync(b,&keys[key_start][k*16],LD);
+                wmma::mma_sync(a,q[k],b,a);
+            }
+            wmma::store_matrix_sync(&dots[warp][0][0],a,20,wmma::mem_row_major);
+            __syncwarp();
+            const int g=gb+key_start+lane;
+            if (lane<16 && pos0+token+1>top_k && g<(pos0+token)/kpool) {
+                float value=0.f;
+#pragma unroll
+                for (int h=0; h<H; ++h) value+=fmaxf(dots[warp][h][lane],0.f)*weight[token][h];
+                score[(size_t)token*ld_score+g]=value;
+            }
+        }
+        __syncthreads();
+    }
+}
+
 // (the few-token form of kb_score_tc: every warp a group sub-range for ALL the NT >= tt_n tokens, each key tile read once)
 template <int NT>
 __device__ __forceinline__ void score_few(const __half* __restrict__ pooled, int kpool, int top_k, int pos0, int t0, int tt_n,
