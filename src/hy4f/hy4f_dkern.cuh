@@ -14,6 +14,32 @@ __device__ __forceinline__ float ar_own(const PeersD& P, float v) { return P.bf 
 // P.bf == 2: the LL form (NCCL's low-latency protocol): every 8-byte word = 2 BF16 values + the step, stored by the
 // sender in one 8-byte store with no fence and no flag; the receiver polls the word until it carries its step
 __device__ __forceinline__ float ar_peer(const PeersD& P, int step, const float* rv, size_t idx) {
+    if (P.bf == 4) {
+        const unsigned field = (unsigned)idx & 3u;
+        const uint2* word = reinterpret_cast<const uint2*>(rv) + ((unsigned)idx >> 2);
+        uint2 packet;
+        do {
+            asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];"
+                         : "=r"(packet.x), "=r"(packet.y) : "l"(word));
+        } while ((packet.y >> 24) != ((unsigned)step & 255u));
+        const unsigned shift = field * 8;
+        const unsigned sign_fraction = (packet.x >> shift) & 255u;
+        unsigned exponent;
+        if ((packet.y & 63u) == 63u) {
+            uint2 ext;
+            const uint2* exception = word + P.exception_stride;
+            do {
+                asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];"
+                             : "=r"(ext.x), "=r"(ext.y) : "l"(exception));
+            } while (ext.y != ((packet.y >> 6) & 1u));
+            exponent = (ext.x >> shift) & 255u;
+        } else {
+            const unsigned code = (packet.y >> (field * 6)) & 63u;
+            exponent = code ? code + 95u : 0u;
+        }
+        const unsigned bits = ((sign_fraction & 128u) << 8) | (exponent << 7) | (sign_fraction & 127u);
+        return __bfloat162float(__ushort_as_bfloat16((unsigned short)bits));
+    }
     if (P.bf == 3) {
         const unsigned index = (unsigned) idx;
         const unsigned packet = index / 3u;
@@ -754,6 +780,58 @@ __global__ void kd_push_all(const float* __restrict__ x1, const float* __restric
 
 // the peers one after another inside one launch (a single launch per exchange instead of one per peer; still one peer
 // at a time per block): each block writes its slice to peer me+1, fences, counts in; then me+2, ...
+// A fast packet stores four signs/mantissas and four lossless six-bit
+// exponent codes. Uncommon exponents (including infinities and NaNs) use a
+// second tagged word. Its generation flips only when that exact slot changes,
+// so an exception after any number of ordinary packets cannot read stale data.
+__global__ void kd_push_ll4(const float* x1, const float* x2, int n, PeersD P, int me, int ranks,
+                            const int* counter, unsigned char* generation) {
+    const unsigned step = (unsigned)*counter + 1u, parity = step & 1u;
+    const int packets = n / 4;
+    int peer = me;
+    for (int r = 1; r < ranks; ++r) {
+        if (++peer == ranks) peer = 0;
+        uint2* target = reinterpret_cast<uint2*>(P.buf[peer][parity]) + me * packets;
+        for (int i = threadIdx.x; i < packets; i += blockDim.x) {
+            const float4 x = reinterpret_cast<const float4*>(x1)[i];
+            float v[4] = {x.x, x.y, x.z, x.w};
+            if (x2) {
+                const float4 y = reinterpret_cast<const float4*>(x2)[i];
+                v[0] += y.x;
+                v[1] += y.y;
+                v[2] += y.z;
+                v[3] += y.w;
+            }
+            unsigned sign_fraction = 0, codes = 0, exponents = 0;
+            bool exceptional = false;
+#pragma unroll
+            for (int f = 0; f < 4; ++f) {
+                const unsigned value = __bfloat16_as_ushort(__float2bfloat16_rn(v[f]));
+                const unsigned exp = (value >> 7) & 255u;
+                exponents |= exp << (f * 8);
+                exceptional |= exp != 0 && exp - 96u >= 62u;
+                const unsigned code = exp ? exp - 95u : 0u;
+                codes |= code << (f * 6);
+                sign_fraction |= ((value & 127u) | ((value >> 8) & 128u)) << (f * 8);
+            }
+            if (exceptional) {
+                auto& slot = generation[parity * packets + i];
+                unsigned gen = slot;
+                if (r == 1) {
+                    gen ^= 1u;
+                    slot = (unsigned char)gen;
+                }
+                codes = 63u | (gen << 6);
+                asm volatile("st.volatile.global.v2.u32 [%0], {%1, %2};"
+                             :: "l"(target + i + P.exception_stride), "r"(exponents), "r"(gen) : "memory");
+            }
+            const unsigned metadata = (step << 24) | codes;
+            asm volatile("st.volatile.global.v2.u32 [%0], {%1, %2};"
+                         :: "l"(target + i), "r"(sign_fraction), "r"(metadata) : "memory");
+        }
+    }
+}
+
 // Each 8-byte PCIe store carries three rounded values and a 16-bit epoch.
 __global__ void kd_push_ll3(const float* x1, const float* x2, int n, PeersD P, int me, int ranks,
                             const int* counter) {

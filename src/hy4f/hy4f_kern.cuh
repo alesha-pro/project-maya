@@ -513,7 +513,8 @@ struct Peers {
     int* flag[4];       // shard j's flag array [4]
 };
 struct PeersD : Peers {   // the decode exchanges' (hy4f_dkern.cuh): + the all-reduce wire format
-    int bf = 0;           // 0 F32 + flags, 1 BF16 + flags, 2 LL (2 BF16 + the step per 8-byte store), 3 LL with 3 BF16 + 16-bit step
+    int bf = 0;           // 0/1 = F32/BF16 with flags, 2/3/4 = 2/3/4 BF16 values per tagged word
+    int exception_stride = 0;  // LL4 packets from a primary word to its exception word
 };
 
 __device__ __forceinline__ void peers_signal_wait(const Peers& P, int me, int n_shards, int step) {

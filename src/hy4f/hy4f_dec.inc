@@ -50,6 +50,7 @@ bool push_seq = std::getenv("HY4F_PUSH_PER_PEER") == nullptr;
 bool push_one = std::getenv("HY4F_PUSH_ONEFENCE") != nullptr;
 bool ll_overlap = std::getenv("HY4F_LL_FUSED") != nullptr;
 bool tail_old = std::getenv("HY4F_TAIL_OLD") != nullptr;
+bool ar_ll4 = std::getenv("HY4F_AR_LL4") && std::atoi(std::getenv("HY4F_AR_LL4")) != 0;
 bool ar_ll3 = std::getenv("HY4F_AR_LL3") && std::atoi(std::getenv("HY4F_AR_LL3")) != 0;
 int ar_push_blocks = std::getenv("HY4F_PUSH_BLOCKS") ? std::atoi(std::getenv("HY4F_PUSH_BLOCKS")) : 1;
 int ar_push_threads = std::getenv("HY4F_PUSH_THREADS") ? std::atoi(std::getenv("HY4F_PUSH_THREADS")) : 256;
@@ -119,6 +120,7 @@ struct DShard {
     float *spm = nullptr, *spl = nullptr, *spacc = nullptr;   // the split-K attention partials [DT][NSP][Hmax][..]
     Q81 *xq = nullptr, *xlq = nullptr, *q16 = nullptr;
     float *ysc = nullptr, *tpart = nullptr, *tppost = nullptr;   // the two-kernel all-reduce tail's scratch
+    unsigned char* ar_generation = nullptr;
     float* ar_buf[2] = {nullptr, nullptr};
     float* cb_buf[2] = {nullptr, nullptr};
     int *ar_flag = nullptr, *cb_flag = nullptr, *ar_ctr = nullptr, *cb_ctr = nullptr, *arrive = nullptr;
@@ -251,10 +253,11 @@ void dec_alloc(Shard& s, DShard& d) {
         HY_CK(cudaEventCreateWithFlags(&d.shared_done, cudaEventDisableTiming));
     }
     for (int p = 0; p < 2; ++p) {
-        // Keep separate address ranges for T=3 and T=4. Their 16-bit epochs
+        // Keep separate address ranges for T=3 and T=4. Their compact epochs
         // can wrap even when only one width has been running for a long time.
-        const size_t ll3_words = ar_ll3 && E % 3 == 0 ? (size_t)S * (E/3) * (3+4) * 2 : 0;
-        d.ar_buf[p] = dalloc((size_t) S * DT * E + ll3_words);
+        const size_t extra = ar_ll4 && E % 4 == 0 ? (size_t)S * E * (3+4)
+                           : ar_ll3 && E % 3 == 0 ? (size_t)S * (E/3) * (3+4) * 2 : 0;
+        d.ar_buf[p] = dalloc((size_t) S * DT * E + extra);
         d.cb_buf[p] = dalloc((size_t) S * DT * (Hd / S) * CBW());
     }
     d.ar_flag = ia(4);
@@ -262,7 +265,11 @@ void dec_alloc(Shard& s, DShard& d) {
     d.tpart = dalloc((size_t) DT * 16 * 32);
     d.tppost = dalloc((size_t) DT * 4);
     d.cb_flag = ia(std::getenv("HY4F_HEAD_SEND") ? 4+DT*Hd : 4);
-    d.ar_ctr = ia(ar_ll3 ? 3 : 1);
+    d.ar_ctr = ia(ar_ll3 || ar_ll4 ? 3 : 1);
+    if (ar_ll4 && E % 4 == 0) {
+        const size_t bytes = (size_t)(E/4) * (3+4) * 2;
+        d.ar_generation = reinterpret_cast<unsigned char*>(dalloc((bytes+sizeof(float)-1)/sizeof(float)));
+    }
     d.cb_ctr = ia(1);
     d.arrive = ia(16);   // [0..4] all-reduce pushes / tail, [8..12] combine
 }
@@ -307,10 +314,18 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
     const int tn = T * E;
     PeersD ar = d.ar;
     int* counter = d.ar_ctr;
-    if (ar_ll3 && ar.bf == 2 && E % 3 == 0 && (T == 3 || T == 4)) {
-        ar.bf = 3;
+    unsigned char* generations = d.ar_generation;
+    const bool four = ar_ll4 && E % 4 == 0;
+    const bool three = ar_ll3 && E % 3 == 0;
+    if ((three || four) && ar.bf == 2 && (T == 3 || T == 4)) {
+        ar.bf = four ? 4 : 3;
         counter += T - 2;
-        const size_t offset = (size_t)S * DT * E + (T == 4 ? (size_t)S * (E/3) * 3 * 2 : 0);
+        const size_t words_per_token = four ? E : (E/3)*2;
+        const size_t offset = (size_t)S * DT * E + (T == 4 ? (size_t)S * words_per_token * 3 : 0);
+        if (four) {
+            ar.exception_stride = S * T * (E/4);
+            if (T == 4) generations += 2 * 3 * (E/4);
+        }
         for (int j = 0; j < S; ++j)
             for (int parity = 0; parity < 2; ++parity)
                 ar.buf[j][parity] += offset;
@@ -326,7 +341,9 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
             void* params[] = { (void*)&val... };
             HY_CK(cudaLaunchCooperativeKernel((const void*)kd_art_a<true>, grid, dim3(256), params, 0, s.st));
         }, args);
-    } else if (ar.bf == 3)
+    } else if (ar.bf == 4)
+        kd_push_ll4<<<1, 256, 0, s.st>>>(x1, x2, tn, ar, s.g, S, counter, generations);
+    else if (ar.bf == 3)
         kd_push_ll3<<<1, 256, 0, s.st>>>(x1, x2, tn, ar, s.g, S, counter);
     else if (push_seq)
         (push_one ? kd_push_seq1 : kd_push_seq)<<<ar_push_blocks, ar_push_threads, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, ar, s.g, S, counter,
