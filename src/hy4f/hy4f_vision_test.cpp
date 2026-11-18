@@ -2,9 +2,14 @@
 // compare them with a llama.cpp reference dump (tools/hy4f_vision_ref).
 //
 // usage: hy4f_vision_test --mmproj <mmproj.gguf> --image <file> [--gpu N] [--out DIR] [--ref DIR] [--iters N] [--mrope]
+//                         [--arena-mib X | --min | --fast] [--dev-out] [--share-cublas] [--plan WxH,WxH,...]
+//   arena: --fast (default) = all heads x 64 queries per attention pass, --min = the smallest that works,
+//   --arena-mib = a fixed budget.  --dev-out: embeddings into a device buffer (copied back for the check).
+//   --plan: print n_tokens and the min / fast arena for sizes and exit.
 //   out: embd.f32 [n_tokens][n_embd], pos.i32 [n_tokens][4] = (t, w, h, z) like mtmd's (t, x, y, z), meta.txt
 #include "hy4f_vision.hpp"
 
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -34,7 +39,9 @@ static double ms_since(std::chrono::steady_clock::time_point t) {
 int main(int argc, char** argv) {
     std::string mmproj, image, out_dir, ref_dir;
     int gpu = 0, iters = 3;
-    bool mrope = false;
+    bool mrope = false, use_min = false, dev_out = false, share_cublas = false;
+    double arena_mib = 0;
+    std::string plan;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -45,53 +52,112 @@ int main(int argc, char** argv) {
         else if (a == "--ref") ref_dir = next();
         else if (a == "--iters") iters = std::max(1, std::atoi(next().c_str()));
         else if (a == "--mrope") mrope = true;
+        else if (a == "--min") use_min = true;
+        else if (a == "--fast") use_min = false, arena_mib = 0;
+        else if (a == "--arena-mib") arena_mib = std::atof(next().c_str());
+        else if (a == "--dev-out") dev_out = true;
+        else if (a == "--share-cublas") share_cublas = true;
+        else if (a == "--plan") plan = next();
         else {
             std::fprintf(stderr, "unknown arg %s\n", a.c_str());
             return 2;
         }
     }
-    if (mmproj.empty() || image.empty()) {
+    if (mmproj.empty() || (image.empty() && plan.empty())) {
         std::fprintf(stderr, "usage: %s --mmproj F --image F [--gpu N] [--out DIR] [--ref DIR] [--iters N] [--mrope]\n", argv[0]);
         return 2;
     }
     std::string err;
-    auto t0 = std::chrono::steady_clock::now();
-    Image img;
-    if (!load_image(image, img, err)) {
-        std::fprintf(stderr, "%s\n", err.c_str());
-        return 1;
-    }
-    const double ms_decode = ms_since(t0);
-    t0 = std::chrono::steady_clock::now();
     size_t free0 = 0, total = 0, free1 = 0;
     cudaSetDevice(gpu);
     cudaFree(nullptr);
     cudaMemGetInfo(&free0, &total);
+    auto t0 = std::chrono::steady_clock::now();
     Encoder enc;
     Options o;
-    o.gpu = gpu;
     o.verbose = true;
     if (!enc.load(mmproj, o, err)) {
         std::fprintf(stderr, "load: %s\n", err.c_str());
         return 1;
     }
     const double ms_load = ms_since(t0);
-    std::printf("image %dx%d, decode %.1f ms, encoder load %.0f ms\n", img.w, img.h, ms_decode, ms_load);
+    cudaMemGetInfo(&free1, &total);
+    std::printf("encoder load %.0f ms (pinned host), device memory after load %+.1f MiB\n", ms_load,
+                ((double) free0 - (double) free1) / 1048576.0);
+    if (!plan.empty()) {
+        std::stringstream ss(plan);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            int w = 0, h = 0;
+            if (std::sscanf(item.c_str(), "%dx%d", &w, &h) != 2) continue;
+            int ow = 0, oh = 0, tw = 0, th = 0;
+            const int nt = image_tokens(w, h, &ow, &oh, &tw, &th);
+            std::printf("plan %dx%d (%.2f MP) -> %dx%d, %d patches, %d tokens (Encoder::n_tokens %d); arena min %.1f MiB, "
+                        "fast %.1f MiB\n",
+                        w, h, w * h / 1e6, tw, th, (tw / 16) * (th / 16), nt, enc.n_tokens(w, h),
+                        enc.arena_bytes(w, h, false) / 1048576.0, enc.arena_bytes(w, h, true) / 1048576.0);
+        }
+        if (image.empty()) return 0;
+    }
+    t0 = std::chrono::steady_clock::now();
+    Image img;
+    if (!load_image(image, img, err)) {
+        std::fprintf(stderr, "%s\n", err.c_str());
+        return 1;
+    }
+    const double ms_decode = ms_since(t0);
+    const size_t abytes = arena_mib > 0 ? (size_t) (arena_mib * 1048576.0) : enc.arena_bytes(img.w, img.h, !use_min);
+    std::printf("image %dx%d, decode %.1f ms; arena %.1f MiB (min %.1f, fast %.1f)\n", img.w, img.h, ms_decode,
+                abytes / 1048576.0, enc.arena_bytes(img.w, img.h, false) / 1048576.0,
+                enc.arena_bytes(img.w, img.h, true) / 1048576.0);
+    void* arena_ptr = nullptr;
+    if (cudaMalloc(&arena_ptr, abytes) != cudaSuccess) {
+        std::fprintf(stderr, "cannot allocate the arena\n");
+        return 1;
+    }
+    cudaStream_t stream = nullptr;
+    cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+    Arena arena;
+    arena.dev_ptr = arena_ptr;
+    arena.bytes = abytes;
+    arena.gpu = gpu;
+    arena.stream = stream;
+    cublasHandle_t caller_cb = nullptr;
+    if (share_cublas) {  // stands in for the LM's handle; created before the baseline so it is not counted
+        cublasCreate(&caller_cb);
+        arena.cublas = caller_cb;
+        cudaMemGetInfo(&free0, &total);
+        free0 += abytes;  // the baseline before the arena (dst is allocated below)
+    }
+    const int nt_plan = enc.n_tokens(img.w, img.h);
+    float* dst = nullptr;
+    if (dev_out && cudaMalloc(&dst, (size_t) nt_plan * enc.n_embd() * 4) != cudaSuccess) {
+        std::fprintf(stderr, "cannot allocate the output\n");
+        return 1;
+    }
 
     Output out;
     for (int it = 0; it < iters; ++it) {
         t0 = std::chrono::steady_clock::now();
-        if (!enc.encode(img, out, err, true, mrope ? PosMode::Mrope2D : PosMode::Sequential)) {
+        if (!enc.encode(img, out, err, arena, dst, mrope ? PosMode::Mrope2D : PosMode::Sequential)) {
             std::fprintf(stderr, "encode: %s\n", err.c_str());
             return 1;
         }
-        std::printf("iter %d: resized %dx%d grid %dx%d (+newline) -> %d tokens; preprocess %.1f ms, gpu %.1f ms, total "
-                    "(incl. D2H) %.1f ms\n",
-                    it, out.img_w, out.img_h, out.ow, out.oh, out.n_tokens, out.ms_preprocess, out.ms_gpu, ms_since(t0));
+        std::printf("iter %d: resized %dx%d grid %dx%d (+newline) -> %d tokens (planned %d); attention tile %d heads x "
+                    "%d queries; preprocess %.1f ms, gpu %.1f ms, total %.1f ms\n",
+                    it, out.img_w, out.img_h, out.ow, out.oh, out.n_tokens, nt_plan, out.attn_heads, out.attn_queries,
+                    out.ms_preprocess, out.ms_gpu, ms_since(t0));
     }
-    cudaMemGetInfo(&free1, &total);
-    std::printf("n_pos (text advance) %d; device memory used by the encoder (weights + buffers) %.0f MiB\n", out.n_pos,
-                (double) (free0 - free1) / 1048576.0);
+    size_t free2 = 0;
+    cudaMemGetInfo(&free2, &total);
+    std::printf("n_pos (text advance) %d; device memory besides the arena%s: %.1f MiB\n", out.n_pos,
+                dev_out ? " and the output" : "",
+                ((double) free0 - (double) free2 - (double) abytes - (dev_out ? (double) nt_plan * enc.n_embd() * 4 : 0)) /
+                    1048576.0);
+    if (dev_out) {
+        out.embd.resize((size_t) out.n_tokens * out.n_embd);
+        cudaMemcpy(out.embd.data(), dst, out.embd.size() * 4, cudaMemcpyDeviceToHost);
+    }
 
     std::vector<int32_t> pos4((size_t) out.n_tokens * 4);
     for (int i = 0; i < out.n_tokens; ++i) {

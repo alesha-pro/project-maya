@@ -1,8 +1,21 @@
-// src/hy4f/hy4f_vision.cu - maya-hy4f vision: the Hy4 flash ViT (27 layers) + rmsnorm/conv projector on one GPU.
-// Math and the splicing contract: hy4f_vision.hpp.  Precision: the ViT linears run on tensor cores with F16 operands
-// (the BF16 weights converted to F16 at load, exact for |w| >= 2^-14) and F32 accumulation, the residual stream, norms,
-// softmax and the whole projector (F32 weights in the GGUF) in F32.  Attention = cuBLAS strided-batched GEMMs over
-// the 16 heads per query chunk (S in F32, P in F16), so the scratch stays bounded at 4 MP (16384 patches).
+// src/hy4f/hy4f_vision.cu - maya-hy4f vision: the Hy4 flash ViT (27 layers) + rmsnorm/conv projector on one GPU,
+// inside a caller-provided device arena.  Math and the splicing contract: hy4f_vision.hpp.
+//
+// Memory: the weights live in pinned host memory; per encode they are streamed through two slots of the arena
+// (items: the patch-embedding conv, the 27 ViT layers, then the projector convs in row chunks), the copy of item i+2 waiting for the compute of
+// item i (events), so H2D overlaps compute.  The 128x128 position grid is read in place (mapped pinned memory).
+// Arena layout (256-byte aligned regions), N = patches, D = 1152:
+//   slot0 | slot1                 2 x 29.1 MiB (one ViT layer: q|k|v|o|up|down F16 + biases / LN F32)
+//   WS  4 MiB                     cuBLAS workspace
+//   X   [N][D] F32                residual stream; later the RMS output, then the projector's mm.2 output
+//   R   N * 8D bytes              u8 image + im2col patches -> qkv [N][3D] F16 + LN out / attention out [N][D] F16;
+//                                 MLP token chunks (up F32 + gelu F16) reuse the qkv part; projector: g | m0 (F32)
+//   SCR rest                      only for the non-flash fallback (HY4F_VISION_ATTN=gemm or head dim > 80):
+//                                 S [hg][qc][N] F32 + P F16 + per-head out for hg heads x qc queries (linear in N)
+// Attention: k_flash_attn (WMMA, two passes over the key tiles, shared-memory scratch only) - the arena needs no
+// attention scratch: arena = 2 slots + 4 MiB + 13.5 KiB per patch.
+// Precision: ViT linears on tensor cores with F16 operands (BF16 weights -> F16 at load, exact for |w| >= 2^-14) and
+// F32 accumulation; residual stream, norms, softmax and the projector (F32 weights) in F32.
 #include "hy4f_vision.hpp"
 #include "hy4f_vision_pre.hpp"
 
@@ -11,6 +24,7 @@
 #include <cublas_v2.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 
 #include <algorithm>
 #include <chrono>
@@ -18,7 +32,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <stdexcept>
+#include <thread>
 
 namespace strata::hy4f::vision {
 
@@ -36,6 +52,10 @@ namespace {
     } while (0)
 
 enum : uint32_t { G_F32 = 0, G_F16 = 1, G_BF16 = 30 };
+
+constexpr size_t AL = 256;
+constexpr size_t WS_BYTES = size_t(4) << 20;  // cuBLAS workspace, inside the arena
+inline size_t al(size_t x) { return (x + AL - 1) / AL * AL; }
 
 // ---------------------------------------------------------------- kernels
 
@@ -65,17 +85,6 @@ __device__ float block_max(float v, float* sh) {
     __syncthreads();
     float r = lane < nw ? sh[lane] : -INFINITY;
     return warp_max(r);
-}
-
-__global__ void k_bf16_to_f16(const uint16_t* s, __half* d, size_t n) {
-    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
-        const uint32_t u = (uint32_t) s[i] << 16;
-        d[i] = __float2half_rn(__uint_as_float(u));
-    }
-}
-__global__ void k_f32_to_f16(const float* s, __half* d, size_t n) {
-    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
-        d[i] = __float2half_rn(s[i]);
 }
 
 // im2col of the 16x16 patches + normalize: patches[p][c*P*P + kh*P + kw], p = py*pw + px
@@ -187,19 +196,6 @@ __global__ void k_rmsnorm(const float* x, const float* add, const float* w, floa
     }
 }
 
-// qkv [N][3D] F32 + bias -> q, k, v [N][D] F16
-__global__ void k_qkv_split(const float* qkv, const float* b, __half* q, __half* k, __half* v, int N, int D) {
-    const size_t n = (size_t) N * 3 * D;
-    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
-        const int col = (int) (i % (3 * D));
-        const size_t row = i / (3 * D);
-        const __half h = __float2half_rn(qkv[i] + b[col]);
-        const int part = col / D, c = col % D;
-        __half* dst = part == 0 ? q : part == 1 ? k : v;
-        dst[row * D + c] = h;
-    }
-}
-
 // row softmax(s * scale) -> P (F16); one block per row of n keys
 __global__ void k_softmax(const float* S, __half* P, int n, float scale) {
     __shared__ float sh[32];
@@ -213,18 +209,6 @@ __global__ void k_softmax(const float* S, __half* P, int n, float scale) {
     sum = block_sum(sum, sh);
     const float inv = 1.0f / sum;
     for (int i = threadIdx.x; i < n; i += blockDim.x) p[i] = __float2half_rn(expf(s[i] * scale - mx) * inv);
-}
-
-// ot [head][query][dh] F32 -> o [query][head*dh] F16
-__global__ void k_merge_heads(const float* ot, __half* o, int nq, int nh, int dh) {
-    const size_t n = (size_t) nq * nh * dh;
-    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
-        const int d = (int) (i % dh);
-        const size_t r = i / dh;
-        const int h = (int) (r % nh);
-        const size_t q = r / nh;
-        o[i] = __float2half_rn(ot[((size_t) h * nq + q) * dh + d]);
-    }
 }
 
 // one-pass variant: the row (n <= NT * 16) is read once into registers (S is the attention's memory bottleneck)
@@ -297,59 +281,245 @@ __global__ void k_emit(const float* m2, const float* b, const float* nl, float* 
     }
 }
 
+// ---- flash attention (WMMA F16 -> F32, sm_80+): one block = 128 queries (8 warps x 16 rows) of one head; keys in
+// tiles of 32; head dim padded to 80.  Two passes over the keys: (1) row max / sum of exp, (2) P = exp(s - m) / l
+// (F16, as the GEMM path) and O += P V in WMMA accumulators.  No score matrix in memory: the scratch is shared memory.
+constexpr int FA_DP = 80, FA_LD = 88, FA_BK = 32, FA_WARPS = 8, FA_BQ = FA_WARPS * 16, FA_SLD = 36, FA_PLD = 40;
+constexpr int FA_SMEM = 40960;  // max(Q staging 128x88 F16, K|V|S|P tiles, O staging 8x16x80 F32)
+
+__global__ void __launch_bounds__(FA_WARPS * 32) k_flash_attn(const __half* qkv, __half* out, int N, int D, int dh,
+                                                              float scale_log2) {
+    using namespace nvcuda;
+    __shared__ __align__(128) unsigned char sm[FA_SMEM];
+    const int h = blockIdx.y, q0 = blockIdx.x * FA_BQ;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const size_t ld = (size_t) 3 * D;
+    const __half* Qg = qkv + (size_t) h * dh;
+    const __half* Kg = qkv + D + (size_t) h * dh;
+    const __half* Vg = qkv + 2 * (size_t) D + (size_t) h * dh;
+    constexpr int CH = FA_DP / 8;  // 16-byte chunks per padded row
+    const uint4 z = make_uint4(0, 0, 0, 0);
+
+    __half* Qs = (__half*) sm;
+    for (int i = threadIdx.x; i < FA_BQ * CH; i += blockDim.x) {
+        const int r = i / CH, c = (i % CH) * 8;
+        uint4 v = z;
+        if (q0 + r < N && c < dh) v = *(const uint4*) (Qg + (size_t) (q0 + r) * ld + c);
+        *(uint4*) (Qs + r * FA_LD + c) = v;
+    }
+    __syncthreads();
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> qf[FA_DP / 16];
+#pragma unroll
+    for (int k = 0; k < FA_DP / 16; ++k) wmma::load_matrix_sync(qf[k], Qs + warp * 16 * FA_LD + k * 16, FA_LD);
+    __syncthreads();
+
+    __half* Ks = (__half*) sm;
+    __half* Vs = Ks + FA_BK * FA_LD;
+    float* Ss = (float*) (sm + 2 * FA_BK * FA_LD * 2) + warp * 16 * FA_SLD;
+    __half* Ps = (__half*) (sm + 2 * FA_BK * FA_LD * 2 + FA_WARPS * 16 * FA_SLD * 4) + warp * 16 * FA_PLD;
+    auto load_tile = [&](const __half* G, __half* T_, int k0) {
+        for (int i = threadIdx.x; i < FA_BK * CH; i += blockDim.x) {
+            const int r = i / CH, c = (i % CH) * 8;
+            uint4 v = z;
+            if (k0 + r < N && c < dh) v = *(const uint4*) (G + (size_t) (k0 + r) * ld + c);
+            *(uint4*) (T_ + r * FA_LD + c) = v;
+        }
+    };
+    auto scores = [&]() {  // Ss[16][32] = Q_w K_tile^T (raw)
+#pragma unroll
+        for (int j = 0; j < FA_BK / 16; ++j) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> sf;
+            wmma::fill_fragment(sf, 0.f);
+#pragma unroll
+            for (int k = 0; k < FA_DP / 16; ++k) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> kf;
+                wmma::load_matrix_sync(kf, Ks + j * 16 * FA_LD + k * 16, FA_LD);
+                wmma::mma_sync(sf, qf[k], kf, sf);
+            }
+            wmma::store_matrix_sync(Ss + j * 16, sf, FA_SLD, wmma::mem_row_major);
+        }
+        __syncwarp();
+    };
+    const int r = lane >> 1, c0 = (lane & 1) * 16;
+
+    float m = -INFINITY, l = 0.f;
+    for (int k0 = 0; k0 < N; k0 += FA_BK) {
+        __syncthreads();
+        load_tile(Kg, Ks, k0);
+        __syncthreads();
+        scores();
+        float v[16], tm = -INFINITY;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            v[j] = k0 + c0 + j < N ? Ss[r * FA_SLD + c0 + j] * scale_log2 : -INFINITY;
+            tm = fmaxf(tm, v[j]);
+        }
+        tm = fmaxf(tm, __shfl_xor_sync(0xffffffffu, tm, 1));
+        const float mn = fmaxf(m, tm);
+        float s = 0.f;
+#pragma unroll
+        for (int j = 0; j < 16; ++j) s += exp2f(v[j] - mn);
+        s += __shfl_xor_sync(0xffffffffu, s, 1);
+        l = l * exp2f(m - mn) + s;
+        m = mn;
+        __syncwarp();
+    }
+    const float inv_l = 1.0f / l;
+
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> of[FA_DP / 16];
+#pragma unroll
+    for (int n = 0; n < FA_DP / 16; ++n) wmma::fill_fragment(of[n], 0.f);
+    for (int k0 = 0; k0 < N; k0 += FA_BK) {
+        __syncthreads();
+        load_tile(Kg, Ks, k0);
+        load_tile(Vg, Vs, k0);
+        __syncthreads();
+        scores();
+#pragma unroll
+        for (int j = 0; j < 16; ++j) {
+            const float p = k0 + c0 + j < N ? exp2f(Ss[r * FA_SLD + c0 + j] * scale_log2 - m) * inv_l : 0.f;
+            Ps[r * FA_PLD + c0 + j] = __float2half_rn(p);
+        }
+        __syncwarp();
+#pragma unroll
+        for (int kk = 0; kk < FA_BK / 16; ++kk) {
+            wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> pf;
+            wmma::load_matrix_sync(pf, Ps + kk * 16, FA_PLD);
+#pragma unroll
+            for (int n = 0; n < FA_DP / 16; ++n) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> vf;
+                wmma::load_matrix_sync(vf, Vs + kk * 16 * FA_LD + n * 16, FA_LD);
+                wmma::mma_sync(of[n], pf, vf, of[n]);
+            }
+        }
+        __syncwarp();
+    }
+    __syncthreads();
+    float* Os = (float*) sm + warp * 16 * FA_DP;
+#pragma unroll
+    for (int n = 0; n < FA_DP / 16; ++n) wmma::store_matrix_sync(Os + n * 16, of[n], FA_DP, wmma::mem_row_major);
+    __syncwarp();
+    for (int i = lane; i < 16 * dh; i += 32) {
+        const int rr = i / dh, cc = i % dh, q = q0 + warp * 16 + rr;
+        if (q < N) out[(size_t) q * D + (size_t) h * dh + cc] = __float2half_rn(Os[rr * FA_DP + cc]);
+    }
+}
+
+// y (F16, [rows][cols]) += b  (in place)
+__global__ void k_add_bias_f16(__half* y, const float* b, size_t n, int cols) {
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        y[i] = __float2half_rn(__half2float(y[i]) + b[i % cols]);
+}
+
+// x (F32, [rows][cols]) += b
+__global__ void k_add_bias_f32(float* x, const float* b, size_t n, int cols) {
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x)
+        x[i] += b[i % cols];
+}
+
+// ot [hg][nq][dh] F32 -> o[q][(h0 + h) * dh + d] F16 (o row stride ldo)
+__global__ void k_merge_heads(const float* ot, __half* o, int nq, int hg, int dh, int h0, int ldo) {
+    const size_t n = (size_t) nq * hg * dh;
+    for (size_t i = blockIdx.x * (size_t) blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const int d = (int) (i % dh);
+        const size_t r = i / dh;
+        const int h = (int) (r % hg);
+        const size_t q = r / hg;
+        o[q * ldo + (size_t) (h0 + h) * dh + d] = __float2half_rn(ot[((size_t) h * nq + q) * dh + d]);
+    }
+}
+
 int grid_for(size_t n, int bs = 256) { return (int) std::min<size_t>((n + bs - 1) / bs, 65535 * 4); }
 
-template <class T> struct DevBuf {
-    T* p = nullptr;
+struct PinnedBuf {
+    void* p = nullptr;
     size_t n = 0;
-    void need(size_t m) {
-        if (m <= n) return;
-        if (p) cudaFree(p);
-        p = nullptr;
-        HV_CK(cudaMalloc(&p, m * sizeof(T)));
-        n = m;
+    void alloc(size_t bytes) {
+        HV_CK(cudaHostAlloc(&p, bytes, cudaHostAllocPortable | cudaHostAllocMapped));
+        n = bytes;
     }
-    ~DevBuf() {
-        if (p) cudaFree(p);
+    ~PinnedBuf() {
+        if (p) cudaFreeHost(p);
     }
 };
 
+// host float -> F16 bits (round to nearest even), the same as __float2half_rn
+inline uint16_t f2h(float f) {
+    __half h = __float2half_rn(f);
+    __half_raw r = h;
+    return r.x;
+}
+
 }  // namespace
+
+int image_tokens(int w, int h, int* ow, int* oh, int* tw, int* th, int min_pixels, int max_pixels, int patch, int merge) {
+    int a = 0, b = 0;
+    detail::smart_size(w, h, patch * merge, min_pixels, max_pixels, a, b);
+    const int gw = a / (patch * merge), gh = b / (patch * merge);
+    if (ow) *ow = gw;
+    if (oh) *oh = gh;
+    if (tw) *tw = a;
+    if (th) *th = b;
+    return (gw + 1) * gh;
+}
+
+void image_positions(int ow, int oh, PosMode mode, std::vector<Pos>& pos, int& n_pos) {
+    const int nx = ow + 1, n = nx * oh;
+    pos.resize(n);
+    if (mode == PosMode::Sequential) {
+        for (int i = 0; i < n; ++i) pos[i] = {i, i, i};
+        n_pos = n;
+    } else {
+        for (int i = 0; i < n; ++i) pos[i] = {0, i / nx, i % nx};
+        n_pos = std::max(nx, oh);
+    }
+}
 
 struct Encoder::Impl {
     Options opt;
     int D = 0, NH = 0, DH = 0, F = 0, L = 0, P = 0, merge = 2, O = 0, NG = 0;
     int min_pixels = 0, max_pixels = 0;
+    bool flash = true;  // WMMA flash attention (head dim <= 80, multiple of 8); else the tiled cuBLAS path
     float eps = 1e-5f, mean[3] = {0.5f, 0.5f, 0.5f}, stdv[3] = {0.5f, 0.5f, 0.5f};
 
-    cudaStream_t st = nullptr;
-    cublasHandle_t cb = nullptr;
-    std::vector<void*> allocs;
+    // pinned host weights
+    struct LayerOff {
+        size_t wqkv, wo, wup, wdown, bqkv, bo, bup, bdown, ln1w, ln1b, ln2w, ln2b, bytes;
+    } lo{};
+    PinnedBuf layers;     // L x lo.bytes
+    PinnedBuf proj;       // mm.0 [4D][4D] F32 then mm.2 [O][4D] F32
+    PinnedBuf grid;       // position grid [NG*NG][D] F32, read in place by the GPU (mapped)
+    PinnedBuf patchw;     // patch conv [D][3*P*P] F32 (streamed as the first item)
+    const float* grid_dev = nullptr;
+    size_t slot_bytes = 0;
+    int rows_per_chunk = 0;  // projector rows per streamed item
+    // small host params, uploaded once per GPU
+    std::vector<float> patch_b, pre_norm, mm0b, mm2b, newline;
 
-    float *patch_w = nullptr, *patch_b = nullptr, *pos_grid = nullptr;
-    struct Layer {
-        __half *wqkv, *wo, *wup, *wdown;
-        float *bqkv, *bo, *bup, *bdown, *ln1w, *ln1b, *ln2w, *ln2b;
+    struct Gpu {
+        int dev = -1;
+        cublasHandle_t cb = nullptr;
+        cudaStream_t cs = nullptr;  // copy stream
+        cudaEvent_t ready[2] = {}, freed[2] = {}, start = nullptr;
+        void* fixed = nullptr;
+        float *patch_b = nullptr, *pre_norm = nullptr, *mm0b = nullptr, *mm2b = nullptr,
+              *newline = nullptr;
+        size_t fixed_bytes = 0;
     };
-    std::vector<Layer> layers;
-    float *pre_norm = nullptr, *mm0w = nullptr, *mm0b = nullptr, *mm2w = nullptr, *mm2b = nullptr, *newline = nullptr;
-
-    DevBuf<uint8_t> d_img;
-    DevBuf<float> d_patches, d_x, d_tmp, d_S, d_ot, d_xr, d_g, d_m0, d_m2, d_out;
-    DevBuf<__half> d_h, d_q, d_k, d_v, d_o, d_P;
+    std::map<int, Gpu> gpus;
 
     ~Impl() {
-        if (opt.gpu >= 0) cudaSetDevice(opt.gpu);
-        for (void* p : allocs) cudaFree(p);
-        if (cb) cublasDestroy(cb);
-        if (st) cudaStreamDestroy(st);
-    }
-
-    template <class T> T* dalloc(size_t n) {
-        void* p = nullptr;
-        HV_CK(cudaMalloc(&p, n * sizeof(T)));
-        allocs.push_back(p);
-        return (T*) p;
+        for (auto& [dev, g] : gpus) {
+            cudaSetDevice(dev);
+            if (g.cb) cublasDestroy(g.cb);
+            for (int i = 0; i < 2; ++i) {
+                if (g.ready[i]) cudaEventDestroy(g.ready[i]);
+                if (g.freed[i]) cudaEventDestroy(g.freed[i]);
+            }
+            if (g.start) cudaEventDestroy(g.start);
+            if (g.cs) cudaStreamDestroy(g.cs);
+            if (g.fixed) cudaFree(g.fixed);
+        }
     }
 
     const strata::TensorInfo& T(const strata::GgufFile& g, const std::string& n, uint64_t elems) {
@@ -362,56 +532,45 @@ struct Encoder::Impl {
             throw std::runtime_error("hy4f_vision: " + n + " has unsupported type " + std::to_string(t->type));
         return *t;
     }
-
-    // a tensor as F32 on the device (into dst when given)
-    float* up_f32(const strata::GgufFile& g, const std::string& n, uint64_t elems, float* dst = nullptr) {
-        const auto& t = T(g, n, elems);
-        const size_t ne = t.elements();
-        if (!dst) dst = dalloc<float>(ne);
-        const uint8_t* src = g.tensor_data(t);
+    static float elem(const strata::TensorInfo& t, const uint8_t* src, size_t i) {
         if (t.type == G_F32) {
-            HV_CK(cudaMemcpy(dst, src, ne * 4, cudaMemcpyHostToDevice));
-        } else {
-            std::vector<float> h(ne);
-            for (size_t i = 0; i < ne; ++i) {
-                uint16_t u;
-                std::memcpy(&u, src + 2 * i, 2);
-                if (t.type == G_BF16) {
-                    const uint32_t b = (uint32_t) u << 16;
-                    std::memcpy(&h[i], &b, 4);
-                } else {
-                    __half_raw hr;
-                    hr.x = u;
-                    h[i] = __half2float(__half(hr));
-                }
-            }
-            HV_CK(cudaMemcpy(dst, h.data(), ne * 4, cudaMemcpyHostToDevice));
+            float f;
+            std::memcpy(&f, src + 4 * i, 4);
+            return f;
         }
-        return dst;
+        uint16_t u;
+        std::memcpy(&u, src + 2 * i, 2);
+        if (t.type == G_BF16) {
+            const uint32_t b = (uint32_t) u << 16;
+            float f;
+            std::memcpy(&f, &b, 4);
+            return f;
+        }
+        __half_raw hr;
+        hr.x = u;
+        return __half2float(__half(hr));
     }
-
-    // a tensor as F16 on the device at dst (staged through `stage`)
-    void up_f16(const strata::GgufFile& g, const std::string& n, uint64_t elems, __half* dst, DevBuf<uint8_t>& stage) {
+    void to_f32(const strata::GgufFile& g, const std::string& n, uint64_t elems, float* dst) {
         const auto& t = T(g, n, elems);
-        const size_t ne = t.elements();
         const uint8_t* src = g.tensor_data(t);
-        if (t.type == G_F16) {
-            HV_CK(cudaMemcpyAsync(dst, src, ne * 2, cudaMemcpyHostToDevice, st));
-            HV_CK(cudaStreamSynchronize(st));
-            return;
-        }
-        const size_t bytes = ne * (t.type == G_F32 ? 4 : 2);
-        stage.need(bytes);
-        // same stream as the conversion: a pageable cudaMemcpy may return before its DMA lands, and st is non-blocking
-        HV_CK(cudaMemcpyAsync(stage.p, src, bytes, cudaMemcpyHostToDevice, st));
-        if (t.type == G_BF16)
-            k_bf16_to_f16<<<grid_for(ne), 256, 0, st>>>((const uint16_t*) stage.p, dst, ne);
+        const size_t ne = t.elements();
+        if (t.type == G_F32) std::memcpy(dst, src, ne * 4);
         else
-            k_f32_to_f16<<<grid_for(ne), 256, 0, st>>>((const float*) stage.p, dst, ne);
-        HV_CK(cudaGetLastError());
-        HV_CK(cudaStreamSynchronize(st));
+            for (size_t i = 0; i < ne; ++i) dst[i] = elem(t, src, i);
     }
-
+    std::vector<float> vec_f32(const strata::GgufFile& g, const std::string& n, uint64_t elems) {
+        std::vector<float> v(elems);
+        to_f32(g, n, elems, v.data());
+        return v;
+    }
+    void to_f16(const strata::GgufFile& g, const std::string& n, uint64_t elems, uint16_t* dst) {
+        const auto& t = T(g, n, elems);
+        const uint8_t* src = g.tensor_data(t);
+        const size_t ne = t.elements();
+        if (t.type == G_F16) std::memcpy(dst, src, ne * 2);
+        else
+            for (size_t i = 0; i < ne; ++i) dst[i] = f2h(elem(t, src, i));
+    }
     uint64_t meta_u(const strata::GgufFile& g, const std::string& k) {
         const strata::MetaValue* v = g.get(k);
         if (!v || !v->is_num()) throw std::runtime_error("hy4f_vision: missing key " + k);
@@ -419,12 +578,8 @@ struct Encoder::Impl {
     }
 
     void load(const std::string& path) {
-        HV_CK(cudaSetDevice(opt.gpu));
-        HV_CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
-        HV_CB(cublasCreate(&cb));
-        HV_CB(cublasSetStream(cb, st));
-        HV_CB(cublasSetMathMode(cb, CUBLAS_DEFAULT_MATH));  // no TF32 for the F32 projector GEMMs
-
+        int ndev = 0;
+        HV_CK(cudaGetDeviceCount(&ndev));  // a context for cudaHostAlloc
         strata::GgufFile g(path);
         const strata::MetaValue* pt = g.get("clip.projector_type");
         if (!pt || pt->s != "hy_v4_flash") throw std::runtime_error("hy4f_vision: projector_type is not hy_v4_flash");
@@ -442,207 +597,381 @@ struct Encoder::Impl {
             for (int i = 0; i < 3; ++i) mean[i] = (float) m->items[i].num();
         if (const strata::MetaValue* s = g.get("clip.vision.image_std"); s && s->items.size() == 3)
             for (int i = 0; i < 3; ++i) stdv[i] = (float) s->items[i].num();
-        DH = D / NH;
-        if (merge != 2 || D % NH || D > 4 * 512 || (int64_t) D * NH == 0)
+        DH = NH ? D / NH : 0;
+        flash = DH <= FA_DP && DH % 8 == 0 && D % 8 == 0;
+        if (const char* e = std::getenv("HY4F_VISION_ATTN"); e && std::string(e) == "gemm") flash = false;
+        // the arena layout relies on: 2x2 merge, im2col patches and the u8 image fit R, the mm.2 output fits X
+        if (merge != 2 || D % NH || D > 4 * 1024 || 3 * P * P * 4 + P * P * 3 > 8 * D || O > 4 * D)
             throw std::runtime_error("hy4f_vision: unexpected geometry");
         const strata::TensorInfo* tp = g.find("v.position_embd.weight");
         if (!tp) throw std::runtime_error("hy4f_vision: missing v.position_embd.weight");
         const int64_t npos = (int64_t) (tp->elements() / D);
         NG = (int) std::lround(std::sqrt((double) npos));
         if ((int64_t) NG * NG != npos) throw std::runtime_error("hy4f_vision: position grid is not square");
-
-        const int K = 3 * P * P;
-        patch_w = up_f32(g, "v.patch_embd.weight", (uint64_t) K * D);
-        patch_b = up_f32(g, "v.patch_embd.bias", D);
-        pos_grid = up_f32(g, "v.position_embd.weight", (uint64_t) npos * D);
-
-        DevBuf<uint8_t> stage;
-        layers.resize(L);
-        for (int il = 0; il < L; ++il) {
-            const std::string b = "v.blk." + std::to_string(il) + ".";
-            Layer& y = layers[il];
-            y.wqkv = dalloc<__half>((size_t) 3 * D * D);
-            up_f16(g, b + "attn_q.weight", (uint64_t) D * D, y.wqkv, stage);
-            up_f16(g, b + "attn_k.weight", (uint64_t) D * D, y.wqkv + (size_t) D * D, stage);
-            up_f16(g, b + "attn_v.weight", (uint64_t) D * D, y.wqkv + (size_t) 2 * D * D, stage);
-            y.bqkv = dalloc<float>((size_t) 3 * D);
-            up_f32(g, b + "attn_q.bias", D, y.bqkv);
-            up_f32(g, b + "attn_k.bias", D, y.bqkv + D);
-            up_f32(g, b + "attn_v.bias", D, y.bqkv + 2 * D);
-            y.wo = dalloc<__half>((size_t) D * D);
-            up_f16(g, b + "attn_out.weight", (uint64_t) D * D, y.wo, stage);
-            y.bo = up_f32(g, b + "attn_out.bias", D);
-            y.wup = dalloc<__half>((size_t) F * D);
-            up_f16(g, b + "ffn_up.weight", (uint64_t) F * D, y.wup, stage);
-            y.bup = up_f32(g, b + "ffn_up.bias", F);
-            y.wdown = dalloc<__half>((size_t) D * F);
-            up_f16(g, b + "ffn_down.weight", (uint64_t) D * F, y.wdown, stage);
-            y.bdown = up_f32(g, b + "ffn_down.bias", D);
-            y.ln1w = up_f32(g, b + "ln1.weight", D);
-            y.ln1b = up_f32(g, b + "ln1.bias", D);
-            y.ln2w = up_f32(g, b + "ln2.weight", D);
-            y.ln2b = up_f32(g, b + "ln2.bias", D);
-        }
-        pre_norm = up_f32(g, "mm.pre_norm.weight", D);
-        mm0w = up_f32(g, "mm.0.weight", (uint64_t) 4 * D * 4 * D);
-        mm0b = up_f32(g, "mm.0.bias", 4 * D);
-        mm2w = up_f32(g, "mm.2.weight", (uint64_t) 4 * D * O);
-        mm2b = up_f32(g, "mm.2.bias", O);
-        newline = up_f32(g, "v.image_newline", O);
         if (g.find("v.pre_ln.weight") || g.find("v.post_ln.weight"))
             throw std::runtime_error("hy4f_vision: unexpected pre/post LN in the encoder");
-        HV_CK(cudaDeviceSynchronize());
+
+        // one layer blob: F16 q|k|v|o|up|down, then F32 biases and LN
+        size_t o = 0;
+        auto put = [&](size_t bytes) { size_t r = o; o += al(bytes); return r; };
+        lo.wqkv = put((size_t) 3 * D * D * 2);
+        lo.wo = put((size_t) D * D * 2);
+        lo.wup = put((size_t) F * D * 2);
+        lo.wdown = put((size_t) D * F * 2);
+        lo.bqkv = put((size_t) 3 * D * 4);
+        lo.bo = put((size_t) D * 4);
+        lo.bup = put((size_t) F * 4);
+        lo.bdown = put((size_t) D * 4);
+        lo.ln1w = put((size_t) D * 4);
+        lo.ln1b = put((size_t) D * 4);
+        lo.ln2w = put((size_t) D * 4);
+        lo.ln2b = put((size_t) D * 4);
+        lo.bytes = o;
+        slot_bytes = lo.bytes;
+        rows_per_chunk = (int) (slot_bytes / ((size_t) 4 * D * 4));
+
+        layers.alloc((size_t) L * lo.bytes);
+        std::vector<std::string> errs(L);
+        auto fill = [&](int il) {
+            try {
+                uint8_t* b = (uint8_t*) layers.p + (size_t) il * lo.bytes;
+                const std::string n = "v.blk." + std::to_string(il) + ".";
+                const uint64_t DD = (uint64_t) D * D;
+                to_f16(g, n + "attn_q.weight", DD, (uint16_t*) (b + lo.wqkv));
+                to_f16(g, n + "attn_k.weight", DD, (uint16_t*) (b + lo.wqkv) + DD);
+                to_f16(g, n + "attn_v.weight", DD, (uint16_t*) (b + lo.wqkv) + 2 * DD);
+                to_f16(g, n + "attn_out.weight", DD, (uint16_t*) (b + lo.wo));
+                to_f16(g, n + "ffn_up.weight", (uint64_t) F * D, (uint16_t*) (b + lo.wup));
+                to_f16(g, n + "ffn_down.weight", (uint64_t) D * F, (uint16_t*) (b + lo.wdown));
+                to_f32(g, n + "attn_q.bias", D, (float*) (b + lo.bqkv));
+                to_f32(g, n + "attn_k.bias", D, (float*) (b + lo.bqkv) + D);
+                to_f32(g, n + "attn_v.bias", D, (float*) (b + lo.bqkv) + 2 * D);
+                to_f32(g, n + "attn_out.bias", D, (float*) (b + lo.bo));
+                to_f32(g, n + "ffn_up.bias", F, (float*) (b + lo.bup));
+                to_f32(g, n + "ffn_down.bias", D, (float*) (b + lo.bdown));
+                to_f32(g, n + "ln1.weight", D, (float*) (b + lo.ln1w));
+                to_f32(g, n + "ln1.bias", D, (float*) (b + lo.ln1b));
+                to_f32(g, n + "ln2.weight", D, (float*) (b + lo.ln2w));
+                to_f32(g, n + "ln2.bias", D, (float*) (b + lo.ln2b));
+            } catch (const std::exception& e) {
+                errs[il] = e.what();
+            }
+        };
+        {
+            std::vector<std::thread> th;
+            const int nt = std::max(1, std::min<int>(L, 16));
+            for (int t = 0; t < nt; ++t)
+                th.emplace_back([&, t] {
+                    for (int il = t; il < L; il += nt) fill(il);
+                });
+            for (auto& x : th) x.join();
+        }
+        for (auto& e : errs)
+            if (!e.empty()) throw std::runtime_error(e);
+
+        const size_t K4 = (size_t) 4 * D;
+        proj.alloc((K4 * K4 + (size_t) O * K4) * 4);
+        to_f32(g, "mm.0.weight", K4 * K4, (float*) proj.p);
+        to_f32(g, "mm.2.weight", (uint64_t) O * K4, (float*) proj.p + K4 * K4);
+        grid.alloc((size_t) npos * D * 4);
+        to_f32(g, "v.position_embd.weight", (uint64_t) npos * D, (float*) grid.p);
+        void* gd = nullptr;
+        HV_CK(cudaHostGetDevicePointer(&gd, grid.p, 0));
+        grid_dev = (const float*) gd;
+
+        patchw.alloc((size_t) 3 * P * P * D * 4);
+        to_f32(g, "v.patch_embd.weight", (uint64_t) 3 * P * P * D, (float*) patchw.p);
+        if (patchw.n > slot_bytes) throw std::runtime_error("hy4f_vision: patch conv larger than a slot");
+        patch_b = vec_f32(g, "v.patch_embd.bias", D);
+        pre_norm = vec_f32(g, "mm.pre_norm.weight", D);
+        mm0b = vec_f32(g, "mm.0.bias", K4);
+        mm2b = vec_f32(g, "mm.2.bias", O);
+        newline = vec_f32(g, "v.image_newline", O);
         if (opt.verbose)
-            std::fprintf(stderr, "hy4f_vision: D %d heads %d ffn %d layers %d patch %d proj %d grid %d px [%d, %d] eps %g\n",
-                         D, NH, F, L, P, O, NG, min_pixels, max_pixels, eps);
+            std::fprintf(stderr,
+                         "hy4f_vision: D %d heads %d ffn %d layers %d patch %d proj %d grid %d px [%d, %d] eps %g; pinned "
+                         "%.0f MiB, slot %.1f MiB\n",
+                         D, NH, F, L, P, O, NG, min_pixels, max_pixels, eps,
+                         (layers.n + proj.n + grid.n + patchw.n) / 1048576.0, slot_bytes / 1048576.0);
     }
 
-    // Y[N][M] (F32, ldy) = X[N][K] (F16) . W[M][K]^T (F16), Y = alpha XW^T + beta Y
-    void gemm_h(const __half* X, const __half* W, float* Y, int N, int M, int K, float beta) {
+    Gpu& gpu(int dev) {
+        auto it = gpus.find(dev);
+        if (it != gpus.end()) return it->second;
+        Gpu& g = gpus[dev];
+        g.dev = dev;
+        HV_CK(cudaSetDevice(dev));
+
+        HV_CK(cudaStreamCreateWithFlags(&g.cs, cudaStreamNonBlocking));
+        for (int i = 0; i < 2; ++i) {
+            HV_CK(cudaEventCreateWithFlags(&g.ready[i], cudaEventDisableTiming));
+            HV_CK(cudaEventCreateWithFlags(&g.freed[i], cudaEventDisableTiming));
+        }
+        HV_CK(cudaEventCreateWithFlags(&g.start, cudaEventDisableTiming));
+        const size_t K4 = (size_t) 4 * D;
+        size_t o = 0;
+        auto put = [&](size_t bytes) { size_t r = o; o += al(bytes); return r; };
+        const size_t opb = put(patch_b.size() * 4), opn = put(pre_norm.size() * 4), om0 = put(K4 * 4),
+                     om2 = put((size_t) O * 4), onl = put((size_t) O * 4);
+        g.fixed_bytes = o;
+        HV_CK(cudaMalloc(&g.fixed, o));
+        uint8_t* b = (uint8_t*) g.fixed;
+        g.patch_b = (float*) (b + opb);
+        g.pre_norm = (float*) (b + opn);
+        g.mm0b = (float*) (b + om0);
+        g.mm2b = (float*) (b + om2);
+        g.newline = (float*) (b + onl);
+        HV_CK(cudaMemcpy(g.patch_b, patch_b.data(), patch_b.size() * 4, cudaMemcpyHostToDevice));
+        HV_CK(cudaMemcpy(g.pre_norm, pre_norm.data(), pre_norm.size() * 4, cudaMemcpyHostToDevice));
+        HV_CK(cudaMemcpy(g.mm0b, mm0b.data(), mm0b.size() * 4, cudaMemcpyHostToDevice));
+        HV_CK(cudaMemcpy(g.mm2b, mm2b.data(), mm2b.size() * 4, cudaMemcpyHostToDevice));
+        HV_CK(cudaMemcpy(g.newline, newline.data(), newline.size() * 4, cudaMemcpyHostToDevice));
+        if (opt.verbose) std::fprintf(stderr, "hy4f_vision: GPU %d fixed allocation %.1f KiB\n", dev, o / 1024.0);
+        return g;
+    }
+
+    // arena plan for N patches
+    struct Plan {
+        size_t slot[2], ws, x, r, scr, scr_bytes, total;
+    };
+    Plan plan(int N, size_t arena_bytes) const {
+        Plan p{};
+        size_t o = 0;
+        p.slot[0] = o, o += al(slot_bytes);
+        p.slot[1] = o, o += al(slot_bytes);
+        p.ws = o, o += WS_BYTES;
+        p.x = o, o += al((size_t) N * D * 4);
+        p.r = o, o += al((size_t) N * 8 * D);
+        p.scr = o;
+        p.scr_bytes = arena_bytes > o ? arena_bytes - o : 0;
+        p.total = o;
+        return p;
+    }
+    size_t attn_bytes(int N, int hg, int qc) const {
+        return al((size_t) hg * qc * N * 4) + al((size_t) hg * qc * N * 2) + al((size_t) hg * qc * DH * 4);
+    }
+    // the attention tile for a scratch size: all heads if possible, queries in multiples of 16 (64 above 64)
+    bool attn_tile(int N, size_t scr, int& hg, int& qc) const {
+        const int qmin = std::min(N, 16);
+        for (hg = NH; hg >= 1; --hg) {
+            if (NH % hg) continue;
+            if (attn_bytes(N, hg, qmin) <= scr) break;
+        }
+        if (hg < 1) return false;
+        int lo_q = qmin, hi_q = N;
+        while (lo_q < hi_q) {  // largest qc that fits
+            const int mid = (lo_q + hi_q + 1) / 2;
+            if (attn_bytes(N, hg, mid) <= scr) lo_q = mid;
+            else hi_q = mid - 1;
+        }
+        qc = lo_q;
+        if (qc < N) qc = qc > 64 ? qc / 64 * 64 : std::max(qmin, qc / 16 * 16);
+        return true;
+    }
+
+    // Y[N][M] (ldy) = X[N][K] (F16, ldx) . W[M][K]^T (F16), C type ct
+    void gemm_h(cublasHandle_t cb, const __half* X, int ldx, const __half* W, void* Y, cudaDataType ct, int ldy, int N,
+                int M, int K, float beta) {
         const float alpha = 1.f;
-        HV_CB(cublasGemmEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, W, CUDA_R_16F, K, X, CUDA_R_16F, K, &beta, Y,
-                           CUDA_R_32F, M, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+        HV_CB(cublasGemmEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, W, CUDA_R_16F, K, X, CUDA_R_16F, ldx, &beta, Y,
+                           ct, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
     }
-    void gemm_f(const float* X, const float* W, float* Y, int N, int M, int K) {
+    void gemm_f(cublasHandle_t cb, const float* X, const float* W, float* Y, int ldy, int N, int M, int K) {
         const float alpha = 1.f, beta = 0.f;
-        HV_CB(cublasSgemm(cb, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, W, K, X, K, &beta, Y, M));
+        HV_CB(cublasSgemm(cb, CUBLAS_OP_T, CUBLAS_OP_N, M, N, K, &alpha, W, K, X, K, &beta, Y, ldy));
     }
 
-    // debug: HY4F_VISION_DUMP=<dir> saves seams as <dir>/t_<name>.f32 (llama.cpp cb names), + bias when given
-    const char* dump_dir = std::getenv("HY4F_VISION_DUMP");
-    template <class TT> void dump(const char* name, const TT* p, size_t n, const float* bias = nullptr, int cols = 0) {
-        if (!dump_dir) return;
-        HV_CK(cudaStreamSynchronize(st));
-        std::vector<TT> h(n);
-        HV_CK(cudaMemcpy(h.data(), p, n * sizeof(TT), cudaMemcpyDeviceToHost));
-        std::vector<float> f(n), b;
-        if (bias) {
-            b.resize(cols);
-            HV_CK(cudaMemcpy(b.data(), bias, cols * sizeof(float), cudaMemcpyDeviceToHost));
-        }
-        for (size_t i = 0; i < n; ++i) f[i] = (float) h[i] + (bias ? b[i % cols] : 0.f);
-        std::FILE* fp = std::fopen((std::string(dump_dir) + "/t_" + name + ".f32").c_str(), "wb");
-        if (fp) {
-            std::fwrite(f.data(), 4, n, fp);
-            std::fclose(fp);
-        }
-    }
-
-    void run(const Image& im, Output& out) {
+    void run(const Image& im, Output& out, const Arena& ar, float* dst) {
         const int W = im.w, H = im.h;
         const int pw = W / P, ph = H / P, N = pw * ph;
         const int ow = pw / merge, oh = ph / merge, M = ow * oh, NT = (ow + 1) * oh;
-        const int K = 3 * P * P;
+        const int K = 3 * P * P, K4 = 4 * D;
+        const Plan pl = plan(N, ar.bytes);
+        int hg = NH, qc = FA_BQ;
+        if (ar.bytes < pl.total || (!flash && !attn_tile(N, pl.scr_bytes, hg, qc)))
+            throw std::runtime_error("hy4f_vision: arena too small: " + std::to_string(ar.bytes) + " bytes, need >= " +
+                                     std::to_string(pl.total + (flash ? 0 : attn_bytes(N, 1, std::min(N, 16)))));
+        Gpu& g = gpu(ar.gpu);
+        HV_CK(cudaSetDevice(ar.gpu));
+        if (!ar.cublas && !g.cb) {
+            size_t f0 = 0, f1 = 0, tot = 0;
+            cudaMemGetInfo(&f0, &tot);
+            HV_CB(cublasCreate(&g.cb));
+            HV_CB(cublasSetMathMode(g.cb, CUBLAS_DEFAULT_MATH));  // no TF32 for the F32 projector GEMMs
+            cudaMemGetInfo(&f1, &tot);
+            if (opt.verbose)
+                std::fprintf(stderr, "hy4f_vision: GPU %d own cublasCreate %.1f MiB\n", ar.gpu, ((double) f0 - f1) / 1048576.0);
+        }
+        cudaStream_t st = ar.stream;
+        uint8_t* A = (uint8_t*) ar.dev_ptr;
+        cublasHandle_t cb = ar.cublas ? (cublasHandle_t) ar.cublas : g.cb;
+        cudaStream_t caller_cb_stream = nullptr;
+        if (ar.cublas) HV_CB(cublasGetStream(cb, &caller_cb_stream));
+        HV_CB(cublasSetStream(cb, st));
+        HV_CB(cublasSetWorkspace(cb, A + pl.ws, WS_BYTES));  // after SetStream, which resets it
+        struct Restore {  // a caller's handle gets its stream back (and with it cuBLAS's default workspace)
+            cublasHandle_t cb;
+            bool own;
+            cudaStream_t s;
+            ~Restore() {
+                if (!own) cublasSetStream(cb, s);
+            }
+        } restore{cb, ar.cublas == nullptr, caller_cb_stream};
 
-        d_img.need((size_t) W * H * 3);
-        d_patches.need((size_t) N * K);
-        d_x.need((size_t) N * D);
-        d_tmp.need((size_t) N * std::max(3 * D, F));
-        d_h.need((size_t) N * std::max(D, F));
-        d_q.need((size_t) N * D);
-        d_k.need((size_t) N * D);
-        d_v.need((size_t) N * D);
-        d_o.need((size_t) N * D);
-        // query chunk: NH * qc * N * (4 + 2) bytes <= scratch
-        int qc = (int) std::max<size_t>(1, opt.attn_scratch_bytes / ((size_t) NH * N * 6));
-        qc = std::min(qc, N);
-        if (qc > 64) qc = qc / 64 * 64;
-        d_S.need((size_t) NH * qc * N);
-        d_P.need((size_t) NH * qc * N);
-        d_ot.need((size_t) NH * qc * DH);
-        d_xr.need((size_t) N * D);
-        d_g.need((size_t) M * 4 * D);
-        d_m0.need((size_t) M * 4 * D);
-        d_m2.need((size_t) M * O);
-        d_out.need((size_t) NT * O);
+        uint8_t* slot[2] = {A + pl.slot[0], A + pl.slot[1]};
+        float* X = (float*) (A + pl.x);
+        uint8_t* R = A + pl.r;
+        __half* QKV = (__half*) R;                           // [N][3D]
+        __half* Hh = (__half*) (R + (size_t) N * 3 * D * 2);  // [N][D]: LN output, attention output
+        uint8_t* SCR = A + pl.scr;
+        float* Sbuf = (float*) SCR;
+        __half* Pbuf = (__half*) (SCR + al((size_t) hg * qc * N * 4));
+        float* OT = (float*) (SCR + al((size_t) hg * qc * N * 4) + al((size_t) hg * qc * N * 2));
 
-        HV_CK(cudaMemcpyAsync(d_img.p, im.rgb.data(), (size_t) W * H * 3, cudaMemcpyHostToDevice, st));
-        k_patchify<<<N, 256, 0, st>>>(d_img.p, W, pw, P, d_patches.p, mean[0], mean[1], mean[2], stdv[0], stdv[1], stdv[2]);
-        gemm_f(d_patches.p, patch_w, d_x.p, N, D, K);
-        k_patch_bias_pos<<<N, 256, 0, st>>>(d_x.p, patch_b, pos_grid, D, pw, ph, NG);
-        dump("pos_embed", d_x.p, (size_t) N * D);
+        // the streamed items: L layers, then mm.0 / mm.2 in row chunks
+        struct Item {
+            const void* host;
+            size_t bytes;
+        };
+        std::vector<Item> items;
+        items.push_back({patchw.p, patchw.n});
+        for (int il = 0; il < L; ++il) items.push_back({(const uint8_t*) layers.p + (size_t) il * lo.bytes, lo.bytes});
+        const float* mm0h = (const float*) proj.p;
+        const float* mm2h = mm0h + (size_t) K4 * K4;
+        const int n_mm0 = (K4 + rows_per_chunk - 1) / rows_per_chunk, n_mm2 = (O + rows_per_chunk - 1) / rows_per_chunk;
+        for (int c = 0; c < n_mm0; ++c) {
+            const int r0 = c * rows_per_chunk, r1 = std::min(K4, r0 + rows_per_chunk);
+            items.push_back({mm0h + (size_t) r0 * K4, (size_t) (r1 - r0) * K4 * 4});
+        }
+        for (int c = 0; c < n_mm2; ++c) {
+            const int r0 = c * rows_per_chunk, r1 = std::min(O, r0 + rows_per_chunk);
+            items.push_back({mm2h + (size_t) r0 * K4, (size_t) (r1 - r0) * K4 * 4});
+        }
+        const int n_items = (int) items.size();
+        // slots are free once the caller's prior work on the arena is done
+        HV_CK(cudaEventRecord(g.freed[0], st));
+        HV_CK(cudaEventRecord(g.freed[1], st));
+        auto issue = [&](int i) {
+            const int s = i & 1;
+            HV_CK(cudaStreamWaitEvent(g.cs, g.freed[s], 0));
+            HV_CK(cudaMemcpyAsync(slot[s], items[i].host, items[i].bytes, cudaMemcpyHostToDevice, g.cs));
+            HV_CK(cudaEventRecord(g.ready[s], g.cs));
+        };
+        auto acquire = [&](int i) -> uint8_t* {
+            HV_CK(cudaStreamWaitEvent(st, g.ready[i & 1], 0));
+            return slot[i & 1];
+        };
+        auto release = [&](int i) {
+            HV_CK(cudaEventRecord(g.freed[i & 1], st));
+            if (i + 2 < n_items) issue(i + 2);
+        };
+        issue(0);
+        if (n_items > 1) issue(1);
+
+        // patch embedding + position grid (in R: im2col F32 at 0, the u8 image behind it)
+        uint8_t* img_d = R + (size_t) N * K * 4;
+        HV_CK(cudaMemcpyAsync(img_d, im.rgb.data(), (size_t) W * H * 3, cudaMemcpyHostToDevice, st));
+        float* patches = (float*) R;
+        k_patchify<<<N, 256, 0, st>>>(img_d, W, pw, P, patches, mean[0], mean[1], mean[2], stdv[0], stdv[1], stdv[2]);
+        gemm_f(cb, patches, (const float*) acquire(0), X, D, N, D, K);
+        release(0);
+        k_patch_bias_pos<<<N, 256, 0, st>>>(X, g.patch_b, grid_dev, D, pw, ph, NG);
 
         const int ln_threads = std::max(32, ((D + 3) / 4 + 31) / 32 * 32);
         const float kq_scale = 1.0f / sqrtf((float) DH);
         const float one = 1.f, zero = 0.f;
-        const float* pending = nullptr;
+        const int T = (int) std::max<size_t>(1, std::min<size_t>(N, (size_t) N * 3 * D * 2 / ((size_t) F * 6 + 512)));
         for (int il = 0; il < L; ++il) {
-            const Layer& y = layers[il];
-            k_layernorm<<<N, ln_threads, 0, st>>>(d_x.p, pending, y.ln1w, y.ln1b, d_h.p, D, eps);
-            if (il == 0) dump("layer_inp_normed-0", d_h.p, (size_t) N * D);
-            gemm_h(d_h.p, y.wqkv, d_tmp.p, N, 3 * D, D, 0.f);
-            k_qkv_split<<<grid_for((size_t) N * 3 * D), 256, 0, st>>>(d_tmp.p, y.bqkv, d_q.p, d_k.p, d_v.p, N, D);
-            for (int q0 = 0; q0 < N; q0 += qc) {
-                const int nq = std::min(qc, N - q0);
-                // S_h (keys x queries, col-major) = K_h^T Q_h
-                HV_CB(cublasGemmStridedBatchedEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, N, nq, DH, &one, d_k.p, CUDA_R_16F, D,
-                                                 DH, d_q.p + (size_t) q0 * D, CUDA_R_16F, D, DH, &zero, d_S.p,
-                                                 CUDA_R_32F, N, (long long) N * nq, NH, CUBLAS_COMPUTE_32F,
-                                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                if (N <= 256 * 16)
-                    k_softmax_reg<256><<<NH * nq, 256, 0, st>>>(d_S.p, d_P.p, N, kq_scale);
-                else if (N <= 512 * 16)
-                    k_softmax_reg<512><<<NH * nq, 512, 0, st>>>(d_S.p, d_P.p, N, kq_scale);
-                else if (N <= 1024 * 16)
-                    k_softmax_reg<1024><<<NH * nq, 1024, 0, st>>>(d_S.p, d_P.p, N, kq_scale);
-                else
-                    k_softmax<<<NH * nq, 256, 0, st>>>(d_S.p, d_P.p, N, kq_scale);
-                // O_h (dh x queries, F32 [head][query][dh]) = V_h (dh x keys) P_h (keys x queries); the heads' outputs
-                // are kept apart (strided C must not interleave) and merged into o [N][D] F16 below
-                HV_CB(cublasGemmStridedBatchedEx(cb, CUBLAS_OP_N, CUBLAS_OP_N, DH, nq, N, &one, d_v.p, CUDA_R_16F, D,
-                                                 DH, d_P.p, CUDA_R_16F, N, (long long) N * nq, &zero, d_ot.p,
-                                                 CUDA_R_32F, DH, (long long) DH * nq, NH, CUBLAS_COMPUTE_32F,
-                                                 CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-                k_merge_heads<<<grid_for((size_t) nq * D), 256, 0, st>>>(d_ot.p, d_o.p + (size_t) q0 * D, nq, NH, DH);
+            uint8_t* b = acquire(1 + il);
+            const __half* wqkv = (const __half*) (b + lo.wqkv);
+            const __half* wo = (const __half*) (b + lo.wo);
+            const __half* wup = (const __half*) (b + lo.wup);
+            const __half* wdown = (const __half*) (b + lo.wdown);
+            const float *bqkv = (const float*) (b + lo.bqkv), *bo = (const float*) (b + lo.bo),
+                        *bup = (const float*) (b + lo.bup), *bdown = (const float*) (b + lo.bdown);
+            k_layernorm<<<N, ln_threads, 0, st>>>(X, nullptr, (const float*) (b + lo.ln1w), (const float*) (b + lo.ln1b),
+                                                  Hh, D, eps);
+            gemm_h(cb, Hh, D, wqkv, QKV, CUDA_R_16F, 3 * D, N, 3 * D, D, 0.f);
+            k_add_bias_f16<<<grid_for((size_t) N * 3 * D), 256, 0, st>>>(QKV, bqkv, (size_t) N * 3 * D, 3 * D);
+            const __half *Q = QKV, *Kp = QKV + D, *V = QKV + 2 * D;
+            if (flash) {
+                k_flash_attn<<<dim3((N + FA_BQ - 1) / FA_BQ, NH), FA_WARPS * 32, 0, st>>>(
+                    QKV, Hh, N, D, DH, kq_scale * 1.4426950408889634f);
+            } else {
+                for (int h0 = 0; h0 < NH; h0 += hg)
+                    for (int q0 = 0; q0 < N; q0 += qc) {
+                        const int nq = std::min(qc, N - q0);
+                        // S_h (keys x queries, col-major) = K_h^T Q_h
+                        HV_CB(cublasGemmStridedBatchedEx(cb, CUBLAS_OP_T, CUBLAS_OP_N, N, nq, DH, &one, Kp + h0 * DH,
+                                                         CUDA_R_16F, 3 * D, DH, Q + (size_t) q0 * 3 * D + h0 * DH, CUDA_R_16F,
+                                                         3 * D, DH, &zero, Sbuf, CUDA_R_32F, N, (long long) N * nq, hg,
+                                                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                        const int rows = hg * nq;
+                        if (N <= 256 * 16) k_softmax_reg<256><<<rows, 256, 0, st>>>(Sbuf, Pbuf, N, kq_scale);
+                        else if (N <= 512 * 16) k_softmax_reg<512><<<rows, 512, 0, st>>>(Sbuf, Pbuf, N, kq_scale);
+                        else if (N <= 1024 * 16) k_softmax_reg<1024><<<rows, 1024, 0, st>>>(Sbuf, Pbuf, N, kq_scale);
+                        else k_softmax<<<rows, 256, 0, st>>>(Sbuf, Pbuf, N, kq_scale);
+                        // O_h (dh x queries) = V_h (dh x keys) P_h (keys x queries), heads kept apart in OT
+                        HV_CB(cublasGemmStridedBatchedEx(cb, CUBLAS_OP_N, CUBLAS_OP_N, DH, nq, N, &one, V + h0 * DH,
+                                                         CUDA_R_16F, 3 * D, DH, Pbuf, CUDA_R_16F, N, (long long) N * nq, &zero,
+                                                         OT, CUDA_R_32F, DH, (long long) DH * nq, hg, CUBLAS_COMPUTE_32F,
+                                                         CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                        k_merge_heads<<<grid_for((size_t) nq * hg * DH), 256, 0, st>>>(OT, Hh + (size_t) q0 * D, nq, hg, DH,
+                                                                                     h0, D);
+                    }
             }
-            if (il == 0) {
-                dump("Qcur-0", d_q.p, (size_t) N * D);
-                dump("Kcur-0", d_k.p, (size_t) N * D);
-                dump("Vcur-0", d_v.p, (size_t) N * D);
-                dump("kqv_out-0", d_o.p, (size_t) N * D);
+            gemm_h(cb, Hh, D, wo, X, CUDA_R_32F, D, N, D, D, 1.f);  // residual += attn_out (bias in the next norm)
+            k_layernorm<<<N, ln_threads, 0, st>>>(X, bo, (const float*) (b + lo.ln2w), (const float*) (b + lo.ln2b), Hh, D,
+                                                  eps);
+            float* up = (float*) R;  // the qkv part of R is free now
+            __half* uph = (__half*) (R + al((size_t) T * F * 4));
+            for (int t0 = 0; t0 < N; t0 += T) {
+                const int nt = std::min(T, N - t0);
+                gemm_h(cb, Hh + (size_t) t0 * D, D, wup, up, CUDA_R_32F, F, nt, F, D, 0.f);
+                k_bias_gelu_tanh<<<grid_for((size_t) nt * F), 256, 0, st>>>(up, bup, uph, (size_t) nt * F, F);
+                gemm_h(cb, uph, F, wdown, X + (size_t) t0 * D, CUDA_R_32F, D, nt, D, F, 1.f);
             }
-            gemm_h(d_o.p, y.wo, d_x.p, N, D, D, 1.f);  // residual += attn_out (bias added by the next norm)
-            if (il == 0) dump("ffn_inp-0", d_x.p, (size_t) N * D, y.bo, D);
-            k_layernorm<<<N, ln_threads, 0, st>>>(d_x.p, y.bo, y.ln2w, y.ln2b, d_h.p, D, eps);
-            gemm_h(d_h.p, y.wup, d_tmp.p, N, F, D, 0.f);
-            k_bias_gelu_tanh<<<grid_for((size_t) N * F), 256, 0, st>>>(d_tmp.p, y.bup, d_h.p, (size_t) N * F, F);
-            gemm_h(d_h.p, y.wdown, d_x.p, N, D, F, 1.f);  // residual += ffn (bias pending)
-            pending = y.bdown;
-            if (il == 0 || il == L - 1) {
-                char nm[32];
-                std::snprintf(nm, sizeof nm, "layer_out-%d", il);
-                dump(nm, d_x.p, (size_t) N * D, pending, D);
-            }
+            k_add_bias_f32<<<grid_for((size_t) N * D), 256, 0, st>>>(X, bdown, (size_t) N * D, D);
+            release(1 + il);
         }
-        k_rmsnorm<<<N, ln_threads, 0, st>>>(d_x.p, pending, pre_norm, d_xr.p, D, eps);
-        dump("mm_rms", d_xr.p, (size_t) N * D);
-        k_gather2x2<<<M, 256, 0, st>>>(d_xr.p, d_g.p, D, pw, ow);
-        gemm_f(d_g.p, mm0w, d_m0.p, M, 4 * D, 4 * D);
-        k_bias_gelu_erf<<<grid_for((size_t) M * 4 * D), 256, 0, st>>>(d_m0.p, mm0b, (size_t) M * 4 * D, 4 * D);
-        gemm_f(d_m0.p, mm2w, d_m2.p, M, O, 4 * D);
-        k_emit<<<NT, 256, 0, st>>>(d_m2.p, mm2b, newline, d_out.p, O, ow);
-        HV_CK(cudaGetLastError());
-        HV_CK(cudaStreamSynchronize(st));
 
+        // projector: RMS in place, 2x2 gather into R, mm.0 (row chunks) -> m0 in R, gelu, mm.2 (row chunks) -> X
+        k_rmsnorm<<<N, ln_threads, 0, st>>>(X, nullptr, g.pre_norm, X, D, eps);
+        float* G = (float*) R;
+        float* M0 = G + (size_t) M * K4;
+        k_gather2x2<<<M, 256, 0, st>>>(X, G, D, pw, ow);
+        int it = 1 + L;
+        for (int c = 0; c < n_mm0; ++c, ++it) {
+            const int r0 = c * rows_per_chunk, r1 = std::min(K4, r0 + rows_per_chunk);
+            const float* w = (const float*) acquire(it);
+            gemm_f(cb, G, w, M0 + r0, K4, M, r1 - r0, K4);
+            release(it);
+        }
+        k_bias_gelu_erf<<<grid_for((size_t) M * K4), 256, 0, st>>>(M0, g.mm0b, (size_t) M * K4, K4);
+        float* M2 = X;
+        for (int c = 0; c < n_mm2; ++c, ++it) {
+            const int r0 = c * rows_per_chunk, r1 = std::min(O, r0 + rows_per_chunk);
+            const float* w = (const float*) acquire(it);
+            gemm_f(cb, M0, w, M2 + r0, O, M, r1 - r0, K4);
+            release(it);
+        }
+        float* outp = dst ? dst : (float*) R;  // host output staged in R (g / m0 are consumed)
+        k_emit<<<NT, 256, 0, st>>>(M2, g.mm2b, g.newline, outp, O, ow);
+        HV_CK(cudaGetLastError());
+        if (!dst) {
+            out.embd.resize((size_t) NT * O);
+            HV_CK(cudaMemcpyAsync(out.embd.data(), outp, out.embd.size() * 4, cudaMemcpyDeviceToHost, st));
+        }
+        HV_CK(cudaStreamSynchronize(st));
+        HV_CK(cudaStreamSynchronize(g.cs));
         out.n_tokens = NT;
         out.n_embd = O;
         out.ow = ow;
         out.oh = oh;
-        out.d_embd = d_out.p;
+        out.attn_heads = hg;
+        out.attn_queries = qc;
     }
 };
-
-void image_positions(int ow, int oh, PosMode mode, std::vector<Pos>& pos, int& n_pos) {
-    const int nx = ow + 1, n = nx * oh;
-    pos.resize(n);
-    if (mode == PosMode::Sequential) {
-        for (int i = 0; i < n; ++i) pos[i] = {i, i, i};
-        n_pos = n;
-    } else {
-        for (int i = 0; i < n; ++i) pos[i] = {0, i / nx, i % nx};
-        n_pos = std::max(nx, oh);
-    }
-}
 
 Encoder::Encoder() : d_(new Impl) {}
 Encoder::~Encoder() = default;
@@ -663,28 +992,39 @@ void Encoder::target_size(int w, int h, int& tw, int& th) const {
     detail::smart_size(w, h, d_->P * d_->merge, d_->min_pixels, d_->max_pixels, tw, th);
 }
 
-bool Encoder::encode(const Image& img, Output& out, std::string& err, bool to_host, PosMode mode) {
+int Encoder::n_tokens(int w, int h, int* ow, int* oh) const {
+    return image_tokens(w, h, ow, oh, nullptr, nullptr, d_->min_pixels, d_->max_pixels, d_->P, d_->merge);
+}
+
+size_t Encoder::arena_bytes(int w, int h, bool fast) const {
+    int tw = 0, th = 0;
+    target_size(w, h, tw, th);
+    const int N = (tw / d_->P) * (th / d_->P);
+    const auto pl = d_->plan(N, 0);
+    if (d_->flash) return pl.total;  // flash attention: no scratch in the arena
+    const int hg = fast ? d_->NH : 1, qc = std::min(N, fast ? 64 : 16);
+    return pl.total + d_->attn_bytes(N, hg, qc);
+}
+
+bool Encoder::encode(const Image& img, Output& out, std::string& err, const Arena& arena, float* dst, PosMode mode) {
     try {
         if (img.w <= 0 || img.h <= 0 || img.rgb.size() != (size_t) img.w * img.h * 3)
             throw std::runtime_error("hy4f_vision: bad image");
-        HV_CK(cudaSetDevice(d_->opt.gpu));
+        if (!arena.dev_ptr) throw std::runtime_error("hy4f_vision: no arena");
         const auto t0 = std::chrono::steady_clock::now();
         int tw = 0, th = 0;
         target_size(img.w, img.h, tw, th);
         Image rs;
         detail::resize_lanczos(img, tw, th, rs);
         const auto t1 = std::chrono::steady_clock::now();
-        d_->run(rs, out);
+        d_->run(rs, out, arena, dst);
         const auto t2 = std::chrono::steady_clock::now();
         out.img_w = tw;
         out.img_h = th;
         out.ms_preprocess = std::chrono::duration<double, std::milli>(t1 - t0).count();
         out.ms_gpu = std::chrono::duration<double, std::milli>(t2 - t1).count();
         image_positions(out.ow, out.oh, mode, out.pos, out.n_pos);
-        if (to_host) {
-            out.embd.resize((size_t) out.n_tokens * out.n_embd);
-            HV_CK(cudaMemcpy(out.embd.data(), out.d_embd, out.embd.size() * sizeof(float), cudaMemcpyDeviceToHost));
-        }
+        if (dst) out.embd.clear();
         return true;
     } catch (const std::exception& e) {
         err = e.what();

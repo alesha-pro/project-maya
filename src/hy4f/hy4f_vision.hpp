@@ -45,10 +45,13 @@
 // ==========================================================================================================================
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
+
+struct CUstream_st;  // cudaStream_t without the CUDA headers
 
 namespace strata::hy4f::vision {
 
@@ -60,6 +63,12 @@ struct Image {
 /// decode a PNG / JPEG / BMP / ... file to RGB8 (stb_image, 3 channels forced, like mtmd)
 bool load_image(const std::string& path, Image& out, std::string& err);
 
+/// planning helper (no encoder needed): the token count an input w x h image becomes (smart resize -> merged grid
+/// + one newline per row).  ow / oh: merged grid without the newline column; tw / th: the resized image.
+/// Defaults = the Hy4 flash mmproj (Encoder::n_tokens uses the values read from the GGUF).
+int image_tokens(int w, int h, int* ow = nullptr, int* oh = nullptr, int* tw = nullptr, int* th = nullptr,
+                 int min_pixels = 4096, int max_pixels = 4194304, int patch = 16, int merge = 2);
+
 enum class PosMode { Sequential, Mrope2D };
 
 struct Pos {
@@ -69,21 +78,34 @@ struct Pos {
 /// positions of the n_tokens image rows (relative, pos_0 = 0) and the text position advance after the image
 void image_positions(int ow, int oh, PosMode mode, std::vector<Pos>& pos, int& n_pos);
 
+/// A caller-owned device region on one GPU.  encode() puts EVERYTHING sized by the image or the weights in it:
+/// two weight slots (the patch conv, the ViT layers and the projector are streamed from pinned host memory,
+/// double-buffered, the H2D of item i+1 overlapping the compute of item i), the cuBLAS workspace, the activations
+/// (attention is a flash kernel: no score matrix).  Outside the arena: ~52 KiB of biases per GPU, a cuBLAS handle
+/// (~12 MiB at cublasCreate) unless the caller passes its own, and the lazily loaded kernel images (~7 MiB; keep
+/// CUDA_MODULE_LOADING lazy - EAGER makes cuBLAS alone ~170 MiB).  The arena's previous contents are destroyed.
+struct Arena {
+    void* dev_ptr = nullptr;
+    size_t bytes = 0;
+    int gpu = 0;
+    CUstream_st* stream = nullptr;  // the caller's stream; encode() orders after its prior work and syncs it at the end
+    void* cublas = nullptr;         // optional caller cublasHandle_t on `gpu` (saves the encoder's own handle); encode()
+                                    // restores its stream, its workspace returns to cuBLAS's default (re-set yours)
+};
+
 struct Output {
     int n_tokens = 0;          // (ow + 1) * oh
     int n_embd = 0;            // 3072
     int ow = 0, oh = 0;        // merged grid (without the newline column)
     int img_w = 0, img_h = 0;  // the resized image fed to the ViT (multiples of 32)
-    const float* d_embd = nullptr;  // device [n_tokens][n_embd] F32 on the encoder's GPU; valid until the next encode()
-    std::vector<float> embd;        // host copy [n_tokens][n_embd] when encode(..., to_host = true)
-    std::vector<Pos> pos;           // per row, PosMode of the call
-    int n_pos = 0;                  // text position advance after the image block
-    double ms_preprocess = 0, ms_gpu = 0;  // host resize/normalize, GPU ViT+projector (synchronized)
+    std::vector<float> embd;   // host [n_tokens][n_embd] when encode(..., dst = nullptr)
+    std::vector<Pos> pos;      // per row, PosMode of the call
+    int n_pos = 0;             // text position advance after the image block
+    int attn_heads = 0, attn_queries = 0;  // the attention tile the arena allowed (heads x queries per pass)
+    double ms_preprocess = 0, ms_gpu = 0;  // host resize; GPU incl. the weight streaming (synchronized)
 };
 
 struct Options {
-    int gpu = 0;
-    size_t attn_scratch_bytes = size_t(768) << 20;  // S (F32) + P (F16) per query chunk, all heads
     bool verbose = false;
 };
 
@@ -91,9 +113,18 @@ class Encoder {
 public:
     Encoder();
     ~Encoder();
+    /// read the mmproj into PINNED host memory (cudaHostAlloc portable | mapped, ~1.04 GiB); nothing on the GPU
     bool load(const std::string& mmproj_path, const Options& o, std::string& err);
-    /// encode one image; the device buffers are reused across calls (grow only)
-    bool encode(const Image& img, Output& out, std::string& err, bool to_host = true, PosMode mode = PosMode::Sequential);
+    /// encode one image inside `arena`.  dst: a device buffer on arena.gpu with room for n_tokens * n_embd floats
+    /// (row-major [n_tokens][n_embd]), or nullptr -> Output::embd on the host.  Synchronous (returns after the
+    /// caller's stream is drained).
+    bool encode(const Image& img, Output& out, std::string& err, const Arena& arena, float* dst = nullptr,
+                PosMode mode = PosMode::Sequential);
+    /// n_tokens for an input w x h image (see image_tokens), with this mmproj's limits
+    int n_tokens(int w, int h, int* ow = nullptr, int* oh = nullptr) const;
+    /// arena size for an input w x h image (exact requirement: 2 slots + 4 MiB workspace + 13.5 KiB per patch).
+    /// `fast` only differs on the non-flash fallback path (attention tile all heads x 64 queries vs 1 x 16).
+    size_t arena_bytes(int w, int h, bool fast = false) const;
     /// the resized size encode() will use for a w x h input
     void target_size(int w, int h, int& tw, int& th) const;
     int n_embd() const;
