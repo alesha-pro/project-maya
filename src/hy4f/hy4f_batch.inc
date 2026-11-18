@@ -27,6 +27,9 @@ struct BShard {
     int* ag_flag = nullptr;
     Peers ag{};
     float* cb_buf[2] = {nullptr, nullptr};
+    int* cellsx[2] = {nullptr, nullptr};   // the indexer split's cells (persistent: peers write them), by step parity
+    int* cl_flag = nullptr;
+    Peers cl{};
     int *ar_flag = nullptr, *cb_flag = nullptr, *ctr = nullptr;   // ctr: [2][4] arrive counters (all-reduce, combine)
     float* wdq = nullptr;   // a dequantized k_b / v_b (F32) for the batched products
     Peers ar{}, cb{};
@@ -43,7 +46,8 @@ struct BShard {
 };
 std::vector<BShard> bsh;
 int score_tile = 64;
-int attn_tile = 512;   // tokens per attention tile (q_abs / o / partials / cells / the combine are tile-sized)
+int attn_tile = 512;
+int64_t idx_split_from = std::getenv("HY4F_IDX_SPLIT_FROM") ? std::atoll(std::getenv("HY4F_IDX_SPLIT_FROM")) : 16384;   // indexer split by tokens from this depth   // tokens per attention tile (q_abs / o / partials / cells / the combine are tile-sized)
 int CBW() const { return kvl + 4; }   // a combine partial's row: kvl accumulators, M, L, 2 pad (float4 / WMMA aligned)
 size_t xp_ld = 0, qp_ld = 0, xm_ld = 0;
 
@@ -121,7 +125,12 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.ag_flag = m.take<int>(4);
         b.ar_flag = m.take<int>(4);
         b.cb_flag = m.take<int>(4);
-        b.ctr = m.take<int>(12);
+        b.ctr = m.take<int>(16);
+        b.cl_flag = m.take<int>(4);
+        if (S > 1) {
+            b.cellsx[0] = m.take<int>((size_t) TA * n_cap);
+            b.cellsx[1] = m.take<int>((size_t) TA * n_cap);
+        }
         b.wdq = m.take<float>(std::max((size_t) Hd, (size_t) Hmax / S) * kvl * nope + (size_t) Hmax / S * vh * kvl);
         b.mr = has_mtp ? m.take<float>((size_t) T * E) : nullptr;
         b.ones = m.take<float>((size_t) T * 8);
@@ -190,7 +199,7 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
 void batch_setup(int Tmax) {
     bsh.resize(sh.size());
     for (size_t i = 0; i < sh.size(); ++i) batch_alloc(sh[i], bsh[i], Tmax);
-    Peers ar{}, cb{}, ag{};
+    Peers ar{}, cb{}, ag{}, cl{};
     for (int j = 0; j < S; ++j) {
         ar.buf[j][0] = bsh[j].ar_buf[0];
         ar.buf[j][1] = bsh[j].ar_buf[1];
@@ -201,8 +210,11 @@ void batch_setup(int Tmax) {
         cb.buf[j][0] = bsh[j].cb_buf[0];
         cb.buf[j][1] = bsh[j].cb_buf[1];
         cb.flag[j] = bsh[j].cb_flag;
+        cl.buf[j][0] = reinterpret_cast<float*>(bsh[j].cellsx[0]);
+        cl.buf[j][1] = reinterpret_cast<float*>(bsh[j].cellsx[1]);
+        cl.flag[j] = bsh[j].cl_flag;
     }
-    for (auto& b : bsh) b.ar = ar, b.cb = cb, b.ag = ag;
+    for (auto& b : bsh) b.ar = ar, b.cb = cb, b.ag = ag, b.cl = cl;
     if (o.verbose)
         std::fprintf(stderr, "hy4f: batch buffers for %d tokens: %.0f MiB per GPU\n", Tmax, bsh[0].bytes / 1048576.0);
     for (auto& s : sh) {
@@ -332,7 +344,7 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                                                        f32(s, P + "indexer_compressor_ape.weight"),
                                                        f32(s, P + "indexer_compressor_norm.weight"), s.pooled[il], IK,
                                                        kpool, rope, eps, th);
-        kb_ring_chunk<<<kpool, 256, 0, s.st>>>(b.ivg, s.ring[il], T, b.pp, IK, kpool);
+        kb_ring_chunk<<<IRING, 256, 0, s.st>>>(b.ivg, s.ring[il], T, b.pp, IK, kpool);
         blin(s, b, P + "indexer.proj.weight", b.x, E, b.iw, IH, T);
         k_scale<<<nb(T * IH), 256, 0, s.st>>>(b.iw, T * IH, 1.0f / std::sqrt((float) (IK * IH)));
     }
@@ -359,8 +371,20 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                 kb_attn2<<<dim3(Hl, T), 256, 0, s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk, nullptr, 0,
                                                         b.pp, win, 1, 0, sinks + s.g * Hl, scale, b.o, nullptr, Hl);
         } else {
-            for (int s0 = t0; s0 < t0 + tt; s0 += score_tile) {
-                const int st = std::min(score_tile, t0 + tt - s0);
+            // the indexer split (deep prompts): shard g scores / selects rows [g*q, (g+1)*q) of the tile, the cells are
+            // all-gathered (one peer at a time) - the score is O(depth) and was computed by all four GPUs
+            const bool split = mqa && S > 1 && pos0 + t0 >= idx_split_from;
+            int* cells = b.cells;
+            int ra = 0, rz = tt;
+            const int q = (tt + S - 1) / S;
+            if (split) {
+                ++b.step;
+                cells = b.cellsx[b.step & 1];
+                ra = std::min(tt, s.g * q);
+                rz = std::min(tt, (s.g + 1) * q);
+            }
+            for (int s0 = t0 + ra; s0 < t0 + rz; s0 += score_tile) {
+                const int st = std::min(score_tile, t0 + rz - s0);
                 const int n_pool_max = (pos0 + s0 + st - 1) / kpool;
                 if (pos0 + s0 + st > top_k && n_pool_max > 0) {
                     if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))
@@ -373,11 +397,19 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                                                                                   (int) ld_sc);
                 }
                 kb_select_kpool<1024><<<st, 1024, 0, s.st>>>(b.score, (int) ld_sc, b.pp, s0, t0, kpool, top_k,
-                                                             top_k / kpool - tail, n_cap, b.cells);
+                                                             top_k / kpool - tail, n_cap, cells);
+            }
+            if (split) {
+                const size_t per = (size_t) q * n_cap;
+                const int blocks = std::min(nb((int) (per / 4), 512), 64);
+                for (int r = 1; r <= S; ++r)   // (r = S: this shard - a copy onto itself that sets its own flag)
+                    kb_push<<<blocks, 512, 0, s.st>>>(reinterpret_cast<const float*>(cells + (size_t) s.g * per), per, 0, 0, 0,
+                                                      0, b.cl, s.g, S, b.step, b.ctr + 12, (s.g + r) % S);
+                kb_wait_k<<<1, 32, 0, s.st>>>(b.cl, s.g, S, b.step);
             }
             if (mqa) {
                 kb_mqa_attn<32><<<tt, 256, mqa_smem<32>(), s.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], nullptr,
-                                                                 b.cells, n_cap, b.pp, t0, win, S, s.g, nullptr, scale,
+                                                                 cells, n_cap, b.pp, t0, win, S, s.g, nullptr, scale,
                                                                  nullptr, b.part, CBW());
                 ++b.step;
                 if (std::getenv("HY4F_CB32")) {

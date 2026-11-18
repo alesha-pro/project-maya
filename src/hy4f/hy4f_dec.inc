@@ -9,7 +9,8 @@
 // eh_proj -> an ordinary sparse layer with a plain residual -> shared_head_norm -> the trunk's output head.
 
 static constexpr int DT = 4;
-static constexpr int NSP = 16;   // split-K blocks per token of the decode attention
+static constexpr int NSP = 16;
+int dec_score_blocks = std::getenv("HY4F_DEC_SCORE_BLOCKS") ? std::atoi(std::getenv("HY4F_DEC_SCORE_BLOCKS")) : 256;   // split-K blocks per token of the decode attention
 int ar_push_blocks = std::getenv("HY4F_PUSH_BLOCKS") ? std::atoi(std::getenv("HY4F_PUSH_BLOCKS")) : 2;
 
 struct IoT {   // a multi-token step's inputs (pinned host -> device at the head of each graph)
@@ -24,6 +25,8 @@ struct DShard {
     float *xp = nullptr, *qr = nullptr, *qp = nullptr, *qabs = nullptr, *o = nullptr, *part = nullptr, *a = nullptr,
           *ao = nullptr, *ikn = nullptr, *ivg = nullptr, *iw = nullptr, *score = nullptr;
     int *cells = nullptr, *eids = nullptr, *eloc = nullptr;
+    unsigned *sel_st = nullptr, *sel_hist = nullptr;
+    int* sel_bc = nullptr;
     float *lg = nullptr, *ew = nullptr, *xm = nullptr, *ga16 = nullptr, *dn16 = nullptr, *moe = nullptr, *mu = nullptr,
           *shh = nullptr, *sh = nullptr, *ga = nullptr, *ffo = nullptr;
     int64_t* eg_ids = nullptr;
@@ -95,6 +98,9 @@ void dec_alloc(Shard& s, DShard& d) {
     d.iw = dalloc((size_t) DT * IH);
     d.score = dalloc((size_t) DT * (C / kpool + 1));
     d.cells = ia((size_t) DT * n_cap);
+    d.sel_st = (unsigned*) ia((size_t) DT * 4);
+    d.sel_hist = (unsigned*) ia((size_t) DT * 2048);
+    d.sel_bc = ia((size_t) DT * SEL_NB * 2);
     d.lg = dalloc((size_t) DT * n_exp);
     d.ew = dalloc((size_t) DT * K);
     d.eids = ia((size_t) DT * K);
@@ -232,17 +238,32 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp) {
         kb_pool_groups<<<T / kpool + 1, 128, 0, s.st>>>(d.ivg, s.ring[il], pp, T, f32(s, P + "indexer_compressor_ape.weight"),
                                                         f32(s, P + "indexer_compressor_norm.weight"), s.pooled[il], IK,
                                                         kpool, rope, eps, th);
-        kb_ring_chunk<<<kpool, 256, 0, s.st>>>(d.ivg, s.ring[il], T, pp, IK, kpool);
+        kb_ring_chunk<<<IRING, 256, 0, s.st>>>(d.ivg, s.ring[il], T, pp, IK, kpool);
         kb_f32_gemv<<<dim3(nb(IH * 32), T), 256, 0, s.st>>>(f32(s, P + "indexer.proj.weight"), d.x, E, d.iw, IH, E, IH,
                                                             1.0f / std::sqrt((float) (IK * IH)));
         const int ld_sc = (int) (o.max_context / kpool + 1);
         if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))   // (grid for the whole context: the graph is fixed)
-            kb_score_tc<<<dim3(64, 1), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, kpool, top_k, pp, 0, T, ld_sc - 1,
+            kb_score_tc<<<dim3(dec_score_blocks, 1), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, kpool, top_k, pp, 0, T, ld_sc - 1,
                                                        d.score, ld_sc);
         else
             kb_score<<<dim3(nb(ld_sc * 32), T), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, IK, IH, kpool, top_k, pp, 0,
                                                                 d.score, ld_sc);
-        kb_select_kpool<1024><<<T, 1024, 0, s.st>>>(d.score, ld_sc, pp, 0, 0, kpool, top_k, top_k / kpool - tail, n_cap, d.cells);
+        if (std::getenv("HY4F_OLD_SELECT")) {
+            kb_select_kpool<1024><<<T, 1024, 0, s.st>>>(d.score, ld_sc, pp, 0, 0, kpool, top_k, top_k / kpool - tail, n_cap,
+                                                       d.cells);
+        } else {   // (multi-block: 32 blocks per token)
+            const int tp = top_k / kpool - tail;
+            kd_sel_init<<<T, 256, 0, s.st>>>(pp, kpool, tp, d.sel_st, d.sel_hist);
+            const int shifts[3] = {21, 10, 0}, widths[3] = {11, 11, 10};
+            for (int p2 = 0; p2 < 3; ++p2) {
+                kd_sel_hist<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, d.sel_st, d.sel_hist,
+                                                               shifts[p2], widths[p2]);
+                kd_sel_resolve<<<T, 1024, 0, s.st>>>(pp, top_k, d.sel_st, d.sel_hist, shifts[p2], widths[p2]);
+            }
+            kd_sel_count<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, d.sel_st, d.sel_bc);
+            kd_sel_write<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, tp, n_cap, d.sel_st, d.sel_bc,
+                                                            d.cells);
+        }
         if (S > 1) {
             if (split && Hd == 32) {
                 kd_mqa_dec<32><<<dim3(NSP, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,

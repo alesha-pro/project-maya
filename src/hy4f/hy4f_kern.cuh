@@ -193,7 +193,9 @@ __global__ void k_hc_post(float* X, const float* R, const float* y, const float*
 // A row: int8 q[576] then half scales[9] (one per 64 values: c 0..511 in 8 groups, k_pe 512..575 in one): 594 bytes,
 // padded to 608 (16-byte aligned rows for vector loads).
 constexpr int KV_ROW = 576, KV_GROUPS = 9, KV_RB = 608;
-constexpr int RING_PAD = 16;   // SWA ring rows = window + RING_PAD: a multi-token step writes its rows before it reads the window   // 576 int8 + 9 half scales, padded to 16-byte rows
+constexpr int RING_PAD = 16;
+constexpr int IRING = 8;   // indexer ring rows (>= kpool + max step tokens - 1: a rejected draft must not overwrite a row of
+                           // the still-open group), position p in row p % IRING   // SWA ring rows = window + RING_PAD: a multi-token step writes its rows before it reads the window   // 576 int8 + 9 half scales, padded to 16-byte rows
 __device__ __forceinline__ float kv_val(const uint8_t* row, int j) {
     const __half* sc = reinterpret_cast<const __half*>(row + KV_ROW);
     return (float) reinterpret_cast<const int8_t*>(row)[j] * __half2float(sc[j >> 6]);
@@ -857,7 +859,7 @@ __global__ void k_ar_post(const float* x1, const float* x2, int n, Peers P, int 
 // the indexer's value/gate pair into the ring + pooling when the group completes (k_ring_store + k_pool fused)
 __global__ void k_ring_pool(const float* ivg, float* ring, const float* ape, const float* norm, __half* pooled, int kd,
                             int kpool, int n_rot, float eps, float theta, const Io* io) {
-    const int pos = io->pos, slot = pos % kpool, d = threadIdx.x;
+    const int pos = io->pos, slot = pos % IRING, d = threadIdx.x;
     if (d < kd) {
         ring[(size_t) slot * 2 * kd + d] = ivg[d];
         ring[(size_t) slot * 2 * kd + kd + d] = ivg[kd + d];
@@ -870,11 +872,11 @@ __global__ void k_ring_pool(const float* ivg, float* ring, const float* ape, con
     if (d < kd) {
         float lg[8], mx = -INFINITY, den = 0.0f;
         for (int mm = 0; mm < kpool; ++mm) {
-            lg[mm] = ring[(size_t) mm * 2 * kd + kd + d] + ape[(size_t) mm * kd + d];
+            lg[mm] = ring[(size_t) ((g * kpool + mm) % IRING) * 2 * kd + kd + d] + ape[(size_t) mm * kd + d];
             mx = fmaxf(mx, lg[mm]);
         }
         for (int mm = 0; mm < kpool; ++mm) den += (lg[mm] = __expf(lg[mm] - mx));
-        for (int mm = 0; mm < kpool; ++mm) v += lg[mm] / den * ring[(size_t) mm * 2 * kd + d];
+        for (int mm = 0; mm < kpool; ++mm) v += lg[mm] / den * ring[(size_t) ((g * kpool + mm) % IRING) * 2 * kd + d];
     }
     const float k = rsqrtf(block_sum(d < kd ? v * v : 0.0f) / kd + eps);
     if (d < kd) vals[d] = v * k * norm[d];

@@ -11,10 +11,13 @@
 // llama.cpp cb names (attn_norm-N, attn_out-N, ffn_out-N, ffn_moe_out-N, ffn_shexp-N, kv_cmpr-N, engram_delta-N,
 // result_norm, logits).  The decode rate is printed over the steps after the first.
 #include "hy4f.hpp"
+
+#include <cuda_profiler_api.h>
 #include "hy4f_serve.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +38,10 @@ int main(int argc, char** argv) {
     strata::hy4f::Options o;
     std::vector<int32_t> toks;
     int gen = 0, pchunk = 0, ptail = 0, repeat = 1, spec = 0, vtail = 0, vbench = 0;
+    std::vector<int> depths;
+    bool vcmp = false;
+    std::vector<int> replay;   // --replay a,b,c,..: these tokens after the prompt via verify(T) chunks (T = --replay-t)
+    int replay_t = 1;
     bool serve_mode = false;
     strata::hy4f::ServeOptions so;
     std::string mmproj, image;
@@ -57,6 +64,10 @@ int main(int argc, char** argv) {
         else if (a == "--prefill-tail") ptail = std::atoi(next());
         else if (a == "--repeat") repeat = std::atoi(next());
         else if (a == "--verify-tail") vtail = std::atoi(next());   // the prompt tail through verify(T) chunks
+        else if (a == "--verify-cmp") vcmp = true;
+        else if (a == "--replay") replay = csv(next());
+        else if (a == "--replay-t") replay_t = std::atoi(next());   // verify T=3 rows vs three T=1 steps after the prompt
+        else if (a == "--depth-bench") depths = csv(next());   // prefill to each depth, then time decode there
         else if (a == "--verify-bench") vbench = std::atoi(next());   // time verify(T) for T = 1..4 (N reps)
         else if (a == "--mmproj") mmproj = next();
         else if (a == "--image") image = next();   // replaces the prompt's image pad token 120120
@@ -129,6 +140,69 @@ int main(int argc, char** argv) {
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
         if (pos > 1) steps_s += dt, ++steps;
     };
+    if (!depths.empty()) {   // depth sweep: prefill segment rate, verify(T) / MTP timings and a k=2 spec decode at each depth
+        using clk = std::chrono::steady_clock;
+        auto secs = [](clk::time_point a) { return std::chrono::duration<double>(clk::now() - a).count(); };
+        std::vector<float> lg((size_t) m.vocab());
+        int64_t cur = 0;
+        const int ch = pchunk > 0 ? pchunk : 2048, K = 2, NG = 96;
+        for (int d : depths) {
+            if (d + 8 > (int) toks.size()) break;
+            const bool prof = std::getenv("HY4F_PROF_SEG") && std::atoi(std::getenv("HY4F_PROF_SEG")) == d;
+            if (prof) cudaProfilerStart();
+            auto a = clk::now();
+            if (!m.prefill(toks.data() + cur, d - (int) cur, cur, lg.data(), ch, err)) {
+                std::fprintf(stderr, "maya-hy4f: prefill failed: %s\n", err.c_str());
+                return 1;
+            }
+            const double pf = (d - cur) / secs(a);
+            if (prof) cudaProfilerStop();
+            int32_t vt[4] = {toks[d], toks[d + 1], toks[d + 2], toks[d + 3]}, am[4], dr[4];
+            double vms[5] = {0, 0, 0, 0, 0};
+            const bool profd = std::getenv("HY4F_PROF_DEC") && std::atoi(std::getenv("HY4F_PROF_DEC")) == d;
+            if (profd) cudaProfilerStart();
+            for (int T = 1; T <= 4; ++T) {
+                m.verify(vt, T, d, nullptr, am, err);
+                a = clk::now();
+                for (int r = 0; r < 5; ++r) m.verify(vt, T, d, nullptr, am, err);
+                vms[T] = secs(a) / 5 * 1e3;
+            }
+            a = clk::now();
+            for (int r = 0; r < 5; ++r) m.mtp(vt, 1, d - 1, dr, err);
+            const double mms = secs(a) / 5 * 1e3;
+            if (profd) cudaProfilerStop();
+            // greedy spec decode, k = 2, from the prompt's last logits at position d
+            int64_t pos = d;
+            int32_t last = (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+            int ngen = 1, steps = 0;
+            m.mtp(&last, 1, pos - 1, &dr[0], err);
+            for (int i = 1; i < K; ++i) m.mtp_chain(dr[i - 1], pos + i - 1, &dr[i], err);
+            a = clk::now();
+            while (ngen < NG) {
+                int32_t v2[4] = {last, dr[0], dr[1], dr[2]};
+                if (!m.verify(v2, K + 1, pos, nullptr, am, err)) break;
+                ++steps;
+                int n = 0;
+                while (n < K && am[n] == dr[n]) ++n;
+                int32_t nt[4];
+                for (int i = 0; i < n; ++i) nt[i] = dr[i];
+                nt[n] = am[n];
+                m.mtp(nt, n + 1, pos, &dr[0], err);
+                last = nt[n];
+                pos += n + 1;
+                ngen += n + 1;
+                for (int i = 1; i < K; ++i) m.mtp_chain(dr[i - 1], pos + i - 1, &dr[i], err);
+            }
+            const double st = secs(a);
+            std::printf("DEPTH %d prefill_seg %lld..%d %.1f tok/s | verify T1 %.2f T2 %.2f T3 %.2f T4 %.2f ms | mtp %.2f ms | "
+                        "spec k=2 %.1f tok/s (%.2f tok/step, %.2f ms/step)\n",
+                        d, (long long) cur, d, pf, vms[1], vms[2], vms[3], vms[4], mms, (ngen - 1) / st,
+                        (double) (ngen - 1) / std::max(1, steps), 1e3 * st / std::max(1, steps));
+            std::fflush(stdout);
+            cur = d;
+        }
+        return 0;
+    }
     std::vector<float> img_rows;
     std::vector<strata::hy4f::EmbdSpan> spans;
     if (!image.empty()) {
@@ -215,6 +289,48 @@ int main(int argc, char** argv) {
                 std::printf("mtp T=%d: %.2f ms\n", T,
                             std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count() / vbench * 1e3);
             }
+    }
+    if (!replay.empty()) {   // feed the tokens in verify(T) chunks; print the top-3 of the row after the last one
+        const int V = m.vocab();
+        std::vector<float> l((size_t) 4 * V);
+        int32_t am[4];
+        size_t i = 0;
+        while (i < replay.size()) {
+            const int T = std::min<int>(replay_t, (int) (replay.size() - i));
+            std::vector<int32_t> tk(replay.begin() + i, replay.begin() + i + T);
+            m.verify(tk.data(), T, pos, l.data(), am, err);
+            pos += T;
+            i += T;
+            if (i == replay.size()) {
+                const float* r = l.data() + (size_t) (T - 1) * V;
+                std::vector<int> idx(V);
+                for (int v = 0; v < V; ++v) idx[v] = v;
+                std::partial_sort(idx.begin(), idx.begin() + 3, idx.end(), [&](int a2, int b2) { return r[a2] > r[b2]; });
+                std::printf("replay T=%d: top %d %.4f | %d %.4f | %d %.4f\n", replay_t, idx[0], r[idx[0]], idx[1], r[idx[1]], idx[2], r[idx[2]]);
+            }
+        }
+        return 0;
+    }
+    if (vcmp) {
+        const int V = m.vocab();
+        std::vector<float> l1((size_t) 3 * V), l3((size_t) 3 * V);
+        int32_t am[4], tk[3] = {(int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin()), 0, 0};
+        for (int i = 0; i < 3; ++i) {
+            m.verify(&tk[i], 1, pos + i, l1.data() + (size_t) i * V, am, err);
+            if (i < 2) tk[i + 1] = am[0];
+        }
+        m.verify(tk, 3, pos, l3.data(), am, err);
+        for (int i = 0; i < 3; ++i) {
+            double dot = 0, na = 0, nb2 = 0;
+            for (int v = 0; v < V; ++v) {
+                const double x = l1[(size_t) i * V + v], y = l3[(size_t) i * V + v];
+                dot += x * y, na += x * x, nb2 += y * y;
+            }
+            const int a1 = (int) (std::max_element(l1.begin() + (size_t) i * V, l1.begin() + (size_t) (i + 1) * V) - l1.begin() - (size_t) i * V);
+            const int a3 = (int) (std::max_element(l3.begin() + (size_t) i * V, l3.begin() + (size_t) (i + 1) * V) - l3.begin() - (size_t) i * V);
+            std::printf("verify-cmp row %d: cos %.6f argmax T1 %d T3 %d\n", i, dot / std::sqrt(na * nb2), a1, a3);
+        }
+        return 0;
     }
     if (spec > 0 && gen > 0) {
         if (!m.has_mtp()) {

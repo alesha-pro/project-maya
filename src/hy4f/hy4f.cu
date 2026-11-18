@@ -491,7 +491,7 @@ struct Model::Impl {
                 HY_CK(cudaMemset(s.kv[il], 0, (size_t) (win + RING_PAD) * KV_RB));
             } else {
                 HY_CK(cudaMalloc(&s.kv[il], (size_t) (C / S + 1) * KV_RB));
-                s.ring[il] = dalloc((size_t) kpool * 2 * IK);
+                s.ring[il] = dalloc((size_t) IRING * 2 * IK);
                 HY_CK(cudaMalloc(&s.pooled[il], sizeof(__half) * (size_t) (C / kpool + 1) * IK));
                 HY_CK(cudaMemset(s.pooled[il], 0, sizeof(__half) * (size_t) (C / kpool + 1) * IK));
             }
@@ -1169,7 +1169,7 @@ bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
 // (Engram) - all indexed by position, so dropping the positions from P on needs nothing but the counter (a verify may
 // start below it anyway: a rejected draft's rows are written over).  Two rings alias: the SWA layers' KV keeps
 // position p in row p % R (R = win + RING_PAD) and a step at p reads p - win + 1 .. p; the indexer keeps the current
-// group's positions in row p % kpool.  A row a kept position needs is lost when a later position sharing it was written
+// group's positions in row p % IRING (8 rows: a rejected draft never overwrites the open group's rows).  A row a kept position needs is lost when a later position sharing it was written
 // after it - conservatively, any written since the last reset (hw_: their high-water mark, rejected drafts included).
 // So P is kept when
 //   SWA:     hw_ <= R + max(0, P - win + 1)  (no position >= P aliases a row of P - win + 1 .. P - 1), and
@@ -1197,7 +1197,7 @@ namespace {
 // the ring a layer keeps (SWA: its KV; DSA, the MTP layer included: the indexer's) and its bytes
 std::pair<void*, size_t> serve_ring(Shard& s, int il, bool sw, int win, int kpool, int IK) {
     if (sw) return {(void*) s.kv[il], (size_t) (win + RING_PAD) * KV_RB};
-    return {(void*) s.ring[il], (size_t) kpool * 2 * IK * sizeof(float)};
+    return {(void*) s.ring[il], (size_t) IRING * 2 * IK * sizeof(float)};
 }
 }  // namespace
 

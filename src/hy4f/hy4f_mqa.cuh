@@ -423,6 +423,48 @@ __global__ void __launch_bounds__(256) kb_score_tc(const float* __restrict__ iq,
         Ws[tk][h] = tt < tt_n ? w[(size_t) (t0 + tt) * ldw + h] : 0.0f;
     }
     __syncthreads();
+    if (tt_n <= 4) {   // few tokens (decode): every warp a group sub-range for ALL the tokens, each key tile read once
+        const int per_b = ((n_pool_max + ngs - 1) / ngs + 15) / 16 * 16, per = (per_b / 8 + 15) / 16 * 16;
+        const int g0 = gs * per_b + warp * per;
+        int npool_max_t = 0;
+        for (int t = 0; t < tt_n; ++t) {
+            const int p = pos0 + t0 + t;
+            if (p + 1 > top_k) npool_max_t = max(npool_max_t, p / kpool);
+        }
+        const int g1 = min(min(npool_max_t, gs * per_b + per_b), g0 + per);
+        for (int g = g0; g < g1; g += 16) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[4];
+#pragma unroll
+            for (int t = 0; t < 4; ++t) wmma::fill_fragment(acc[t], 0.0f);
+#pragma unroll
+            for (int k = 0; k < KD / 16; ++k) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fb, pooled + (size_t) g * KD + k * 16, KD);
+#pragma unroll
+                for (int t = 0; t < 4; ++t)
+                    if (t < tt_n) {
+                        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa1;
+                        wmma::load_matrix_sync(fa1, &Qs[t][0][k * 16], QLD);
+                        wmma::mma_sync(acc[t], fa1, fb, acc[t]);
+                    }
+            }
+#pragma unroll
+            for (int t = 0; t < 4; ++t)
+                if (t < tt_n) {
+                    const int p = pos0 + t0 + t, np = p / kpool;
+                    wmma::store_matrix_sync(&Ss[warp][0][0], acc[t], 20, wmma::mem_row_major);
+                    __syncwarp();
+                    if (lane < 16 && g + lane < min(g1, np) && p + 1 > top_k) {
+                        float s2 = 0.0f;
+#pragma unroll
+                        for (int h = 0; h < NH; ++h) s2 += fmaxf(Ss[warp][h][lane], 0.0f) * Ws[t][h];
+                        score[(size_t) t * ld_score + g + lane] = s2;
+                    }
+                    __syncwarp();
+                }
+        }
+        return;
+    }
     const int tt = tb * 8 + warp, pos = pos0 + t0 + tt;
     if (tt >= tt_n || pos + 1 <= top_k) return;
     const int npool = pos / kpool;

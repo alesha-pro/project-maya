@@ -425,7 +425,7 @@ __global__ void kb_pool_groups(const float* ivg, const float* ring, const int* p
         float lg[8], vv[8], mx = -INFINITY, den = 0.0f;
         for (int mm = 0; mm < kpool; ++mm) {
             const int p = g * kpool + mm;
-            const float* src = p >= pos0 ? ivg + (size_t) (p - pos0) * 2 * kd : ring + (size_t) (p % kpool) * 2 * kd;
+            const float* src = p >= pos0 ? ivg + (size_t) (p - pos0) * 2 * kd : ring + (size_t) (p % IRING) * 2 * kd;
             vv[mm] = src[d];
             lg[mm] = src[kd + d] + ape[(size_t) mm * kd + d];
             mx = fmaxf(mx, lg[mm]);
@@ -448,12 +448,12 @@ __global__ void kb_pool_groups(const float* ivg, const float* ring, const int* p
     __syncthreads();
     if (d < kd) pooled[(size_t) g * kd + d] = __float2half_rn(vals[d]);
 }
-// the chunk's last tokens' value/gate rows into the ring (slot = pos % kpool), after the pooling
+// the chunk's last IRING tokens' value/gate rows into the ring (slot = pos % IRING), after the pooling; IRING blocks
 __global__ void kb_ring_chunk(const float* ivg, float* ring, int T, const int* pos0p, int kd, int kpool) {
     const int pos0 = *pos0p;
-    const int t = T - kpool + (int) blockIdx.x;
+    const int t = T - IRING + (int) blockIdx.x;
     if (t < 0) return;
-    const int slot = (pos0 + t) % kpool;
+    const int slot = (pos0 + t) % IRING;
     for (int i = threadIdx.x; i < 2 * kd; i += blockDim.x) ring[(size_t) slot * 2 * kd + i] = ivg[(size_t) t * 2 * kd + i];
 }
 // scores of the tokens [t0, t0 + Tt) over their candidate groups g < pos / kpool (warp per group, blockIdx.y = token)
@@ -644,6 +644,7 @@ __device__ __forceinline__ void kb_wait(const Peers& P, int me, int n_shards, in
     __syncthreads();
     __threadfence_system();
 }
+__global__ void kb_wait_k(Peers P, int me, int n_shards, int step) { kb_wait(P, me, n_shards, step); }
 // all-reduce tail per token (blockIdx.x = token, 1024 threads): y = RMS(sum over shards [+ x2 local... folded in the
 // payload]) * w, X = R + post * y, R = X
 __global__ void kb_ar_post(const float* local, int n, Peers P, int me, int n_shards, int step, const float* nw, float eps,
@@ -873,35 +874,42 @@ __global__ void kb_select_kpool(const float* __restrict__ score_tile, int ld_sco
     }
     const unsigned thr = s_prefix;
     const int ties = s_kk;
-    __shared__ int s_out;
-    if (tid == 0) s_out = 0;
-    __syncthreads();
-    for (int i = tid; i < n_pool; i += NT)
-        if (hy4f_key(score[i]) > thr) {
-            const int slot = atomicAdd(&s_out, 1);
-            for (int m = 0; m < kpool; ++m) cells[slot * kpool + m] = i * kpool + m;
-        }
-    __syncthreads();
+    // the groups above the threshold, then the first `ties` at it, both in index order (block scans: deterministic,
+    // so the cells - and the attention's summation order - are the same every run and in every path)
     using Scan = cub::BlockScan<int, NT>;
     __shared__ typename Scan::TempStorage tmp;
-    __shared__ int s_taken;
-    if (tid == 0) s_taken = 0;
+    __shared__ int s_gt, s_eq, s_ngt;
+    if (tid == 0) s_gt = 0, s_eq = 0;
     __syncthreads();
-    const int base = s_out;
+    int ngt_local = 0;
+    for (int i = tid; i < n_pool; i += NT) ngt_local += hy4f_key(score[i]) > thr;
+    {
+        int dummy, tot;
+        Scan(tmp).ExclusiveSum(ngt_local, dummy, tot);
+        if (tid == 0) s_ngt = tot;
+    }
+    __syncthreads();
+    const int n_gt = s_ngt;
     for (int c0 = 0; c0 < n_pool; c0 += NT) {
         const int i = c0 + tid;
-        const int flag = (i < n_pool && hy4f_key(score[i]) == thr) ? 1 : 0;
-        int rank, total;
-        Scan(tmp).ExclusiveSum(flag, rank, total);
-        const int taken = s_taken;
-        if (flag && taken + rank < ties) {
-            const int slot = base + taken + rank;
+        const unsigned key = i < n_pool ? hy4f_key(score[i]) : 0u;
+        const int fg = (i < n_pool && key > thr) ? 1 : 0, fe = (i < n_pool && key == thr) ? 1 : 0;
+        int rg, tg, re, te;
+        Scan(tmp).ExclusiveSum(fg, rg, tg);
+        __syncthreads();
+        Scan(tmp).ExclusiveSum(fe, re, te);
+        const int bg = s_gt, be = s_eq;
+        if (fg) {
+            const int slot = bg + rg;
+            for (int m = 0; m < kpool; ++m) cells[slot * kpool + m] = i * kpool + m;
+        }
+        if (fe && be + re < ties) {
+            const int slot = n_gt + be + re;
             for (int m = 0; m < kpool; ++m) cells[slot * kpool + m] = i * kpool + m;
         }
         __syncthreads();
-        if (tid == 0) s_taken = taken + total;
+        if (tid == 0) s_gt = bg + tg, s_eq = be + te;
         __syncthreads();
-        if (s_taken >= ties) break;
     }
     const int n_top = k * kpool;
     for (int i = n_top + tid; i < n_cap; i += NT) {

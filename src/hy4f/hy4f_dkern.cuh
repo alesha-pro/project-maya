@@ -448,6 +448,133 @@ __global__ void kd_cb_tail(const float* __restrict__ part, int T, int H, int kvl
     kd_post_done(counter, arrive, step);
 }
 
+
+// ---- the k-pool selection for a few tokens (decode) over gridDim.x blocks per token instead of one: the same set of
+// cells as kb_select_kpool (top k groups by hy4f_key, ties taken in index order, then the current group's tail), the
+// groups in index order.  st [T][4] = prefix, mask, kk (ties left), -; hist [T][2048]; bc [T][NB][2] = (gt, eq) per block.
+constexpr int SEL_NB = 32;
+__global__ void kd_sel_init(const int* pos0p, int kpool, int top_pools, unsigned* st, unsigned* hist) {
+    const int t = blockIdx.x, pos = *pos0p + t, n_pool = pos / kpool;
+    if (threadIdx.x == 0) st[t * 4] = 0, st[t * 4 + 1] = 0, st[t * 4 + 2] = (unsigned) min(top_pools, n_pool), st[t * 4 + 3] = 0;
+    for (int i = threadIdx.x; i < 2048; i += blockDim.x) hist[(size_t) t * 2048 + i] = 0;
+}
+__global__ void kd_sel_hist(const float* __restrict__ score, int ld, const int* pos0p, int kpool, int top_k,
+                            const unsigned* st, unsigned* hist, int sh, int nbits) {
+    const int t = blockIdx.y, pos = *pos0p + t;
+    if (pos + 1 <= top_k) return;
+    const int n_pool = pos / kpool, nbins = 1 << nbits;
+    __shared__ unsigned h[2048];
+    for (int i = threadIdx.x; i < nbins; i += blockDim.x) h[i] = 0;
+    __syncthreads();
+    const unsigned prefix = st[t * 4], mask = st[t * 4 + 1];
+    const int per = (n_pool + gridDim.x - 1) / gridDim.x, i0 = blockIdx.x * per, i1 = min(n_pool, i0 + per);
+    const float* sc = score + (size_t) t * ld;
+    for (int i = i0 + threadIdx.x; i < i1; i += blockDim.x) {
+        const unsigned key = hy4f_key(sc[i]);
+        if ((key & mask) == prefix) atomicAdd(&h[(key >> sh) & (nbins - 1)], 1u);
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < nbins; i += blockDim.x)
+        if (h[i]) atomicAdd(&hist[(size_t) t * 2048 + i], h[i]);
+}
+__global__ void kd_sel_resolve(const int* pos0p, int top_k, unsigned* st, unsigned* hist, int sh, int nbits) {
+    const int t = blockIdx.x, pos = *pos0p + t, tid = threadIdx.x;
+    if (pos + 1 <= top_k) return;
+    const int nbins = 1 << nbits;
+    using Scan = cub::BlockScan<int, 1024>;
+    __shared__ typename Scan::TempStorage tmp;
+    unsigned* hh = hist + (size_t) t * 2048;
+    const unsigned prefix = st[t * 4], mask = st[t * 4 + 1];
+    const int kk = (int) st[t * 4 + 2];
+    const int r0 = nbins - 1 - 2 * tid, r1 = r0 - 1;
+    const int c0 = r0 >= 0 ? (int) hh[r0] : 0, c1 = r1 >= 0 ? (int) hh[r1] : 0;
+    int above, total;
+    Scan(tmp).ExclusiveSum(c0 + c1, above, total);
+    __syncthreads();
+    if (r0 >= 0 && above < kk && kk <= above + c0) {
+        st[t * 4] = prefix | ((unsigned) r0 << sh);
+        st[t * 4 + 1] = mask | ((unsigned) (nbins - 1) << sh);
+        st[t * 4 + 2] = (unsigned) (kk - above);
+    } else if (r1 >= 0 && above + c0 < kk && kk <= above + c0 + c1) {
+        st[t * 4] = prefix | ((unsigned) r1 << sh);
+        st[t * 4 + 1] = mask | ((unsigned) (nbins - 1) << sh);
+        st[t * 4 + 2] = (unsigned) (kk - above - c0);
+    }
+    for (int i = tid; i < 2048; i += blockDim.x) hh[i] = 0;
+}
+__global__ void kd_sel_count(const float* __restrict__ score, int ld, const int* pos0p, int kpool, int top_k,
+                             const unsigned* st, int* bc) {
+    const int t = blockIdx.y, pos = *pos0p + t;
+    if (pos + 1 <= top_k) return;
+    const int n_pool = pos / kpool;
+    const unsigned thr = st[t * 4];
+    const int per = (n_pool + gridDim.x - 1) / gridDim.x, i0 = blockIdx.x * per, i1 = min(n_pool, i0 + per);
+    const float* sc = score + (size_t) t * ld;
+    int gt = 0, eq = 0;
+    for (int i = i0 + threadIdx.x; i < i1; i += blockDim.x) {
+        const unsigned key = hy4f_key(sc[i]);
+        gt += key > thr;
+        eq += key == thr;
+    }
+    gt = (int) block_sum((float) gt);
+    eq = (int) block_sum((float) eq);
+    if (threadIdx.x == 0) bc[((size_t) t * gridDim.x + blockIdx.x) * 2] = gt, bc[((size_t) t * gridDim.x + blockIdx.x) * 2 + 1] = eq;
+}
+__global__ void kd_sel_write(const float* __restrict__ score, int ld, const int* pos0p, int kpool, int top_k, int top_pools,
+                             int n_cap, const unsigned* st, const int* bc, int* __restrict__ cells_all) {
+    const int t = blockIdx.y, pos = *pos0p + t, tid = threadIdx.x;
+    int* cells = cells_all + (size_t) t * n_cap;
+    if (pos + 1 <= top_k) {
+        if (blockIdx.x == 0)
+            for (int i = tid; i < n_cap; i += blockDim.x) cells[i] = i <= pos ? i : -1;
+        return;
+    }
+    const int n_pool = pos / kpool, k = min(top_pools, n_pool), gcur = n_pool;
+    const unsigned thr = st[t * 4];
+    const int ties = (int) st[t * 4 + 2];
+    int base_gt = 0, base_eq = 0, n_gt = 0;
+    for (int b = 0; b < (int) gridDim.x; ++b) {
+        const int g = bc[((size_t) t * gridDim.x + b) * 2], e = bc[((size_t) t * gridDim.x + b) * 2 + 1];
+        if (b < (int) blockIdx.x) base_gt += g, base_eq += e;
+        n_gt += g;
+    }
+    const int per = (n_pool + gridDim.x - 1) / gridDim.x, i0 = blockIdx.x * per, i1 = min(n_pool, i0 + per);
+    const float* sc = score + (size_t) t * ld;
+    using Scan = cub::BlockScan<int, 256>;
+    __shared__ typename Scan::TempStorage tmp;
+    int run_gt = 0, run_eq = 0;
+    for (int c0 = i0; c0 < i1; c0 += 256) {
+        const int i = c0 + tid;
+        const unsigned key = i < i1 ? hy4f_key(sc[i]) : 0u;
+        const int fg = (i < i1 && key > thr) ? 1 : 0, fe = (i < i1 && key == thr) ? 1 : 0;
+        int rg, tg, re, te;
+        Scan(tmp).ExclusiveSum(fg, rg, tg);
+        __syncthreads();
+        Scan(tmp).ExclusiveSum(fe, re, te);
+        __syncthreads();
+        if (fg) {
+            const int slot = base_gt + run_gt + rg;
+            for (int m = 0; m < kpool; ++m) cells[slot * kpool + m] = i * kpool + m;
+        }
+        if (fe) {
+            const int r = base_eq + run_eq + re;
+            if (r < ties) {
+                const int slot = n_gt + r;
+                for (int m = 0; m < kpool; ++m) cells[slot * kpool + m] = i * kpool + m;
+            }
+        }
+        run_gt += tg;
+        run_eq += te;
+    }
+    if (blockIdx.x == 0) {
+        const int n_top = k * kpool;
+        for (int i = n_top + tid; i < n_cap; i += blockDim.x) {
+            const int c = gcur * kpool + (i - n_top);
+            cells[i] = c <= pos ? c : -1;
+        }
+    }
+}
+
 // the sigmoid router: top-k by (sigmoid(l) + bias) descending, index ascending (router_sigmoid's rank order) through a
 // bitonic sort in shared memory instead of an O(n^2) rank count; the weights from the unbiased p summed in double on
 // one thread in rank order (router_sigmoid's arithmetic).  NE = n_expert, a power of two <= 1024; blockIdx.x = token,
