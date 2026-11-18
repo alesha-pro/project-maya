@@ -9,8 +9,9 @@
 namespace strata::hy4f {
 namespace kern {
 
-__global__ void kb_embed(const uint8_t* emb, size_t rb, const int* toks, int pos0, float* X, float* R, int E, int hc,
+__global__ void kb_embed(const uint8_t* emb, size_t rb, const int* toks, const int* pos0p, float* X, float* R, int E, int hc,
                          int* hist) {
+    const int pos0 = *pos0p;
     const int t = blockIdx.y, tok = toks[t];
     const uint8_t* row = emb + (size_t) tok * rb;
     float* Xt = X + (size_t) t * hc * E;
@@ -23,8 +24,9 @@ __global__ void kb_embed(const uint8_t* emb, size_t rb, const int* toks, int pos
     if (blockIdx.x == 0 && threadIdx.x == 0) hist[pos0 + t] = tok;
 }
 // Engram, per token (blockIdx.x = token): hash, then rows
-__global__ void kb_engram_hash(const int* hist, int pos0, const int64_t* map, int64_t n_map, int64_t pad_id,
+__global__ void kb_engram_hash(const int* hist, const int* pos0p, const int64_t* map, int64_t n_map, int64_t pad_id,
                                const uint64_t* mult, const uint64_t* vsz, const uint64_t* off, int ng, int nh, int64_t* ids) {
+    const int pos0 = *pos0p;
     const int t = blockIdx.x, col = threadIdx.x, ncol = (ng - 1) * nh, pos = pos0 + t;
     if (col >= ncol) return;
     const int64_t pad = map[pad_id];
@@ -164,9 +166,10 @@ __global__ void kb_rms(const float* x, int ldx, const float* w, int n, float eps
     for (int i = threadIdx.x; i < n; i += blockDim.x) y[(size_t) t * ldy + i] = xr[i] * r * w[i];
 }
 // the latent rows of the chunk: RoPE(k_pe) at pos0 + t, RMS * w on c, Q8 into: mode 1 (SWA) the chunk buffer row t,
-// mode 2 (DSA, context parallel) the cache slot when this shard owns the position.  blockIdx.x = token, 576 threads.
+// mode 2 (DSA, context parallel) the cache slot when this shard owns the position, mode 3 the ring slot pos % rw.  blockIdx.x = token, 576 threads.
 __global__ void kb_kv_prep(const float* kvin, int ld, const float* nw, int kvl, int rope, float eps, float theta,
-                           uint8_t* dst_base, int pos0, int mode, int n_shards, int shard) {
+                           uint8_t* dst_base, const int* pos0p, int mode, int n_shards, int shard, int rw) {
+    const int pos0 = *pos0p;
     const int t = blockIdx.x, pos = pos0 + t, j = threadIdx.x;
     __shared__ float row[KV_ROW];
     float v = j < KV_ROW ? kvin[(size_t) t * ld + j] : 0.0f;
@@ -186,6 +189,7 @@ __global__ void kb_kv_prep(const float* kvin, int ld, const float* nw, int kvl, 
     __syncthreads();
     long slot;
     if (mode == 1) slot = t;
+    else if (mode == 3) slot = pos % rw;   // (SWA ring, a multi-token decode step)
     else {
         if (pos % n_shards != shard) return;
         slot = pos / n_shards;
@@ -203,17 +207,19 @@ __global__ void kb_kv_prep(const float* kvin, int ld, const float* nw, int kvl, 
     if (j < KV_GROUPS) reinterpret_cast<__half*>(dst + KV_ROW)[j] = __float2half(fmaxf(gmax[2 * j], gmax[2 * j + 1]) / 127.0f);
 }
 // the chunk's last min(T, win) SWA rows into the ring (after the chunk's attention)
-__global__ void kb_ring_write(const uint8_t* chunk, uint8_t* ring, int T, int pos0, int win) {
+__global__ void kb_ring_write(const uint8_t* chunk, uint8_t* ring, int T, const int* pos0p, int win) {
+    const int pos0 = *pos0p;
     const int t0 = max(0, T - win);
     for (int t = t0 + blockIdx.x; t < T; t += gridDim.x) {
         const uint8_t* src = chunk + (size_t) t * KV_RB;
-        uint8_t* dst = ring + (size_t) ((pos0 + t) % win) * KV_RB;
+        uint8_t* dst = ring + (size_t) ((pos0 + t) % (win + RING_PAD)) * KV_RB;
         for (int i = threadIdx.x; i < KV_RB / 4; i += blockDim.x)
             reinterpret_cast<int*>(dst)[i] = reinterpret_cast<const int*>(src)[i];
     }
 }
 // RoPE NORM per token at pos0 + t (blockIdx.y = token)
-__global__ void kb_rope(float* x, int ld, int heads, int stride, int off, int n_rot, int pos0, float theta) {
+__global__ void kb_rope(float* x, int ld, int heads, int stride, int off, int n_rot, const int* pos0p, float theta) {
+    const int pos0 = *pos0p;
     const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x, half = n_rot / 2;
     if (i >= heads * half) return;
     const int h = i / half, j = i % half;
@@ -244,8 +250,9 @@ __global__ void kb_absorb_bf16(const uint16_t* kb, const float* q, int ldq, int 
 // (positions < pos0) and the chunk buffer (>= pos0).  DSA: cells [T][n_cap], context parallel as k_attn2.
 __global__ void __launch_bounds__(256) kb_attn2(const float* qabs, const float* q, int ldq, int qs, int nope, float theta,
                                                 const uint8_t* kv, const uint8_t* chunk, const int* cells, int n_cap,
-                                                int pos0, int win, int n_shards, int shard, const float* sinks,
+                                                const int* pos0p, int win, int n_shards, int shard, const float* sinks,
                                                 float scale, float* o, float* part, int H) {
+    const int pos0 = *pos0p;
     constexpr int KVL = 512, ROPE = 64, NW = 8;
     const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5, pos = pos0 + t;
     float qa[16];
@@ -281,7 +288,7 @@ __global__ void __launch_bounds__(256) kb_attn2(const float* qabs, const float* 
         const uint8_t* r;
         if (!cells) {
             const int p = lo + s;
-            r = p >= pos0 ? chunk + (size_t) (p - pos0) * KV_RB : kv + (size_t) (p % win) * KV_RB;
+            r = (chunk && p >= pos0) ? chunk + (size_t) (p - pos0) * KV_RB : kv + (size_t) (p % (win + RING_PAD)) * KV_RB;
         } else {
             const int c = cr[s];
             if (c < 0 || (n_shards > 1 && c % n_shards != shard)) continue;
@@ -395,9 +402,10 @@ __global__ void kb_f32_gemv(const float* W, const float* x, int ldx, float* y, i
 }
 // indexer: pool the groups that complete inside the chunk; members before pos0 come from the ring (the incomplete
 // group carried over), members inside from the chunk's ivg rows.  blockIdx.x = group index from g_first, 128 threads.
-__global__ void kb_pool_groups(const float* ivg, const float* ring, int pos0, int g_first, const float* ape,
-                               const float* norm, float* pooled, int kd, int kpool, int n_rot, float eps, float theta) {
-    const int g = g_first + blockIdx.x, d = threadIdx.x;
+__global__ void kb_pool_groups(const float* ivg, const float* ring, const int* pos0p, int T, const float* ape,
+                               const float* norm, __half* pooled, int kd, int kpool, int n_rot, float eps, float theta) {
+    const int pos0 = *pos0p, g = pos0 / kpool + blockIdx.x, d = threadIdx.x;
+    if (g >= (pos0 + T) / kpool) return;
     __shared__ float vals[256];
     float v = 0.0f;
     if (d < kd) {
@@ -425,27 +433,29 @@ __global__ void kb_pool_groups(const float* ivg, const float* ring, int pos0, in
         vals[base + 2 * d + 1] = a * s + b * c;
     }
     __syncthreads();
-    if (d < kd) pooled[(size_t) g * kd + d] = vals[d];
+    if (d < kd) pooled[(size_t) g * kd + d] = __float2half_rn(vals[d]);
 }
 // the chunk's last tokens' value/gate rows into the ring (slot = pos % kpool), after the pooling
-__global__ void kb_ring_chunk(const float* ivg, float* ring, int T, int pos0, int kd, int kpool) {
+__global__ void kb_ring_chunk(const float* ivg, float* ring, int T, const int* pos0p, int kd, int kpool) {
+    const int pos0 = *pos0p;
     const int t = T - kpool + (int) blockIdx.x;
     if (t < 0) return;
     const int slot = (pos0 + t) % kpool;
     for (int i = threadIdx.x; i < 2 * kd; i += blockDim.x) ring[(size_t) slot * 2 * kd + i] = ivg[(size_t) t * 2 * kd + i];
 }
 // scores of the tokens [t0, t0 + Tt) over their candidate groups g < pos / kpool (warp per group, blockIdx.y = token)
-__global__ void kb_score(const float* iq, int ldq, const float* pooled, const float* w, int ldw, int kd, int nh, int kpool,
-                         int top_k, int pos0, int t0, float* score, int ld_score) {
+__global__ void kb_score(const float* iq, int ldq, const __half* pooled, const float* w, int ldw, int kd, int nh, int kpool,
+                         int top_k, const int* pos0p, int t0, float* score, int ld_score) {
+    const int pos0 = *pos0p;
     const int tt = blockIdx.y, t = t0 + tt, pos = pos0 + t;
     if (pos + 1 <= top_k) return;
     const int n_pool = pos / kpool;
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (warp >= n_pool) return;
-    const float* pk = pooled + (size_t) warp * kd;
+    const __half* pk = pooled + (size_t) warp * kd;
     const float* q = iq + (size_t) t * ldq;
     float pv[4];
-    for (int i = 0; i < 4; ++i) pv[i] = lane + 32 * i < kd ? pk[lane + 32 * i] : 0.0f;
+    for (int i = 0; i < 4; ++i) pv[i] = lane + 32 * i < kd ? __half2float(pk[lane + 32 * i]) : 0.0f;
     float s = 0.0f;
     for (int h = 0; h < nh; ++h) {
         float d = 0.0f;
@@ -739,8 +749,9 @@ __global__ void kb_add(const float* a, const float* b, float* y, size_t n) {
 
 // the batched k-pool selection (blockIdx.x = token of the tile): as k_select_kpool for pos = pos0 + t0 + blockIdx.x
 template <int NT>
-__global__ void kb_select_kpool(const float* __restrict__ score_tile, int ld_score, int pos0, int t0, int kpool, int top_k,
+__global__ void kb_select_kpool(const float* __restrict__ score_tile, int ld_score, const int* pos0p, int t0, int kpool, int top_k,
                                 int top_pools, int n_cap, int* __restrict__ cells_all) {
+    const int pos0 = *pos0p;
     const int tt = blockIdx.x, t = t0 + tt, pos = pos0 + t;
     const float* score = score_tile + (size_t) tt * ld_score;
     int* cells = cells_all + (size_t) t * n_cap;

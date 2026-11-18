@@ -33,6 +33,10 @@ struct BShard {
     int step = 0;
     int* hb = nullptr;   // pinned {0, T}
     size_t bytes = 0;    // device bytes of the batch buffers
+    // the MTP layer over the chunk (plain residual mr, positions at dbounds[3])
+    bool mtp = false;
+    float *mr = nullptr, *ones = nullptr, *hprev = nullptr;
+    const int* pp = nullptr;   // the positions' device pointer of the current pass
 };
 std::vector<BShard> bsh;
 int score_tile = 64;
@@ -68,8 +72,8 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_BL(cublasCreate(&b.blas));
     HY_BL(cublasSetStream(b.blas, s.st));
     HY_BL(cublasSetMathMode(b.blas, CUBLAS_DEFAULT_MATH));
-    HY_CK(cudaHostAlloc((void**) &b.hb, sizeof(int) * 2, cudaHostAllocPortable));
-    HY_CK(cudaHostAlloc((void**) &b.hmb, sizeof(int) * (n_exp / S + 1), cudaHostAllocPortable));
+    HY_CK(cudaHostAlloc((void**) &b.hb, sizeof(int) * 4, cudaHostAllocPortable));
+    HY_CK(cudaHostAlloc((void**) &b.hmb, sizeof(int) * (nl_max + 1), cudaHostAllocPortable));
     b.cap = std::min((int64_t) T * K, std::max<int64_t>(2 * (int64_t) T * K / S, 4 * T));
     xp_ld = ((size_t) q_lora + KV_ROW + (size_t) Hmax / S * vh + IK + 3) / 4 * 4;
     qp_ld = std::max((size_t) Hd * QH + (size_t) IH * IK, (size_t) Hs / S * QH);
@@ -81,7 +85,7 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     const int Ha = std::max(Hd, Hs / S), Ho = S > 1 ? Hmax / S : Hmax;
     // persistent
     auto persistent = [&](Bump& m) {
-        b.dbounds = m.take<int>(2);
+        b.dbounds = m.take<int>(4);   // {0, T, pos0, -}
         b.iota = m.take<int>((size_t) T * K + strata::prefill::mmq::IDS_PAD);
         b.toks = m.take<int>(T);
         b.xq = m.take<uint8_t>(q8a);
@@ -96,9 +100,9 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.chunk = m.take<uint8_t>((size_t) T * KV_RB);
         b.ew = m.take<float>((size_t) T * K);
         b.eids = m.take<int>((size_t) T * K);
-        b.mb = m.take<int>(n_exp / S + 1);
-        b.mb2 = m.take<int>(n_exp / S + 1);
-        b.mcnt = m.take<int>(n_exp / S + 1);
+        b.mb = m.take<int>(nl_max + 1);
+        b.mb2 = m.take<int>(nl_max + 1);
+        b.mcnt = m.take<int>(nl_max + 1);
         b.rows_tok = m.take<int>((size_t) T * K + strata::prefill::mmq::IDS_PAD);
         b.row_of = m.take<int>((size_t) T * K);
         b.eg_ids = m.take<int64_t>((size_t) T * ncol);
@@ -112,6 +116,9 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.cb_flag = m.take<int>(4);
         b.ctr = m.take<int>(12);
         b.wdq = m.take<float>(std::max((size_t) Hd * kvl * nope, (size_t) Hmax / S * vh * kvl));
+        b.mr = has_mtp ? m.take<float>((size_t) T * E) : nullptr;
+        b.ones = m.take<float>((size_t) T * 8);
+        b.hprev = m.take<float>(E);
     };
     auto attn = [&](Bump& m) {
         b.xp = m.take<float>((size_t) T * xp_ld);
@@ -160,6 +167,11 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     ffn(mf);
     engr(me);
     b.bytes = m0.off + arena;
+    {
+        std::vector<float> one((size_t) T * 8, 1.0f);
+        HY_CK(cudaMemcpy(b.ones, one.data(), sizeof(float) * one.size(), cudaMemcpyHostToDevice));
+    }
+    b.pp = b.dbounds + 2;
     strata::prefill::mmq::iota(b.iota, (int64_t) T * K + strata::prefill::mmq::IDS_PAD, s.st);
 }
 
@@ -237,8 +249,11 @@ void bgemm(BShard& b, int m, int n, int k, const float* A, int lda, long long sA
 
 // all-reduce of y [T][E] then RMS * w, X = R + post * y: reduce-scatter (bf16) by token slices, all-gather (fp16)
 void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int T) {
+    float* X = b.mtp ? b.mr : b.X;
+    const float* post = b.mtp ? b.ones : b.post;
+    const int hcn = b.mtp ? 1 : hc;
     if (S == 1) {
-        kb_ar_post<<<T, 1024, 0, s.st>>>(y, E, b.ar, s.g, S, b.step, f32(s, norm), eps, b.X, b.R, b.post, hc, (size_t) T * E);
+        kb_ar_post<<<T, 1024, 0, s.st>>>(y, E, b.ar, s.g, S, b.step, f32(s, norm), eps, X, X, post, hcn, (size_t) T * E);
         return;
     }
     const int ts = (T + S - 1) / S, blocks = std::min(nb(ts * E / 8, 512), 160);
@@ -249,7 +264,7 @@ void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int
     ++b.step;
     for (int r = 1; r <= S; ++r)
         kb_ag_push<<<blocks, 512, 0, s.st>>>(b.yn, T, E, ts, b.ag, s.g, b.step, b.ctr + 8, (s.g + r) % S);
-    kb_ag_post<<<T, 1024, 0, s.st>>>(E, b.ag, s.g, S, b.step, b.X, b.R, b.post, hc);
+    kb_ag_post<<<T, 1024, 0, s.st>>>(E, b.ag, s.g, S, b.step, X, X, post, hcn);
 }
 
 void b_norm_in(Shard& s, BShard& b, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
@@ -263,7 +278,7 @@ void b_norm_in(Shard& s, BShard& b, const std::string& P, const std::string& k, 
 void b_engram(Shard& s, BShard& b, int e, int il, int pos0, int T) {
     const int ng = eg_ngram, nh = eg_heads, ncol = (ng - 1) * nh;
     const std::string P = "blk." + std::to_string(il) + ".";
-    kb_engram_hash<<<T, 32, 0, s.st>>>(s.hist, pos0, s.eg_map, (int64_t) eg_map.size(), eg_pad, s.eg_mult + (size_t) e * ng,
+    kb_engram_hash<<<T, 32, 0, s.st>>>(s.hist, b.dbounds + 2, s.eg_map, (int64_t) eg_map.size(), eg_pad, s.eg_mult + (size_t) e * ng,
                                        s.eg_vsz + (size_t) e * ncol, s.eg_off + (size_t) e * ncol, ng, nh, b.eg_ids);
     kb_engram_rows<<<dim3(ncol, T), 128, 0, s.st>>>(eg_table, b.eg_ids, f32(s, P + "engram_lookup_norm.weight"), b.eg_r,
                                                     eg_D, ncol, 1.1920929e-07f);
@@ -279,11 +294,12 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
     const int Hl = sw ? Hs / S : Hd / S, QH = nope + rope;
     const float th = sw ? theta_swa : theta;
     const int oq = 0, okv = q_lora, og = q_lora + KV_ROW, oik = og + Hl * vh;
-    b_norm_in(s, b, P, "hc_attn", P + "attn_norm.weight", 2 * hc, hc_mag, T);
+    if (b.mtp) kb_rms<<<T, 1024, 0, s.st>>>(b.mr, E, f32(s, P + "attn_norm.weight"), E, eps, b.x, E);
+    else b_norm_in(s, b, P, "hc_attn", P + "attn_norm.weight", 2 * hc, hc_mag, T);
     blin(s, b, P + "xproj", b.x, E, b.xp, (int) xp_ld, T);
     kb_rms<<<T, 1024, 0, s.st>>>(b.xp + oq, (int) xp_ld, f32(s, P + "attn_q_a_norm.weight"), q_lora, eps, b.qr, q_lora);
     kb_kv_prep<<<T, 576, 0, s.st>>>(b.xp + okv, (int) xp_ld, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th,
-                                    sw ? b.chunk : s.kv[il], pos0, sw ? 1 : 2, S, s.g);
+                                    sw ? b.chunk : s.kv[il], b.pp, sw ? 1 : 2, S, s.g, 0);
     blin(s, b, P + "qproj", b.qr, q_lora, b.qp, (int) qp_ld, T);
     const DW& kb = s.w.at(P + "attn_k_b.weight");
     const DW& vb = s.w.at(P + "attn_v_b.weight");
@@ -295,31 +311,31 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
     if (sw) {
         if (Hl == 16)
             kb_mqa_attn<16><<<T, 256, mqa_smem<16>(), s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk,
-                                                            nullptr, 0, pos0, win, 1, 0,
+                                                            nullptr, 0, b.pp, win, 1, 0,
                                                             f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, b.o, nullptr, 0);
         else if (Hl == 32)
             kb_mqa_attn<32><<<T, 256, mqa_smem<32>(), s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk,
-                                                            nullptr, 0, pos0, win, 1, 0,
+                                                            nullptr, 0, b.pp, win, 1, 0,
                                                             f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, b.o, nullptr, 0);
         else
             kb_attn2<<<dim3(Hl, T), 256, 0, s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk, nullptr, 0,
-                                                    pos0, win, 1, 0, f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, b.o,
+                                                    b.pp, win, 1, 0, f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, b.o,
                                                     nullptr, Hl);
-        kb_ring_write<<<std::min(T, win), 152, 0, s.st>>>(b.chunk, s.kv[il], T, pos0, win);
+        kb_ring_write<<<std::min(T, win), 152, 0, s.st>>>(b.chunk, s.kv[il], T, b.pp, win);
     } else {
         // the indexer: pooled keys of the groups completed in the chunk, then the per-token selection in tiles
         float* iq = b.qp + (size_t) Hd * QH;
-        kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, s.st>>>(iq, (int) qp_ld, IH, IK, IK - rope, rope, pos0, th);
+        kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, s.st>>>(iq, (int) qp_ld, IH, IK, IK - rope, rope, b.pp, th);
         kb_rms<<<T, 128, 0, s.st>>>(b.xp + oik, (int) xp_ld, f32(s, P + "indexer.k_norm.weight"), IK, eps, b.ikn, IK);
         const DW& ivw = s.w.at(P + "ivg");
         kb_q8_gemv<<<dim3(nb(2 * IK * 32), T), 256, 0, s.st>>>((const uint8_t*) ivw.d, b.ikn, IK, b.ivg, 2 * IK, IK, 2 * IK);
         const int g_first = pos0 / kpool, n_groups = (pos0 + T) / kpool - g_first;
         if (n_groups > 0)
-            kb_pool_groups<<<n_groups, 128, 0, s.st>>>(b.ivg, s.ring[il], pos0, g_first,
+            kb_pool_groups<<<n_groups, 128, 0, s.st>>>(b.ivg, s.ring[il], b.pp, T,
                                                        f32(s, P + "indexer_compressor_ape.weight"),
                                                        f32(s, P + "indexer_compressor_norm.weight"), s.pooled[il], IK,
                                                        kpool, rope, eps, th);
-        kb_ring_chunk<<<kpool, 256, 0, s.st>>>(b.ivg, s.ring[il], T, pos0, IK, kpool);
+        kb_ring_chunk<<<kpool, 256, 0, s.st>>>(b.ivg, s.ring[il], T, b.pp, IK, kpool);
         blin(s, b, P + "indexer.proj.weight", b.x, E, b.iw, IH, T);
         k_scale<<<nb(T * IH), 256, 0, s.st>>>(b.iw, T * IH, 1.0f / std::sqrt((float) (IK * IH)));
         const int64_t ld_sc = o.max_context / kpool + 1;
@@ -328,18 +344,18 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
             const int n_pool_max = (pos0 + t0 + tt - 1) / kpool;
             if (pos0 + t0 + tt > top_k && n_pool_max > 0)
                 kb_score<<<dim3(nb(n_pool_max * 32), tt), 256, 0, s.st>>>(iq, (int) qp_ld, s.pooled[il], b.iw, IH, IK, IH,
-                                                                          kpool, top_k, pos0, t0, b.score, (int) ld_sc);
-            kb_select_kpool<1024><<<tt, 1024, 0, s.st>>>(b.score, (int) ld_sc, pos0, t0, kpool, top_k, top_k / kpool - tail,
+                                                                          kpool, top_k, b.pp, t0, b.score, (int) ld_sc);
+            kb_select_kpool<1024><<<tt, 1024, 0, s.st>>>(b.score, (int) ld_sc, b.pp, t0, kpool, top_k, top_k / kpool - tail,
                                                          n_cap, b.cells);
         }
         if (S > 1) {
             if (Hd == 32 && !std::getenv("HY4F_OLD_ATTN"))
                 kb_mqa_attn<32><<<T, 256, mqa_smem<32>(), s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], nullptr,
-                                                                b.cells, n_cap, pos0, win, S, s.g, nullptr, scale, nullptr,
+                                                                b.cells, n_cap, b.pp, win, S, s.g, nullptr, scale, nullptr,
                                                                 b.part, CBW());
             else
                 kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], nullptr, b.cells,
-                                                        n_cap, pos0, win, S, s.g, nullptr, scale, nullptr, b.part, Hd);
+                                                        n_cap, b.pp, win, S, s.g, nullptr, scale, nullptr, b.part, Hd);
             ++b.step;
             const size_t per = (size_t) T * Hl * CBW();
             push(s, b, b.part, per, 1, Hl, CBW(), b.cb, b.ctr + 4);
@@ -347,7 +363,7 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                                             b.o);
         } else {
             kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], nullptr, b.cells, n_cap,
-                                                    pos0, win, 1, 0, f32(s, P + "attn_sinks.weight"), scale, b.o, nullptr, Hd);
+                                                    b.pp, win, 1, 0, f32(s, P + "attn_sinks.weight"), scale, b.o, nullptr, Hd);
         }
     }
     // a[t][h] = v_b_h o[t][h] (v_b_h [vh][kvl] row-major), then the sigmoid gate
@@ -361,7 +377,8 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
 void b_ffn(Shard& s, BShard& b, int il, int T) {
     namespace mq = strata::prefill::mmq;
     const std::string P = "blk." + std::to_string(il) + ".";
-    b_norm_in(s, b, P, "hc_ffn", P + "ffn_norm.weight", 2 * hc, hc_mag, T);
+    if (b.mtp) kb_rms<<<T, 1024, 0, s.st>>>(b.mr, E, f32(s, P + "ffn_norm.weight"), E, eps, b.x, E);
+    else b_norm_in(s, b, P, "hc_ffn", P + "ffn_norm.weight", 2 * hc, hc_mag, T);
     if (il < dense_lead) {
         const int fl = n_ff / S;
         blin(s, b, P + "dense_gu", b.x, E, b.shd, 2 * fl, T);
@@ -370,7 +387,7 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
         b_ar_post(s, b, b.ffo, P + "post_ffw_norm.weight", T);
         return;
     }
-    const int K = n_used, e0 = s.g * n_exp / S, nl = n_exp / S, fl = n_ffx / S;
+    const int K = n_used, e0 = ebound[s.g], nl = ebound[s.g + 1] - ebound[s.g], fl = n_ffx / S;
     blin(s, b, P + "ffn_gate_inp.weight", b.x, E, b.lg, n_exp, T);
     kn::router_sigmoid(b.lg, f32(s, P + "exp_probs_b.bias"), T, n_exp, K, w_scale, true, b.eids, b.ew, s.st);
     kb_moe_count<<<nl, 256, 0, s.st>>>(b.eids, T * K, e0, b.mcnt);
@@ -439,19 +456,54 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
 void b_chunk(Shard& s, BShard& b, int pos0, int T, bool want_logits) {
     b.hb[0] = 0;
     b.hb[1] = T;
-    HY_CK(cudaMemcpyAsync(b.dbounds, b.hb, sizeof(int) * 2, cudaMemcpyHostToDevice, s.st));
+    b.hb[2] = pos0;
+    b.hb[3] = pos0 > 0 ? pos0 - 1 : 0;   // the MTP rows' first position (it lags the trunk by one)
+    HY_CK(cudaMemcpyAsync(b.dbounds, b.hb, sizeof(int) * 4, cudaMemcpyHostToDevice, s.st));
+    b.mtp = false;
+    b.pp = b.dbounds + 2;
     const DW& emb = s.w.at("token_embd.weight");
-    kb_embed<<<dim3(nb(E), T), 256, 0, s.st>>>((const uint8_t*) emb.d, emb.rb, b.toks, pos0, b.X, b.R, E, hc, s.hist);
+    kb_embed<<<dim3(nb(E), T), 256, 0, s.st>>>((const uint8_t*) emb.d, emb.rb, b.toks, b.dbounds + 2, b.X, b.R, E, hc, s.hist);
     for (int il = 0; il < L; ++il) {
         for (size_t e = 0; e < eg_layers.size(); ++e)
             if (eg_layers[e] == il) b_engram(s, b, (int) e, il, pos0, T);
         b_attention(s, b, il, pos0, T);
         b_ffn(s, b, il, T);
     }
+    // the final hidden states (hc head + output norm): every row when the MTP layer follows, else the last one
+    const int th = has_mtp ? T : 1;
+    b_norm_in(s, b, "", "output_hc", "output_norm.weight", hc, 0.0f, th, (size_t) (T - th));
+    const float* hlast = b.x + (size_t) (th - 1) * E;
     if (want_logits) {
-        b_norm_in(s, b, "", "output_hc", "output_norm.weight", hc, 0.0f, 1, (size_t) T - 1);
-        gemv(s, "output.weight", b.x, s.logits);
+        gemv(s, "output.weight", hlast, s.logits);
         HY_CK(cudaMemcpyAsync(hlogits + (size_t) s.g * (V / S), s.logits, sizeof(float) * (V / S), cudaMemcpyDeviceToHost,
                               s.st));
     }
+    if (!has_mtp) return;
+    // the MTP layer over (h[p], token[p+1]) for p = pos0-1 .. pos0+T-2 (the chunk's last row waits for the next token)
+    const int Tm = pos0 > 0 ? T : T - 1;
+    if (Tm > 0) {
+        float* hin = b.ao;   // (attention arena: free until the MTP attention)
+        if (pos0 > 0) {
+            HY_CK(cudaMemcpyAsync(hin, b.hprev, sizeof(float) * E, cudaMemcpyDeviceToDevice, s.st));
+            if (T > 1) HY_CK(cudaMemcpyAsync(hin + E, b.x, sizeof(float) * (size_t) (T - 1) * E, cudaMemcpyDeviceToDevice, s.st));
+        } else {
+            HY_CK(cudaMemcpyAsync(hin, b.x, sizeof(float) * (size_t) (T - 1) * E, cudaMemcpyDeviceToDevice, s.st));
+        }
+    }
+    HY_CK(cudaMemcpyAsync(b.hprev, hlast, sizeof(float) * E, cudaMemcpyDeviceToDevice, s.st));
+    if (!dsh.empty()) HY_CK(cudaMemcpyAsync(dsh[s.g].h, hlast, sizeof(float) * E, cudaMemcpyDeviceToDevice, s.st));
+    if (Tm <= 0) return;
+    const std::string P = "blk." + std::to_string(L) + ".";
+    float* me = b.mu;    // (FFN arena)
+    float* cat = b.gu;
+    kd_embed_rows<<<dim3(nb(E), Tm), 256, 0, s.st>>>((const uint8_t*) emb.d, emb.rb, pos0 > 0 ? b.toks : b.toks + 1, E, me);
+    kb_rms<<<Tm, 1024, 0, s.st>>>(me, E, f32(s, P + "nextn.enorm.weight"), E, eps, cat, 2 * E);
+    kb_rms<<<Tm, 1024, 0, s.st>>>(b.ao, E, f32(s, P + "nextn.hnorm.weight"), E, eps, cat + E, 2 * E);
+    blin(s, b, P + "nextn.eh_proj.weight", cat, 2 * E, b.mr, E, Tm);
+    b.mtp = true;
+    b.pp = b.dbounds + 3;
+    b_attention(s, b, L, pos0 > 0 ? pos0 - 1 : 0, Tm);
+    b_ffn(s, b, L, Tm);
+    b.mtp = false;
+    b.pp = b.dbounds + 2;
 }

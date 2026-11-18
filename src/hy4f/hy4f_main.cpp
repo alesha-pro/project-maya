@@ -29,7 +29,7 @@ static std::vector<int> csv(const char* s) {
 int main(int argc, char** argv) {
     strata::hy4f::Options o;
     std::vector<int32_t> toks;
-    int gen = 0, pchunk = 0, ptail = 0, repeat = 1;
+    int gen = 0, pchunk = 0, ptail = 0, repeat = 1, spec = 0, vtail = 0, vbench = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -48,6 +48,9 @@ int main(int argc, char** argv) {
         else if (a == "--prefill") pchunk = std::atoi(next());
         else if (a == "--prefill-tail") ptail = std::atoi(next());
         else if (a == "--repeat") repeat = std::atoi(next());
+        else if (a == "--verify-tail") vtail = std::atoi(next());   // the prompt tail through verify(T) chunks
+        else if (a == "--verify-bench") vbench = std::atoi(next());   // time verify(T) for T = 1..4 (N reps)
+        else if (a == "--spec") spec = std::atoi(next());   // MTP drafts per step (1)
         else if (a == "--gen") gen = std::atoi(next());
         else if (a == "--dump") o.dump_dir = next();
         else if (a == "--max-context") o.max_context = std::atoll(next());
@@ -101,12 +104,98 @@ int main(int argc, char** argv) {
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
         std::printf("prefill: %d tokens in %.3f s, %.1f tok/s (chunk %d, first call includes setup)\n", np, dt, np / dt, pchunk);
         pos = np;
-        for (size_t i = np; i < toks.size(); ++i) run(toks[i]);
+        if (vtail > 0) {
+            std::vector<float> lg((size_t) 4 * m.vocab());
+            int32_t am[4];
+            for (size_t i = np; i < toks.size();) {
+                const int T = std::min<int>(vtail, (int) (toks.size() - i));
+                if (!m.verify(toks.data() + i, T, pos, lg.data(), am, err)) {
+                    std::fprintf(stderr, "maya-hy4f: verify failed: %s\n", err.c_str());
+                    return 1;
+                }
+                if (!o.dump_dir.empty()) {
+                    std::FILE* f = std::fopen((o.dump_dir + "/logits.f32").c_str(), "ab");
+                    if (f) std::fwrite(lg.data(), 4, (size_t) T * m.vocab(), f), std::fclose(f);
+                }
+                std::copy(lg.begin() + (size_t) (T - 1) * m.vocab(), lg.begin() + (size_t) T * m.vocab(), logits.begin());
+                pos += T;
+                i += T;
+            }
+        } else {
+            for (size_t i = np; i < toks.size(); ++i) run(toks[i]);
+        }
         steps_s = 0, steps = 0;
     } else {
         for (int32_t t : toks) run(t);
     }
     std::printf("prompt: %zu tokens\n", toks.size());
+    if (vbench > 0) {
+        int32_t am[4], vt[4] = {toks[0], toks[1 % toks.size()], toks[2 % toks.size()], toks[3 % toks.size()]};
+        for (int T = 1; T <= 4; ++T) {
+            m.verify(vt, T, pos, nullptr, am, err);
+            const auto a = std::chrono::steady_clock::now();
+            for (int r = 0; r < vbench; ++r)
+                if (!m.verify(vt, T, pos, nullptr, am, err)) {
+                    std::fprintf(stderr, "maya-hy4f: verify failed: %s\n", err.c_str());
+                    return 1;
+                }
+            const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count() / vbench;
+            std::printf("verify T=%d: %.2f ms\n", T, dt * 1e3);
+        }
+        if (m.has_mtp())
+            for (int T = 1; T <= 2; ++T) {
+                int32_t dr;
+                const auto a = std::chrono::steady_clock::now();
+                for (int r = 0; r < vbench; ++r) m.mtp(vt, T, pos, &dr, err);
+                std::printf("mtp T=%d: %.2f ms\n", T,
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count() / vbench * 1e3);
+            }
+    }
+    if (spec > 0 && gen > 0) {
+        if (!m.has_mtp()) {
+            std::fprintf(stderr, "maya-hy4f: --spec needs the MTP layer\n");
+            return 1;
+        }
+        // greedy speculative decode, one MTP draft per step: verify [last, draft] -> accept -> MTP over the new rows
+        std::vector<int32_t> out;
+        int32_t last = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin()), draft = 0, am[4];
+        out.push_back(last);
+        if (!m.mtp(&last, 1, pos - 1, &draft, err)) {
+            std::fprintf(stderr, "maya-hy4f: mtp failed: %s\n", err.c_str());
+            return 1;
+        }
+        int steps2 = 0, acc = 0;
+        const auto a = std::chrono::steady_clock::now();
+        while ((int) out.size() < gen) {
+            const int32_t vt[2] = {last, draft};
+            if (!m.verify(vt, 2, pos, nullptr, am, err)) {
+                std::fprintf(stderr, "maya-hy4f: verify failed: %s\n", err.c_str());
+                return 1;
+            }
+            ++steps2;
+            int32_t nt[2];
+            int nn;
+            if (am[0] == draft) {
+                ++acc;
+                nt[0] = draft, nt[1] = am[1], nn = 2;
+            } else {
+                nt[0] = am[0], nn = 1;
+            }
+            for (int i = 0; i < nn; ++i) out.push_back(nt[i]);
+            if (!m.mtp(nt, nn, pos, &draft, err)) {
+                std::fprintf(stderr, "maya-hy4f: mtp failed: %s\n", err.c_str());
+                return 1;
+            }
+            last = nt[nn - 1];
+            pos += nn;
+        }
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+        std::printf("gen:");
+        for (int32_t t : out) std::printf(" %d", t);
+        std::printf("\nspec: %zu tokens in %d steps, accept %.1f%%, %.2f tok/s, %.2f ms/step\n", out.size() - 1, steps2,
+                    100.0 * acc / std::max(1, steps2), (out.size() - 1) / dt, 1000.0 * dt / std::max(1, steps2));
+        return 0;
+    }
     std::vector<int32_t> out;
     for (int g = 0; g < gen; ++g) {
         const int32_t t = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin());

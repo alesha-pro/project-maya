@@ -17,6 +17,7 @@
 #include "hy4f_select.cuh"
 #include "hy4f_bkern.cuh"
 #include "hy4f_mqa.cuh"
+#include "hy4f_dkern.cuh"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -96,7 +97,8 @@ struct Shard {
     cudaStream_t st = nullptr;
     std::map<std::string, DW> w;
     std::map<int, uint8_t*> kv;       // layer -> Q8 rows (SWA ring / DSA context-parallel slots)
-    std::map<int, float*> ring, pooled;
+    std::map<int, float*> ring;
+    std::map<int, __half*> pooled;   // the k-pool keys, F16 (replicated: the score reads every group)
     Io* dio = nullptr;
     int* hist = nullptr;
     void* q8 = nullptr;
@@ -142,6 +144,8 @@ struct Model::Impl {
     int eg_ngram = 3, eg_heads = 8, eg_D = 96, eg_pad = 0;
     uint8_t* eg_table = nullptr;
     int S = 4;
+    std::vector<int> ebound;   // shard g owns the experts [ebound[g], ebound[g+1])
+    int nl_max = 0;
     std::vector<Shard> sh;
     Io* hio = nullptr;
     float* hlogits = nullptr;
@@ -309,6 +313,72 @@ struct Model::Impl {
         return w;
     }
 
+    // the token embedding in pinned host memory, read by every GPU in place (a few rows per step: ~390 MB of VRAM saved)
+    DW emb_h;
+    DW emb_host() {
+        if (emb_h.d) return emb_h;
+        const strata::GgufFile* f = nullptr;
+        const strata::TensorInfo* t = T("token_embd.weight", &f);
+        emb_h.type = (int) t->type;
+        emb_h.ne[0] = (int64_t) t->shape[0];
+        emb_h.ne[1] = (int64_t) t->shape[1];
+        emb_h.rb = row_bytes(emb_h.type, emb_h.ne[0]);
+        const size_t bytes = emb_h.rb * (size_t) emb_h.ne[1];
+        HY_CK(cudaHostAlloc(&emb_h.d, bytes, cudaHostAllocPortable | cudaHostAllocMapped));
+        std::memcpy(emb_h.d, f->tensor_data(*t), bytes);
+        return emb_h;
+    }
+
+    // the experts per GPU: HY4F_EXPERT_SPLIT=a,b,c,d, else evened out by the free VRAM (GPUs that hold other processes'
+    // memory get fewer experts; one expert index = its gate/up/down in every MoE layer)
+    void split_experts(const std::vector<int>& devs) {
+        std::vector<int> n(S, n_exp / S);
+        if (const char* e = std::getenv("HY4F_EXPERT_SPLIT")) {
+            std::vector<int> v;
+            for (const char* p = e; *p;) {
+                v.push_back(std::atoi(p));
+                while (*p && *p != ',') ++p;
+                if (*p == ',') ++p;
+            }
+            if ((int) v.size() == S) n = v;
+        } else if (S > 1) {
+            double per = 0;   // bytes of one expert index over the layers
+            for (int il = dense_lead; il < L + (has_mtp ? 1 : 0); ++il) {
+                const std::string P = "blk." + std::to_string(il) + ".";
+                for (const char* k : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
+                    const strata::GgufFile* f = nullptr;
+                    const strata::TensorInfo* t = T(P + k, &f);
+                    per += (double) row_bytes((int) t->type, (int64_t) t->shape[0]) * (double) t->shape[1];
+                }
+            }
+            std::vector<double> fr(S);
+            double mean = 0;
+            for (int g = 0; g < S; ++g) {
+                size_t f = 0, tot = 0;
+                HY_CK(cudaSetDevice(devs[g]));
+                HY_CK(cudaMemGetInfo(&f, &tot));
+                fr[g] = (double) f;
+                mean += fr[g] / S;
+            }
+            int sum = 0;
+            for (int g = 0; g < S; ++g) {
+                n[g] = (int) std::lround(n_exp / (double) S + (fr[g] - mean) / per);
+                sum += n[g];
+            }
+            n[S - 1] += n_exp - sum;
+        }
+        ebound.assign(S + 1, 0);
+        for (int g = 0; g < S; ++g) ebound[g + 1] = ebound[g] + n[g];
+        if (ebound[S] != n_exp) throw std::runtime_error("hy4f: the expert split does not add up to " + std::to_string(n_exp));
+        nl_max = 0;
+        for (int g = 0; g < S; ++g) nl_max = std::max(nl_max, n[g]);
+        if (o.verbose) {
+            std::fprintf(stderr, "hy4f: experts per GPU:");
+            for (int g = 0; g < S; ++g) std::fprintf(stderr, " %d", n[g]);
+            std::fprintf(stderr, "\n");
+        }
+    }
+
     void load_engram() {
         const strata::GgufFile* f = nullptr;
         const strata::TensorInfo* t = T("per_layer_token_embd.weight", &f);
@@ -327,18 +397,24 @@ struct Model::Impl {
         HY_CK(cudaStreamCreateWithFlags(&s.st, cudaStreamNonBlocking));
         const int g = s.g;
         const int64_t C = o.max_context;
-        up_full(s, "token_embd.weight");
+        s.w["token_embd.weight"] = emb_host();
         for (const char* n : {"output_norm.weight", "output_hc_fn.weight", "output_hc_scale.weight", "output_hc_base.weight"})
             up_full(s, n);
         up_rows(s, "output.weight", (int64_t) g * V / S, (int64_t) (g + 1) * V / S);
         const int Hsl = Hs / S, Hdl = Hd / S, QH = nope + rope;
-        for (int il = 0; il < L; ++il) {
+        for (int il = 0; il < L + (has_mtp ? 1 : 0); ++il) {
             const std::string P = "blk." + std::to_string(il) + ".";
             for (const char* n : {"attn_norm.weight", "attn_q_a_norm.weight", "attn_kv_a_norm.weight", "post_attention_norm.weight", "ffn_norm.weight",
-                                  "post_ffw_norm.weight", "hc_attn_fn.weight", "hc_attn_scale.weight",
-                                  "hc_attn_base.weight", "hc_ffn_fn.weight", "hc_ffn_scale.weight", "hc_ffn_base.weight",
-                                  "attn_sinks.weight"})
+                                  "post_ffw_norm.weight", "attn_sinks.weight"})
                 up_full(s, P + n);
+            if (il < L)
+                for (const char* n : {"hc_attn_fn.weight", "hc_attn_scale.weight", "hc_attn_base.weight", "hc_ffn_fn.weight",
+                                      "hc_ffn_scale.weight", "hc_ffn_base.weight"})
+                    up_full(s, P + n);
+            else
+                for (const char* n : {"nextn.enorm.weight", "nextn.hnorm.weight", "nextn.eh_proj.weight",
+                                      "nextn.shared_head_norm.weight"})
+                    up_full(s, P + n);
             for (int e : eg_layers)
                 if (e == il)
                     for (const char* n : {"engram_lookup_norm.weight", "engram_kv.weight", "engram_kv_b.weight",
@@ -372,7 +448,7 @@ struct Model::Impl {
                 up_cols(s, P + "ffn_down.weight", f0, f1);
             } else {
                 for (const char* n : {"ffn_gate_inp.weight", "exp_probs_b.bias", "ffn_routed_up.weight"}) up_full(s, P + n);
-                const int64_t e0 = (int64_t) g * n_exp / S, e1 = (int64_t) (g + 1) * n_exp / S;
+                const int64_t e0 = ebound[g], e1 = ebound[g + 1];
                 {   // gate | up of each expert as one [2 n_ff, latent] matrix (MMQ run_glu's layout; one decode launch)
                     const strata::GgufFile *fg = nullptr, *fu = nullptr;
                     const strata::TensorInfo* tg = T(P + "ffn_gate_exps.weight", &fg);
@@ -405,11 +481,13 @@ struct Model::Impl {
                 up_cols(s, P + "ffn_down_shexp.weight", f0, f1);
             }
             if (sw) {
-                HY_CK(cudaMalloc(&s.kv[il], (size_t) win * KV_RB));
+                HY_CK(cudaMalloc(&s.kv[il], (size_t) (win + RING_PAD) * KV_RB));
+                HY_CK(cudaMemset(s.kv[il], 0, (size_t) (win + RING_PAD) * KV_RB));
             } else {
                 HY_CK(cudaMalloc(&s.kv[il], (size_t) (C / S + 1) * KV_RB));
                 s.ring[il] = dalloc((size_t) kpool * 2 * IK);
-                s.pooled[il] = dalloc((size_t) (C / kpool + 1) * IK);
+                HY_CK(cudaMalloc(&s.pooled[il], sizeof(__half) * (size_t) (C / kpool + 1) * IK));
+                HY_CK(cudaMemset(s.pooled[il], 0, sizeof(__half) * (size_t) (C / kpool + 1) * IK));
             }
         }
         const int Hmax = std::max(Hd, Hs);
@@ -578,7 +656,7 @@ struct Model::Impl {
         mmvq(s, P + "xproj", s.xq, s.xp);
         k_rms_q8<<<1, 1024, 0, s.st>>>(s.xp + oq, f32(s, P + "attn_q_a_norm.weight"), q_lora, eps, nullptr, s.qrq);
         k_kv_prep<<<1, 576, 0, s.st>>>(s.xp + okv, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th, s.kv[il],
-                                       s.dio, sw ? 1 : 2, win, S, s.g, nullptr);
+                                       s.dio, sw ? 1 : 2, win + RING_PAD, S, s.g, nullptr);
         mmvq(s, P + "qproj", s.qrq, s.qp);
         const DW& kb = s.w.at(P + "attn_k_b.weight");
         const DW& vb = s.w.at(P + "attn_v_b.weight");
@@ -636,7 +714,7 @@ struct Model::Impl {
         }
         gemv(s, P + "ffn_gate_inp.weight", s.x, s.lg);
         kn::router_sigmoid(s.lg, f32(s, P + "exp_probs_b.bias"), 1, n_exp, n_used, w_scale, true, s.eids, s.ew, s.st);
-        const int e0 = s.g * n_exp / S, e1 = (s.g + 1) * n_exp / S, fl = n_ffx / S;
+        const int e0 = ebound[s.g], e1 = ebound[s.g + 1], fl = n_ffx / S;
         k_local_ids<<<1, 32, 0, s.st>>>(s.eids, s.eloc, n_used, e0, e1);
         mmvq(s, P + "xmoe", s.xq, s.xm);
         k_q8<<<nb(latent), 256, 0, s.st>>>(s.xm, latent, s.xlq);
@@ -766,6 +844,7 @@ struct Model::Impl {
     }
 
 #include "hy4f_batch.inc"
+#include "hy4f_dec.inc"
 
     void capture() {
         for (auto& s : sh) {
@@ -787,7 +866,7 @@ int Model::vocab() const { return d_->V; }
 std::string Model::summary() const {
     return "hy4f v3: " + std::to_string(d_->L) + " layers, tensor parallel over " + std::to_string(d_->S) +
            " GPUs, Q8 KV (DSA context parallel, SWA ring), " + (d_->graphs ? "CUDA graphs" : "no graphs") +
-           ", max context " + std::to_string(d_->o.max_context);
+           ", max context " + std::to_string(d_->o.max_context) + (d_->has_mtp ? ", MTP" : "");
 }
 
 bool Model::load(const Options& o, std::string& err) {
@@ -808,6 +887,14 @@ bool Model::load(const Options& o, std::string& err) {
         d.load_engram();
         HY_CK(cudaHostAlloc((void**) &d.hio, sizeof(Io), cudaHostAllocPortable));
         HY_CK(cudaHostAlloc((void**) &d.hlogits, sizeof(float) * d.V, cudaHostAllocPortable));
+        {
+            const strata::GgufFile* f = nullptr;
+            const strata::TensorInfo* t = d.find("blk." + std::to_string(d.L) + ".nextn.eh_proj.weight", &f);
+            const strata::TensorInfo* te = d.find("blk." + std::to_string(d.L) + ".ffn_gate_exps.weight", &f);
+            d.has_mtp = t && te && (int) te->type != 30 /*BF16 experts: requantize first (scripts/requant_mtp_q3k.py)*/ &&
+                        (int) t->type == 8 && !std::getenv("HY4F_NO_MTP");
+        }
+        d.split_experts(devs);
         d.sh.resize(d.S);
         for (int g = 0; g < d.S; ++g) {
             d.sh[g].g = g;
@@ -820,6 +907,7 @@ bool Model::load(const Options& o, std::string& err) {
             HY_CK(cudaDeviceSynchronize());
         }
         if (d.graphs) d.capture();
+        if (d.graphs) d.dec_setup();
         if (o.verbose)
             for (auto& s : d.sh) {
                 size_t fr = 0, tot = 0;
@@ -837,7 +925,7 @@ bool Model::load(const Options& o, std::string& err) {
 bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int chunk, std::string& err) {
     try {
         Impl& d = *d_;
-        if (pos != d.pos_next) throw std::runtime_error("hy4f: prefill out of order");
+        if (pos > d.pos_next) throw std::runtime_error("hy4f: prefill out of order");
         if (pos + n > d.o.max_context) throw std::runtime_error("hy4f: context full");
         if (chunk <= 0) chunk = 1024;
         if (d.bsh.empty() || d.bsh[0].Tmax < chunk) {
@@ -879,10 +967,64 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
     }
 }
 
+bool Model::verify(const int32_t* toks, int T, int64_t pos, float* logits, int32_t* argmax, std::string& err) {
+    try {
+        Impl& d = *d_;
+        if (d.dsh.empty()) throw std::runtime_error("hy4f: multi-token steps need the CUDA graphs");
+        if (T < 1 || T > Impl::DT) throw std::runtime_error("hy4f: verify takes 1.." + std::to_string(Impl::DT) + " tokens");
+        if (pos > d.pos_next) throw std::runtime_error("hy4f: verify out of order");
+        if (pos + T > d.o.max_context) throw std::runtime_error("hy4f: context full");
+        d.hio_v->pos = (int) pos;
+        d.hio_v->n = T;
+        for (int t = 0; t < T; ++t) d.hio_v->toks[t] = toks[t];
+        d.dec_launch(false, T);
+        d.pos_next = pos + T;
+        if (logits) std::memcpy(logits, d.hlogT, sizeof(float) * T * d.V);
+        if (argmax)
+            for (int t = 0; t < T; ++t) {
+                float bv = -INFINITY;
+                int bi = 0;
+                for (int g = 0; g < d.S; ++g) {
+                    const float v = d.hargv[g * Impl::DT + t];
+                    if (v > bv) bv = v, bi = d.hargi[g * Impl::DT + t];
+                }
+                argmax[t] = bi;
+            }
+        return true;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
+
+bool Model::mtp(const int32_t* next_toks, int T, int64_t mpos, int32_t* draft, std::string& err) {
+    try {
+        Impl& d = *d_;
+        if (!d.has_mtp || d.dsh.empty()) throw std::runtime_error("hy4f: no MTP layer (or no CUDA graphs)");
+        if (T < 1 || T > Impl::DT) throw std::runtime_error("hy4f: mtp takes 1.." + std::to_string(Impl::DT) + " tokens");
+        if (mpos + T > d.o.max_context) throw std::runtime_error("hy4f: context full");
+        d.hio_m->pos = (int) mpos;
+        d.hio_m->n = T;
+        for (int t = 0; t < T; ++t) d.hio_m->toks[t] = next_toks[t];
+        d.dec_launch(true, T);
+        d.m_next = mpos + T;
+        float bv = -INFINITY;
+        int bi = 0;
+        for (int g = 0; g < d.S; ++g)
+            if (d.hmargv[g] > bv) bv = d.hmargv[g], bi = d.hmargi[g];
+        if (draft) *draft = bi;
+        return true;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
+bool Model::has_mtp() const { return d_->has_mtp; }
+
 bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
     try {
         Impl& d = *d_;
-        if (pos != d.pos_next) throw std::runtime_error("hy4f: step out of order");
+        if (pos > d.pos_next) throw std::runtime_error("hy4f: step out of order");
         if (pos >= d.o.max_context) throw std::runtime_error("hy4f: context full");
         d.hio->pos = (int) pos;
         d.hio->tok = token;
@@ -900,7 +1042,7 @@ bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
             HY_CK(cudaStreamSynchronize(s.st));
         }
         HY_CK(cudaGetLastError());
-        ++d.pos_next;
+        d.pos_next = pos + 1;
         if (logits) std::memcpy(logits, d.hlogits, sizeof(float) * d.V);
         if (!d.o.dump_dir.empty() && logits) {
             std::FILE* f = std::fopen((d.o.dump_dir + "/logits.f32").c_str(), "ab");

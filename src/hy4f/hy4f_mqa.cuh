@@ -25,9 +25,10 @@ template <int H>
 __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qabs, const float* __restrict__ q, int ldq,
                                                    int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                    const uint8_t* __restrict__ chunk, const int* __restrict__ cells,
-                                                   int n_cap, int pos0, int win, int n_shards, int shard,
+                                                   int n_cap, const int* pos0p, int win, int n_shards, int shard,
                                                    const float* __restrict__ sinks, float scale, float* __restrict__ o,
                                                    float* __restrict__ part, int W) {
+    const int pos0 = *pos0p;
     using namespace nvcuda;
     constexpr int KVL = 512, ROPE = 64, D = 576, LD = MQA_LD, TR = MQA_TR;
     constexpr int NST = H / 8;          // S tiles (16 heads x 16 rows): (H/16) x 2
@@ -105,7 +106,7 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
                 if (s < n) {
                     if (!cells) {
                         const int pp = lo + s;
-                        p = pp >= pos0 ? chunk + (size_t) (pp - pos0) * KV_RB : kv + (size_t) (pp % win) * KV_RB;
+                        p = (chunk && pp >= pos0) ? chunk + (size_t) (pp - pos0) * KV_RB : kv + (size_t) (pp % (win + RING_PAD)) * KV_RB;
                     } else {
                         p = kv + (size_t) cl[s] * KV_RB;
                     }
