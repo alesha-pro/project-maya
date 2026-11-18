@@ -278,19 +278,6 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
     __shared__ int wtot[8], s_n;
     const int sp = blockIdx.x, nsp = gridDim.x, t = blockIdx.y, pos = *pos0p + t;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
-    for (int i = tid; i < H * D; i += 256) {
-        const int h = i / D, c = i % D;
-        float v;
-        if (c < KVL) v = qabs[((size_t) t * H + h) * KVL + c];
-        else {
-            const int j = c - KVL, jj = j >> 1;
-            const float* qp = q + (size_t) t * ldq + (size_t) h * qs + nope + 2 * jj;
-            float sn, cs;
-            sincosf((float) pos * powf(theta, -2.0f * jj / ROPE), &sn, &cs);
-            v = (j & 1) ? qp[0] * sn + qp[1] * cs : qp[0] * cs - qp[1] * sn;
-        }
-        Qs[(size_t) h * LD + c] = __float2half_rn(v * scale);
-    }
     int n, lo = 0;
     if constexpr (DenseDsa) {
         n = (pos + n_shards - shard) / n_shards;
@@ -322,11 +309,32 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
         n = s_n;
     }
     const int per = ((n + nsp - 1) / nsp + TR - 1) / TR * TR, rb = min(n, sp * per), re = min(n, rb + per);
+    const size_t pb = ((size_t) t * nsp + sp) * H;
+    if (rb == re) {
+        if (tid < H) pm[pb + tid] = -INFINITY, pl[pb + tid] = 0.0f;
+        return;  // merge only reads accumulator slices belonging to active splits
+    }
+    for (int i = tid; i < H * D; i += 256) {
+        const int h = i / D, c = i % D;
+        float v;
+        if (c < KVL) v = qabs[((size_t) t * H + h) * KVL + c];
+        else {
+            const int j = c - KVL, jj = j >> 1;
+            const float* qp = q + (size_t) t * ldq + (size_t) h * qs + nope + 2 * jj;
+            float sn, cs;
+            sincosf((float) pos * powf(theta, -2.0f * jj / ROPE), &sn, &cs);
+            v = (j & 1) ? qp[0] * sn + qp[1] * cs : qp[0] * cs - qp[1] * sn;
+        }
+        Qs[(size_t) h * LD + c] = __float2half_rn(v * scale);
+    }
     if (tid < H) sm_m[tid] = -INFINITY, sm_l[tid] = 0.0f, sm_i[tid] = 1.0f;
     wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[OPW];
 #pragma unroll
     for (int i = 0; i < OPW; ++i) wmma::fill_fragment(acc[i], 0.0f);
-    for (int pass = 0; pass < 2; ++pass) {
+    // A one-tile split has its final softmax maximum after its sole QK operation.
+    // Keep scores and the same dequantized KV tile for PV instead of repeating QK.
+    const bool one_tile = re - rb <= TR;
+    for (int pass = 0; pass < (one_tile ? 1 : 2); ++pass) {
         for (int r0 = rb; r0 < re; r0 += TR) {
             __syncthreads();
             if (tid < TR) {
@@ -377,7 +385,9 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
                 if (pass == 0) {
                     const float mx = warp_max(valid ? s2 : -INFINITY);
                     const float mo = sm_m[h], mn = fmaxf(mo, mx);
-                    const float e = warp_sum(valid ? __expf(s2 - mn) : 0.0f);
+                    const float weight = valid ? __expf(s2 - mn) : 0.0f;
+                    const float e = warp_sum(weight);
+                    if (one_tile) Ps[h * 40 + lane] = __float2half_rn(mn != -INFINITY ? weight : 0.0f);
                     if (lane == 0) {
                         sm_l[h] = sm_l[h] * (mo == -INFINITY ? 0.0f : __expf(mo - mn)) + e;
                         sm_m[h] = mn;
@@ -387,7 +397,7 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
                     Ps[h * 40 + lane] = __float2half_rn(valid && m != -INFINITY ? __expf(s2 - m) : 0.0f);
                 }
             }
-            if (pass == 1) {
+            if (pass == 1 || one_tile) {
                 __syncthreads();
 #pragma unroll
                 for (int i = 0; i < OPW; ++i) {
@@ -405,7 +415,6 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
         }
         __syncthreads();
     }
-    const size_t pb = ((size_t) t * nsp + sp) * H;
 #pragma unroll
     for (int i = 0; i < OPW; ++i) {
         const int idx = w * OPW + i, hi = idx >> 5, nj = idx & 31;
@@ -421,16 +430,18 @@ __global__ void kd_mqa_merge(const float* __restrict__ pm, const float* __restri
     constexpr int KVL = 512;
     const int h = blockIdx.x, t = blockIdx.y;
     float M = sinks ? sinks[h] : -INFINITY;
-    for (int sp = 0; sp < nsp; ++sp) M = fmaxf(M, pm[((size_t) t * nsp + sp) * H + h]);
+    int active = nsp;
+    while (active && pm[((size_t) t * nsp + active - 1) * H + h] == -INFINITY) --active;
+    for (int sp = 0; sp < active; ++sp) M = fmaxf(M, pm[((size_t) t * nsp + sp) * H + h]);
     float L = sinks && M != -INFINITY ? __expf(sinks[h] - M) : 0.0f, f[32];
-    for (int sp = 0; sp < nsp; ++sp) {
+    for (int sp = 0; sp < active; ++sp) {
         const float m = pm[((size_t) t * nsp + sp) * H + h];
         f[sp] = m == -INFINITY ? 0.0f : __expf(m - M);
         L += f[sp] * pl[((size_t) t * nsp + sp) * H + h];
     }
     for (int c = threadIdx.x; c < KVL; c += blockDim.x) {
         float a = 0.0f;
-        for (int sp = 0; sp < nsp; ++sp) a += f[sp] * pacc[(((size_t) t * nsp + sp) * H + h) * KVL + c];
+        for (int sp = 0; sp < active; ++sp) a += f[sp] * pacc[(((size_t) t * nsp + sp) * H + h) * KVL + c];
         if (sinks) o[((size_t) t * H + h) * KVL + c] = a / L;
         else part[((size_t) t * H + h) * W + c] = a;
     }
