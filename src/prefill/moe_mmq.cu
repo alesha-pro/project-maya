@@ -175,6 +175,15 @@ static bool stride_refused(const Product& p) {
     return true;
 }
 
+// For grouped products the max experts' load sizes the grid, but the
+// typical expert receives fewer rows. Tune only the tile-selection hint.
+static int64_t tile_rows(const Product& p) {
+    const char* param = std::getenv("HY4F_PF_MMQ_TILE");
+    if (!param || p.n <= 1) return p.max_rows;
+    const int choice = std::atoi(param);
+    return choice < 1 ? p.max_rows : std::min<int64_t>(choice, p.max_rows);
+}
+
 void Context::run(const Product& p, void* stream) {
     if (p.n <= 0 || p.max_rows <= 0) return;
     if (stride_refused(p)) return;   // glm-dsa B15.2
@@ -214,7 +223,7 @@ void Context::run_glu(const Product& p, float limit, void* stream) {
                   p.w_cols, n_ff, p.total_rows, bpr, p.total_rows, p.ld_dst,
                   p.n, p.n, (int64_t) (p.expert_bytes / ggml_type_size(t)), 0, 0,
                   1, 1, 0, 0, 0,
-                  p.max_rows, p.max_rows};
+                  p.max_rows, tile_rows(p)};
     a.x_gate = (const char*) p.w;
     a.glu_limit = limit;
     dispatch(*(ggml_backend_cuda_context*) ctx_, a, (cudaStream_t) stream);
