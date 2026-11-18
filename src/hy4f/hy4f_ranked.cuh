@@ -1,5 +1,6 @@
 #pragma once
 #include "hy4f.hpp"
+#include <math_constants.h>
 #include <cub/block/block_radix_sort.cuh>
 
 namespace strata::hy4f::kern {
