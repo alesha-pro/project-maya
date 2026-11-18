@@ -34,12 +34,15 @@ struct Glm5Geometry;
 enum class GlmArch : int {
     Glm5Next = 0,   // GLM-5.3-Flash: KDA + NoPE MLA with a k-pool indexer, mHC (Maya's reader)
     GlmDsa = 1,     // GLM-5.3 744B: MLA + rope tail, token lightning indexer (full/shared layers), plain residual
+    Hy4Flash = 2,   // Tencent Hy4 flash (hy_v4_flash): MLA + rope tail on DSA and sliding-window layers, k-pool indexer
+                    // over a pooled key projection, hc 4 with identity comb, LatentMoE, Engram (src/core/hy4f_*.cpp)
 };
 
 // how the DSA indexer selects
 enum class GlmIdxKind : int {
     KPool = 0,      // Flash: top pools of kpool positions (+ the open tail)
     Token = 1,      // glm-dsa: top-k individual tokens, shared layers reuse the previous full layer's selection
+    KPoolProj = 2,  // Hy4 flash: top pools of kpool positions, the pooled quantity a gated projection of the normed key
 };
 
 const char* glm_arch_name(GlmArch a);
@@ -54,6 +57,28 @@ template <class D> struct GlmArchExt {
     float idx_ln_eps = 0;         // the indexer key LayerNorm eps (glm-dsa; HF 1e-6, llama.cpp 0)
     GlmIdxKind idx_kind = GlmIdxKind::KPool;
     int64_t n_ctx_train = 0;      // context_length (selects llama.cpp's indexer-types back-compat rule)
+
+    // Hy4 flash (hy_v4_flash, src/core/hy4f_geometry.cpp); every default leaves Flash and glm-dsa as they were
+    std::vector<int> swa_layer;   // per trunk layer: 1 sliding-window attention, 0 the DSA (full) attention
+    int n_swa = 0;                // the window, in tokens
+    int n_head_swa = 0;           // heads on the sliding-window layers (n_head: the DSA layers')
+    double rope_theta_swa = 0;    // RoPE base of the sliding-window layers (rope_theta: the DSA layers')
+    int n_expert_latent = 0;      // LatentMoE: routed experts run at this width (0: at n_embd)
+    bool sandwich_norm = false;   // RMS norms after the attention output and after the FFN (post_*_norm)
+    bool attn_sinks = false;      // a learnable per-head sink logit in the attention softmax
+    bool hc_identity = false;     // hc streams with pre/post weights only: no comb mixing, no Sinkhorn
+    float hc_magnitude = 0;       // hyper_connection.magnitude
+    // Engram: n-gram hash tables (llama.cpp "ple"), one module per Engram layer, all rows in one table
+    std::vector<int> engram_layers;
+    int engram_ngram = 0, engram_heads = 0, engram_dim = 0, engram_pad = -1;
+    std::vector<uint64_t> engram_mult, engram_offsets, engram_vocab;
+    int64_t engram_rows = 0;      // the table's rows: the last module's last offset + its bucket count
+    int64_t engram_token_map = 0; // entries of engram.token_map (the tokenizer -> hash vocabulary map)
+
+    /// Hy4 flash: layer il attends a sliding window (false: the DSA path, and for every other arch).
+    bool is_swa(int il) const { return il >= 0 && il < (int) swa_layer.size() && swa_layer[(size_t) il] != 0; }
+    /// The attention heads of layer il (Hy4 flash: n_head_swa on a sliding-window layer).
+    int heads(int il) const { return is_swa(il) && n_head_swa > 0 ? n_head_swa : d().n_head; }
 
     /// One attention head's q/k width: nope + rope (Flash 256 + 0, glm-dsa 192 + 64).
     int qk_head() const { return d().qk_nope + qk_rope; }
@@ -94,6 +119,14 @@ int glm_arch_route(const strata::GgufFile& g, Glm5Geometry& out, std::string& er
 /// is refused with the key named.  Tensor-dependent facts (n_vocab without vocab_size) are filled by
 /// glm_geometry_check.
 bool from_gguf_glm_dsa(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+
+/// The Hy4 flash geometry reader (prefix "hy_v4_flash."), fail-closed like glm-dsa's (src/core/hy4f_geometry.cpp).
+bool from_gguf_hy4_flash(const strata::GgufFile& g, Glm5Geometry& out, std::string& err);
+/// Hy4 flash tensor shapes of layers [l0, l1) (+ globals, + the NextN block at the trunk's end).
+bool hy4f_geometry_check(Glm5Geometry& g, const std::function<const strata::TensorInfo*(const std::string&)>& find,
+                         int l0, int l1, std::string& err);
+/// One line per fact of a Hy4 flash geometry (the probe and the check-only refusal print it).
+std::string hy4f_geometry_summary(const Glm5Geometry& g);
 
 /// The pack's own geometry (shard 1 named by native_experts.txt), read before anything is sized from it.
 bool glm_pack_geometry(const std::string& pack_dir, Glm5Geometry& out, std::string& err);

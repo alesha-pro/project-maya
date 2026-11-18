@@ -35,6 +35,7 @@ std::vector<uint64_t> trimmed(std::vector<uint64_t> s) {
 }  // namespace
 
 bool glm_geometry_check(Glm5Geometry& g, const GlmFindTensor& find, int l0, int l1, std::string& err) {
+    if (g.arch == GlmArch::Hy4Flash) return hy4f_geometry_check(g, find, l0, l1, err);
     if (g.arch != GlmArch::GlmDsa) return true;   // Flash: Maya's loader checks what it reads, unchanged
     const uint64_t E = (uint64_t) g.n_embd;
     if (l1 <= 0) l1 = g.n_layers;

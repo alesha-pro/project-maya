@@ -35,6 +35,8 @@ const char* glm_arch_name(GlmArch a) {
         return "glm5-next";
     case GlmArch::GlmDsa:
         return "glm-dsa";
+    case GlmArch::Hy4Flash:
+        return "hy-v4-flash";
     }
     return "?";
 }
@@ -127,7 +129,8 @@ int glm_arch_route(const strata::GgufFile& g, Glm5Geometry& out, std::string& er
         return 0;
     }
     if (a->s == "glm-dsa") return from_gguf_glm_dsa(g, out, err) ? 1 : -1;
-    err = "glm geometry: architecture '" + a->s + "' is not served (this engine reads glm5-next and glm-dsa)";
+    if (a->s == "hy_v4_flash") return from_gguf_hy4_flash(g, out, err) ? 1 : -1;
+    err = "glm geometry: architecture '" + a->s + "' is not served (this engine reads glm5-next, glm-dsa and hy_v4_flash)";
     return -1;
 }
 
@@ -376,6 +379,12 @@ bool glm_split_bounds_ok(const Glm5Geometry& g, const std::vector<int>& bounds, 
 }
 
 bool glm_forward_available(const Glm5Geometry& g, std::string& err) {
+    if (g.arch == GlmArch::Hy4Flash) {
+        // hy4f: the geometry and the tensor shapes are read and checked; the forward is not written yet
+        err = "hy-v4-flash: geometry and tensor shapes check out (" + hy4f_geometry_summary(g) +
+              "); the Hy4 flash forward is not implemented yet - stopped before any weight upload";
+        return false;
+    }
     if (g.arch != GlmArch::GlmDsa) return true;
     // glm-dsa B4.6 integration: both glm-dsa forwards exist - the F32 reference (MAYA_GLM_SLOW, B3.5,
     // src/core/glm_dsa_ref.cu) and the fast decode path (fast_layers_plain + the glm-dsa mixer, src/core/glm_dsa_mixer.cu).
