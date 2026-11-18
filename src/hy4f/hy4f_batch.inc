@@ -20,7 +20,9 @@ struct BShard {
     float *xp = nullptr, *qr = nullptr, *qp = nullptr, *qabs = nullptr, *o = nullptr, *part = nullptr, *a = nullptr,
           *ao = nullptr, *ikn = nullptr, *ivg = nullptr, *iw = nullptr, *score = nullptr;
     uint8_t* chunk = nullptr;
-    int* cells = nullptr;
+    int *cells = nullptr, *select_fallback = nullptr;
+    unsigned *pivots = nullptr, *counts = nullptr;
+    uint2* candidates = nullptr;
     float *lg = nullptr, *ew = nullptr, *xm = nullptr, *gu = nullptr, *dn = nullptr, *moe = nullptr, *mu = nullptr,
           *shh = nullptr, *shd = nullptr, *ffo = nullptr;
     int *eids = nullptr, *mb = nullptr, *mb2 = nullptr, *mcnt = nullptr, *rows_tok = nullptr, *row_of = nullptr;
@@ -173,6 +175,13 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.ivg = m.take<float>((size_t) T * 2 * IK);
         b.iw = m.take<float>((size_t) T * IH);
         b.cells = m.take<int>((size_t) TA * n_cap);
+        const char* select = std::getenv("HY4F_PF_SELECT");
+        if (select && std::atoi(select) && C >= 98304) {
+            b.select_fallback = m.take<int>(score_tile);
+            b.pivots = m.take<unsigned>(score_tile);
+            b.counts = m.take<unsigned>(score_tile);
+            b.candidates = m.take<uint2>((size_t)score_tile * SELECT_CAND_LIMIT);
+        }
     };
     auto ffn = [&](Bump& m) {
         if (compact_arena) {
@@ -540,8 +549,19 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                                                                                   IK, IH, kpool, top_k, b.pp, s0, b.score,
                                                                                   (int) ld_sc);
                 }
+                int* fallback = nullptr;
+                if (b.candidates && pos0 + s0 >= 98304) {
+                    fallback = b.select_fallback;
+                    const int parts = std::max(4, std::min(48, (pos0 + s0 + st) / kpool / 2048));
+                    kb_select_pivot<<<st, 256, 0, b.st>>>(b.score, (int)ld_sc, b.pp, s0, kpool, top_k / kpool - tail,
+                                                         b.pivots, b.counts, fallback);
+                    kb_select_filter<<<dim3(parts, st), 256, 0, b.st>>>(b.score, (int)ld_sc, b.pp, s0, kpool,
+                                                                       b.pivots, b.counts, fallback, b.candidates);
+                    kb_select_finish<<<st, 256, 0, b.st>>>(b.candidates, b.counts, fallback, b.pp, s0, t0, kpool,
+                                                          top_k / kpool - tail, n_cap, cells);
+                }
                 kb_select_kpool<1024><<<st, 1024, 0, b.st>>>(b.score, (int) ld_sc, b.pp, s0, t0, kpool, top_k,
-                                                             top_k / kpool - tail, n_cap, cells);
+                                                             top_k / kpool - tail, n_cap, cells, fallback);
             }
             if (compact) {
                 const int stride = (groups + 7) / 8 * 8, rows = rz - ra;

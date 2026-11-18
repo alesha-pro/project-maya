@@ -5,6 +5,7 @@
 #include "hy4f_kern.cuh"
 
 #include <cuda_bf16.h>
+#include <cub/block/block_radix_sort.cuh>
 
 namespace strata::hy4f {
 namespace kern {
@@ -973,10 +974,110 @@ __global__ void kb_add(const float* a, const float* b, float* y, size_t n) {
 
 }  // namespace kern
 
+// The sample estimates the candidate count only. When fewer than k or more than
+// the bounded candidate capacity qualify, the original full selector takes over.
+constexpr int SELECT_CAND_LIMIT = 2048;
+
+__global__ void kb_select_pivot(const float* __restrict__ scores, int ld, const int* pos0p, int t0,
+                                int pool, int k, unsigned* pivots, unsigned* counts, int* fallback) {
+    constexpr int NT = 256, NS = 1024;
+    using Sort = cub::BlockRadixSort<unsigned, NT, NS / NT>;
+    __shared__ typename Sort::TempStorage tmp;
+    __shared__ unsigned extremes[2];
+    const int t = blockIdx.x, n = (*pos0p + t0 + t) / pool, tid = threadIdx.x;
+    if (k < 1 || k > 512 || n > 65536 || n < NS) {
+        if (!tid) { counts[t] = 0; fallback[t] = 1; }
+        return;
+    }
+    unsigned buf[NS / NT];
+#pragma unroll
+    for (int i = 0; i < NS / NT; ++i) {
+        const int rank = tid * (NS / NT) + i;
+        buf[i] = hy4f_key(scores[(size_t)t * ld + (long long)rank * n / NS]);
+    }
+    Sort(tmp).SortDescending(buf);
+    const int rank = min(NS - 1, (int)(((long long)k * NS * 7 / 4 + n - 1) / n));
+    if (tid == rank / (NS / NT)) pivots[t] = buf[rank % (NS / NT)];
+    if (tid == 0) extremes[0] = buf[0];
+    if (tid == NT - 1) extremes[1] = buf[NS / NT - 1];
+    __syncthreads();
+    if (!tid) {
+        counts[t] = 0;
+        fallback[t] = extremes[0] == extremes[1];
+    }
+}
+
+__global__ void kb_select_filter(const float* __restrict__ scores, int ld, const int* pos0p, int t0, int pool,
+                                 const unsigned* pivots, unsigned* counts, const int* fallback, uint2* candidates) {
+    const int t = blockIdx.y, tid = threadIdx.x, lane = tid % 32;
+    if (fallback[t]) return;
+    const int n = (*pos0p + t0 + t) / pool;
+    const unsigned pivot = pivots[t];
+    uint2* dst = candidates + (size_t)t * SELECT_CAND_LIMIT;
+    for (int i = blockIdx.x * blockDim.x + tid; i - lane < n; i += blockDim.x * gridDim.x) {
+        const unsigned key = i < n ? hy4f_key(scores[(size_t)t * ld + i]) : 0;
+        const bool take = i < n && key >= pivot;
+        const unsigned mask = __ballot_sync(0xffffffffu, take);
+        if (mask) {
+            unsigned base = 0;
+            if (!lane) base = atomicAdd(counts + t, __popc(mask));
+            base = __shfl_sync(0xffffffffu, base, 0);
+            const unsigned off = base + __popc(mask & ((1u << lane) - 1));
+            if (take && off < SELECT_CAND_LIMIT) dst[off] = make_uint2(key, i);
+        }
+    }
+}
+
+__global__ void kb_select_finish(const uint2* __restrict__ candidates, const unsigned* counts, int* fallback,
+                                 const int* pos0p, int t0, int tb, int pool, int k, int cap, int* cells_all) {
+    constexpr int NT = 256, Items = SELECT_CAND_LIMIT / NT;
+    using Sort = cub::BlockRadixSort<unsigned, NT, Items>;
+    __shared__ typename Sort::TempStorage tmp;
+    __shared__ unsigned kth;
+    const int t = blockIdx.x, tid = threadIdx.x, pos = *pos0p + t0 + t, n = pos / pool;
+    const unsigned count = counts[t];
+    if (fallback[t] || count < (unsigned)k || count > SELECT_CAND_LIMIT || n > 65536) {
+        if (!tid) fallback[t] = 1;
+        return;
+    }
+    unsigned tags[Items], keys[Items], before[Items];
+#pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        const int rank = tid * Items + i;
+        const uint2 v = rank < count ? candidates[(size_t)t * SELECT_CAND_LIMIT + rank] : make_uint2(0, 0x3ffffu);
+        keys[i] = before[i] = v.x;
+        tags[i] = v.y;
+    }
+    Sort(tmp).SortDescending(keys);
+    if (tid == (k - 1) / Items) kth = keys[(k - 1) % Items];
+    __syncthreads();
+#pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        if (tags[i] != 0x3ffffu)
+            tags[i] = before[i] > kth ? tags[i] : before[i] == kth ? (0x10000u | tags[i]) : 0x3ffffu;
+    }
+    // Preserve full-selector order: all greater keys by index, then equal
+    // keys by index. Excess equal keys fall strictly beyond the first k.
+    Sort(tmp).Sort(tags, 0, 18);
+    int* cells = cells_all + (size_t)(t0 + t - tb) * cap;
+#pragma unroll
+    for (int i = 0; i < Items; ++i) {
+        const int rank = tid * Items + i;
+        if (rank < k)
+            for (int j = 0; j < pool; ++j) cells[rank * pool + j] = int(tags[i] % 65536u) * pool + j;
+    }
+    for (int j = k * pool + tid; j < cap; j += NT) {
+        const int c = n * pool + j - k * pool;
+        cells[j] = c <= pos ? c : -1;
+    }
+}
+
+
 // the batched k-pool selection (blockIdx.x = token of the tile): as k_select_kpool for pos = pos0 + t0 + blockIdx.x
 template <int NT>
 __global__ void kb_select_kpool(const float* __restrict__ score_tile, int ld_score, const int* pos0p, int t0, int tb, int kpool, int top_k,
-                                int top_pools, int n_cap, int* __restrict__ cells_all) {
+                                int top_pools, int n_cap, int* __restrict__ cells_all, const int* fallback = nullptr) {
+    if (fallback && !fallback[blockIdx.x]) return;
     const int pos0 = *pos0p;
     const int tt = blockIdx.x, t = t0 + tt, pos = pos0 + t;
     const float* score = score_tile + (size_t) tt * ld_score;
