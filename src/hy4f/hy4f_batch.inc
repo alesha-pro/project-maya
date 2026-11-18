@@ -52,6 +52,7 @@ struct BShard {
 };
 std::vector<BShard> bsh;
 int score_tile = 64;
+bool mtp_kv_only = std::getenv("HY4F_PF_MTP_KV_ONLY") != nullptr;
 int dma_mask = std::getenv("HY4F_PF_DMA") ? std::atoi(std::getenv("HY4F_PF_DMA")) : 0;   // RS=1, AG=2, DSA=4, residual=8
 bool paired = !std::getenv("HY4F_RING_PUSH");   // exchanges in XOR-paired phases (S a power of two)
 int peer_of(int g, int r) const { return paired && (S & (S - 1)) == 0 ? (g ^ r) : (g + r) % S; }
@@ -372,16 +373,22 @@ void b_engram(Shard& s, BShard& b, int e, int il, int pos0, int T) {
 void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
     const std::string P = "blk." + std::to_string(il) + ".";
     const bool sw = swa[il] != 0;
+    const bool cache_only = b.mtp && mtp_kv_only;
     const int Hl = sw ? Hs / S : Hd / S, QH = nope + rope;
     const float th = sw ? theta_swa : theta;
     const int oq = 0, okv = q_lora, og = q_lora + KV_ROW, oik = og + Hl * vh;
     if (b.mtp) kb_rms<<<T, 1024, 0, b.st>>>(b.mr, E, f32(s, P + "attn_norm.weight"), E, eps, b.x, E);
     else b_norm_in(s, b, P, "hc_attn", P + "attn_norm.weight", 2 * hc, hc_mag, T);
     blin(s, b, P + "xproj", b.x, E, b.xp, (int) xp_ld, T);
-    kb_rms<<<T, 1024, 0, b.st>>>(b.xp + oq, (int) xp_ld, f32(s, P + "attn_q_a_norm.weight"), q_lora, eps, b.qr, q_lora);
+    if (!cache_only) kb_rms<<<T, 1024, 0, b.st>>>(b.xp + oq, (int) xp_ld, f32(s, P + "attn_q_a_norm.weight"), q_lora, eps, b.qr, q_lora);
     kb_kv_prep<<<T, 576, 0, b.st>>>(b.xp + okv, (int) xp_ld, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th,
                                     sw ? b.chunk_cur + (size_t) b.chunk_off * KV_RB : s.kv[il], b.pp, sw ? 1 : 2, S, s.g, 0);
-    blin(s, b, P + "qproj", b.qr, q_lora, b.qp, (int) qp_ld, T);
+    if (cache_only && sw) {
+        if (b.ring_T > 0)
+            kb_ring_write<<<std::min(b.ring_T, win), 152, 0, b.st>>>(b.chunk_cur, s.kv[il], b.ring_T, b.pp_attn, win);
+        return;
+    }
+    if (!cache_only) blin(s, b, P + "qproj", b.qr, q_lora, b.qp, (int) qp_ld, T);
     const DW& kb = s.w.at(P + "attn_k_b.weight");
     const DW& vb = s.w.at(P + "attn_v_b.weight");
     const float scale = 1.0f / std::sqrt((float) QH);
@@ -391,7 +398,7 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
     float* iq = b.qp + (size_t) Hd * QH;
     const int64_t ld_sc = o.max_context / kpool + 1;
     if (!sw) {   // the indexer: pooled keys of the groups completed in the chunk (selection per tile below)
-        kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, b.st>>>(iq, (int) qp_ld, IH, IK, IK - rope, rope, b.pp, th);
+        if (!cache_only) kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, b.st>>>(iq, (int) qp_ld, IH, IK, IK - rope, rope, b.pp, th);
         kb_rms<<<T, 128, 0, b.st>>>(b.xp + oik, (int) xp_ld, f32(s, P + "indexer.k_norm.weight"), IK, eps, b.ikn, IK);
         const DW& ivw = s.w.at(P + "ivg");
         kb_q8_gemv<<<dim3(nb(2 * IK * 32), T), 256, 0, b.st>>>((const uint8_t*) ivw.d, b.ikn, IK, b.ivg, 2 * IK, IK, 2 * IK);
@@ -402,6 +409,7 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                                                        f32(s, P + "indexer_compressor_norm.weight"), s.pooled[il], IK,
                                                        kpool, rope, eps, th);
         kb_ring_chunk<<<IRING, 256, 0, b.st>>>(b.ivg, s.ring[il], T, b.pp, IK, kpool);
+        if (cache_only) return;
         blin(s, b, P + "indexer.proj.weight", b.x, E, b.iw, IH, T);
         k_scale<<<nb(T * IH), 256, 0, b.st>>>(b.iw, T * IH, 1.0f / std::sqrt((float) (IK * IH)));
     }
@@ -680,7 +688,9 @@ void b_mtp(Shard& s, BShard& b, const float* hrow0, int nx, const int* toks, int
     b.mtp = true;
     b.pp = b.dbounds + 3;
     b_attention(s, b, L, mpos0, Tm);
-    b_ffn(s, b, L, Tm);
+    // The next request consumes the MTP KV cache, pooled keys and open group.
+    // Draft generation seeds its residual from the trunk hidden state.
+    if (!mtp_kv_only) b_ffn(s, b, L, Tm);
     b.mtp = false;
     b.pp = b.dbounds + 2;
 }
