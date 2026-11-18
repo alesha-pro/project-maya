@@ -486,7 +486,10 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
     else b_norm_in(s, b, P, "hc_attn", P + "attn_norm.weight", 2 * hc, hc_mag, T);
     blin(s, b, P + "xproj", b.x, E, b.xp, (int) xp_ld, T);
     if (!cache_only) kb_rms<<<T, 1024, 0, b.st>>>(b.xp + oq, (int) xp_ld, f32(s, P + "attn_q_a_norm.weight"), q_lora, eps, b.qr, q_lora);
-    if (!sw && pos0 < top_k && !s.prefix_kv.empty())
+    if (!sw && sparse_limit && mbs.empty() && pos0 + T <= sparse_limit)
+        kb_kv_prep<true,true><<<T,576,0,b.st>>>(b.xp + okv,(int)xp_ld,f32(s,P+"attn_kv_a_norm.weight"),
+            kvl,rope,eps,th,s.kv[il],b.pp,2,S,s.g,0,s.prefix_kv.at(il),top_k,sparse_base,sparse_limit/S);
+    else if (!sw && pos0 < top_k && !s.prefix_kv.empty())
         kb_kv_prep<true><<<T,576,0,b.st>>>(b.xp + okv, (int)xp_ld, f32(s,P+"attn_kv_a_norm.weight"),
             kvl,rope,eps,th,s.kv[il],b.pp,2,S,s.g,0,s.prefix_kv.at(il),top_k);
     else

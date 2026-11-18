@@ -194,6 +194,12 @@ __global__ void k_hc_post(float* X, const float* R, const float* y, const float*
 // A row: int8 q[576] then half scales[9] (one per 64 values: c 0..511 in 8 groups, k_pe 512..575 in one): 594 bytes,
 // padded to 608 (16-byte aligned rows for vector loads).
 constexpr int KV_ROW = 576, KV_GROUPS = 9, KV_RB = 608;
+
+// The source rank owns its ordinary CP rows at the start. Rows of the other
+// ranks fit in separate stripes at the unwritten end of the same allocation.
+__host__ __device__ inline int replica_row_base(int source, int owner, int base, int stripe) {
+    return source == owner ? 0 : base + (source - int(source > owner)) * stripe;
+}
 constexpr int RING_PAD = 16;
 #ifdef HY4F_DT6
 constexpr int IRING = 16;   // (the DFly build: verify steps of up to 6 tokens)

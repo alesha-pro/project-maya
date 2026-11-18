@@ -63,29 +63,29 @@ struct IoT {   // a multi-token step's inputs (pinned host -> device at the head
     int last_pos;  // final row of a teacher-forced MTP update
 };
 
-// Hold both captured topologies on the host. Only the active one needs executable
+// Hold the captured topologies on the host. Only the active one needs executable
 // graph memory on the GPU. A switch can happen when decoding crosses top_k or
 // when a later request reuses a shorter prefix; ordinary steps reuse the same exec.
 struct DecodeGraph {
-    cudaGraph_t shape[2] = {};
+    cudaGraph_t shape[3] = {};
     cudaGraphExec_t exec = nullptr;
-    bool short_active = false;
+    int active = 0;
 
-    void capture(cudaGraph_t graph, bool dense_dsa, bool both) {
-        if (both) {
-            shape[int(dense_dsa)] = graph;
-            if (!dense_dsa) return;
+    void capture(cudaGraph_t graph, int mode, bool multiple) {
+        if (multiple) {
+            shape[mode] = graph;
+            if (mode != 1) return;
         }
         HY_CK(cudaGraphInstantiate(&exec, graph, 0));
-        short_active = dense_dsa;
-        if (!both) HY_CK(cudaGraphDestroy(graph));
+        active = mode;
+        if (!multiple) HY_CK(cudaGraphDestroy(graph));
     }
-    cudaGraphExec_t select(bool dense_dsa) {
-        if (dense_dsa != short_active) {
+    cudaGraphExec_t select(int mode) {
+        if (mode != active) {
             HY_CK(cudaGraphExecDestroy(exec));
             exec = nullptr;
-            HY_CK(cudaGraphInstantiate(&exec, shape[int(dense_dsa)], 0));
-            short_active = dense_dsa;
+            HY_CK(cudaGraphInstantiate(&exec, shape[mode], 0));
+            active = mode;
         }
         return exec;
     }
@@ -414,8 +414,8 @@ void d_indexer_cache(Shard& s, DShard& d, const std::string& P, int il, const in
 }
 
 void d_indexer_select(Shard& s, DShard& d, const std::string& P, int il, const int* pp,
-                      int T, int qpc, int QH, float th, cudaStream_t st) {
-    float* iq = d.qp + (size_t) Hd * QH;
+                      int T, int qpc, int QH, float th, cudaStream_t st, float* local_iq = nullptr) {
+    float* iq = local_iq ? local_iq : d.qp + (size_t) Hd * QH;
     kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, st>>>(iq, qpc, IH, IK, IK - rope, rope, pp, th);
     kb_f32_gemv<<<dim3(nb(IH * 32), T), 256, 0, st>>>(f32(s, P + "indexer.proj.weight"), d.x, E, d.iw, IH, E, IH,
                                                         1.0f / std::sqrt((float) (IK * IH)));
@@ -447,17 +447,17 @@ void d_indexer_select(Shard& s, DShard& d, const std::string& P, int il, const i
     }
 }
 
-void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false, bool dense_dsa = false, const int* last_pos = nullptr) {
+void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false, bool dense_dsa = false, const int* last_pos = nullptr, bool sparse_dsa = false) {
     const std::string P = "blk." + std::to_string(il) + ".";
     const bool sw = swa[il] != 0;
     const int Hl = sw ? Hs / S : Hd / S, QH = nope + rope;
     const float th = sw ? theta_swa : theta;
     const DW& kb = s.w.at(P + "attn_k_b.weight");
-    const bool local_queries = !sw && dense_dsa && !s.prefix_kv.empty() && kb.type == T_Q8_0 &&
+    const bool local_queries = !sw && (dense_dsa || sparse_dsa) && !s.prefix_kv.empty() && kb.type == T_Q8_0 &&
                                std::getenv("HY4F_LOCAL_QUERY");
     const int query_first = local_queries ? s.g * Hl : 0;
     const int Ha = (sw || local_queries) ? Hl : Hd;
-    const int xpc = rows_of(s,P+"xproj"), qpc = !sw && dense_dsa ? Ha * QH : rows_of(s,P+"qproj");
+    const int xpc = rows_of(s,P+"xproj"), qpc = !sw && (dense_dsa || (sparse_dsa && local_queries)) ? Ha * QH : rows_of(s,P+"qproj");
     const int oq = 0, okv = q_lora, og = q_lora + KV_ROW, oik = og + Hl * vh;
     if (!ready) {
         if (mtp && fuse_rms_q81 && E == 3072) {
@@ -479,7 +479,10 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         HY_CK(cudaEventRecord(d.attention_fork, s.st));
         HY_CK(cudaStreamWaitEvent(side, d.attention_fork));
     }
-    if (!sw && !s.prefix_kv.empty())
+    if (!sw && sparse_limit && (dense_dsa || sparse_dsa))
+        kb_kv_prep<true,true><<<T,576,0,keys>>>(d.xp+okv,xpc,f32(s,P+"attn_kv_a_norm.weight"),kvl,
+            rope,eps,th,s.kv[il],pp,2,S,s.g,0,s.prefix_kv.at(il),top_k,sparse_base,sparse_limit/S);
+    else if (!sw && !s.prefix_kv.empty())
         kb_kv_prep<true><<<T,576,0,keys>>>(d.xp+okv,xpc,f32(s,P+"attn_kv_a_norm.weight"),kvl,
             rope,eps,th,s.kv[il],pp,2,S,s.g,0,s.prefix_kv.at(il),top_k);
     else
@@ -504,16 +507,24 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         kb_rms<<<T, 1024, 0, s.st>>>(d.xp + oq, xpc, f32(s, P + "attn_q_a_norm.weight"), q_lora, eps, d.qr, q_lora);
         k_q8<<<nb(T * q_lora), 256, 0, s.st>>>(d.qr, T * q_lora, d.xq);
     }
-    if (!sw && dense_dsa) {
+    float* local_iq = nullptr;
+    int index_stride = qpc;
+    if (!sw && (dense_dsa || (sparse_dsa && local_queries))) {
         const DW& q = s.w.at(P + "qproj");
         const auto* weights=static_cast<const uint8_t*>(q.d)+(size_t)query_first*QH*q.rb;
         kn::native_q8_0_mmvq(weights, d.xq, d.qp, (int) q.ne[0], qpc, T, s.st);
+        if (sparse_dsa) {
+            index_stride = IH * IK;
+            local_iq = d.qp + (size_t)T * qpc;
+            const auto* index_weights = static_cast<const uint8_t*>(q.d) + (size_t)Hd * QH * q.rb;
+            kn::native_q8_0_mmvq(index_weights,d.xq,local_iq,(int)q.ne[0],index_stride,T,s.st);
+        }
     } else dec_mmvq(s, P + "qproj", d.xq, d.qp, T);
     const bool async_select = !sw && !dense_dsa && side && std::getenv("HY4F_INDEX_OVERLAP");
     if (async_select) {
         HY_CK(cudaEventRecord(d.attention_fork,s.st));
         HY_CK(cudaStreamWaitEvent(side,d.attention_fork));
-        d_indexer_select(s,d,P,il,pp,T,qpc,QH,th,side);
+        d_indexer_select(s,d,P,il,pp,T,index_stride,QH,th,side,local_iq);
         HY_CK(cudaEventRecord(d.attention_join,side));
     }
     const DW& vb = s.w.at(P + "attn_v_b.weight");
@@ -556,7 +567,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     if (sw) {
         if (split && Hl == 16) {
             (value_groups==4 ? kd_mqa_dec<16,false,4> : kd_mqa_dec<16>)<<<dim3(NSP*value_groups, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
-                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh, false);
+                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh, false, 0, 0);
             if (std::getenv("HY4F_MQA_FOLD"))
                 kd_mqa_fold<false><<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hl,
                     f32(s,P+"attn_sinks.weight")+s.g*Hl,d.o,nullptr,0,d.cb,s.g,S,nullptr);
@@ -568,21 +579,26 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         }
     } else {
         if (!dense_dsa && !async_select)
-            d_indexer_select(s,d,P,il,pp,T,qpc,QH,th,s.st);
+            d_indexer_select(s,d,P,il,pp,T,index_stride,QH,th,s.st,local_iq);
         if (!mtp && !dfs.empty() && df_slot[il] >= 0)   // (the DFly drafter reads this layer's top-k of every row)
             HY_CK(cudaMemcpyAsync(dfs[s.g].snap + (size_t) df_slot[il] * DT * n_cap, d.cells, sizeof(int) * T * n_cap,
                                   cudaMemcpyDeviceToDevice, s.st));
-        if (dense_dsa && !s.prefix_kv.empty()) {
-            kd_mqa_dec<16,true,1,true><<<dim3(NSP,T,4),256,mqd_smem<16>(),s.st>>>(
-                d.qabs,d.qp,qpc,QH,nope,th,s.prefix_kv.at(il),nullptr,0,pp,win,S,s.g,
-                scale,d.spm,d.spl,d.spacc,0,0,qh,local_queries);
+        if (sparse_dsa || (dense_dsa && !s.prefix_kv.empty())) {
+            if (sparse_dsa)
+                kd_mqa_dec<16,false,1,true><<<dim3(NSP,T,4),256,mqd_smem<16>(),s.st>>>(
+                    d.qabs,d.qp,qpc,QH,nope,th,s.kv[il],d.cells,n_cap,pp,win,S,s.g,
+                    scale,d.spm,d.spl,d.spacc,top_k,top_k/kpool-tail,qh,local_queries,sparse_base,sparse_limit/S);
+            else
+                kd_mqa_dec<16,true,1,true><<<dim3(NSP,T,4),256,mqd_smem<16>(),s.st>>>(
+                    d.qabs,d.qp,qpc,QH,nope,th,s.prefix_kv.at(il),nullptr,0,pp,win,S,s.g,
+                    scale,d.spm,d.spl,d.spacc,0,0,qh,local_queries);
             kd_replica_merge<<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,T,
                 f32(s,P+"attn_sinks.weight")+s.g*Hl,d.o);
         } else if (S > 1) {
             if (split && Hd == 32) {
                 (value_groups==4 ? (dense_dsa ? kd_mqa_dec<32,true,4> : kd_mqa_dec<32,false,4>) : (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>))<<<dim3(NSP*value_groups, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
                                                                            n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
-                                                                           d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail, qh, false);
+                                                                           d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail, qh, false, 0, 0);
                 if (std::getenv("HY4F_HEAD_SEND")) {
                     kd_mqa_fold<true><<<dim3(Hd,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hd,nullptr,nullptr,
                                                                d.part,CBW(),d.head_cb,s.g,S,d.cb_ctr);
@@ -797,7 +813,7 @@ void head_rows(Shard& s, DShard& d, const float* x, int T, float* argv, int* arg
     kd_argmax<<<T, 1024, 0, s.st>>>(d.logits, rows, s.g * rows, argv, argi);
 }
 
-void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false) {
+void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_dsa = false) {
     HY_CK(cudaMemcpyAsync(d.dio_v, hio_v, sizeof(IoT), cudaMemcpyHostToDevice, s.st));
     const int* pp = &d.dio_v->pos;
     if (dense_dsa) kd_dense_cells<<<dim3(nb(n_cap), T), 256, 0, s.st>>>(pp, n_cap, d.cells);
@@ -813,7 +829,7 @@ void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false) {
     for (int il = 0; il < L; ++il) {
         for (size_t e = 0; e < eg_layers.size(); ++e)
             if (eg_layers[e] == il) d_engram(s, d, (int) e, il, pp, T);
-        d_attention(s, d, il, pp, T, false, ready, dense_dsa);
+        d_attention(s, d, il, pp, T, false, ready, dense_dsa, nullptr, sparse_dsa);
         HcNext nx;
         const HcNext* nxp = nullptr;
         if (fuse && il + 1 < L && !has_engram(il + 1)) {
@@ -837,7 +853,7 @@ void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false) {
     HY_CK(cudaMemcpyAsync(hargi + (size_t) s.g * DT, d.argi, sizeof(int) * T, cudaMemcpyDeviceToHost, s.st));
 }
 
-void mtp_ops(Shard& s, DShard& d, int T, bool chain = false, bool dense_dsa = false) {
+void mtp_ops(Shard& s, DShard& d, int T, bool chain = false, bool dense_dsa = false, bool sparse_dsa = false) {
     HY_CK(cudaMemcpyAsync(d.dio_m, hio_m, sizeof(IoT), cudaMemcpyHostToDevice, s.st));
     const int* pp = &d.dio_m->pos;
     if (dense_dsa) kd_dense_cells<<<dim3(nb(n_cap), T), 256, 0, s.st>>>(pp, n_cap, d.cells);
@@ -857,10 +873,10 @@ void mtp_ops(Shard& s, DShard& d, int T, bool chain = false, bool dense_dsa = fa
     dec_mmvq(s, P + "nextn.eh_proj.weight", d.xq, d.mr, T);
     if (T > 1 && std::getenv("HY4F_MTP_LAST")) {
         DShard view = d;  // the final row will rebase the residual and projection pointers in this capture
-        d_attention(s, view, L, pp, T, true, false, dense_dsa, &d.dio_m->last_pos);
+        d_attention(s, view, L, pp, T, true, false, dense_dsa, &d.dio_m->last_pos, sparse_dsa);
         d_ffn(s, view, L, 1, true);
     } else {
-        d_attention(s, d, L, pp, T, true, false, dense_dsa);
+        d_attention(s, d, L, pp, T, true, false, dense_dsa, nullptr, sparse_dsa);
         d_ffn(s, d, L, T, true);
     }
     kb_rms<<<1, 1024, 0, s.st>>>(d.mr + (size_t) (T - 1) * E, E, f32(s, P + "nextn.shared_head_norm.weight"), E, eps, d.mh, E);
@@ -874,6 +890,7 @@ void mtp_ops(Shard& s, DShard& d, int T, bool chain = false, bool dense_dsa = fa
 }
 
 void dec_setup() {
+    setup_sparse_replica();
     HY_CK(cudaHostAlloc((void**) &hio_v, sizeof(IoT), cudaHostAllocPortable));
     HY_CK(cudaHostAlloc((void**) &hio_m, sizeof(IoT), cudaHostAllocPortable));
     HY_CK(cudaHostAlloc((void**) &hlogT, sizeof(float) * DT * V, cudaHostAllocPortable));
@@ -915,6 +932,8 @@ void dec_setup() {
             HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32,false,4>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<32>()));
             HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32,true,4>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<32>()));
         }
+        if (sparse_limit)
+            HY_CK(cudaFuncSetAttribute(kd_mqa_dec<16,false,1,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<16>()));
         if (replicate_prefix()) {
             HY_CK(cudaFuncSetAttribute(kd_mqa_dec<16,true,1,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<16>()));
         }
@@ -931,28 +950,31 @@ void dec_setup() {
             }
         }
         DShard& d = dsh[s.g];
-        for (int mode = 0; mode <= int(short_graphs); ++mode) {
-            const bool dense_dsa = mode != 0;
+        // The short shape is instantiated initially. Keep the two deep shapes
+        // host-side and instantiate one on demand at a context boundary.
+        for (int mode : {0, 2, 1}) {
+            if ((mode == 2 && !sparse_limit) || (mode == 1 && !short_graphs)) continue;
+            const bool dense_dsa = mode == 1, sparse_dsa = mode == 2;
             for (int T = 1; T <= DT; ++T) {
                 cudaGraph_t gr = nullptr;
                 // (MMVQ with 5..8 columns: the upstream layout's 2-warp reduction is not bitwise equal to one column; the
                 // verify rows must equal plain steps (spec == greedy), so T >= 5 takes the exact layout)
                 kn::native_mmvq_set_multi_exact(T >= 5 && !std::getenv("HY4F_FAST_T56"));
                 HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
-                verify_ops(s, d, T, dense_dsa);
+                verify_ops(s, d, T, dense_dsa, sparse_dsa);
                 HY_CK(cudaStreamEndCapture(s.st, &gr));
                 kn::native_mmvq_set_multi_exact(false);
-                d.gv[T].capture(gr, dense_dsa, short_graphs);
+                d.gv[T].capture(gr, mode, short_graphs);
                 if (has_mtp) {
                     HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
-                    mtp_ops(s, d, T, false, dense_dsa);
+                    mtp_ops(s, d, T, false, dense_dsa, sparse_dsa);
                     HY_CK(cudaStreamEndCapture(s.st, &gr));
-                    d.gm[T].capture(gr, dense_dsa, short_graphs);
+                    d.gm[T].capture(gr, mode, short_graphs);
                     if (T == 1) {
                         HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
-                        mtp_ops(s, d, 1, true, dense_dsa);
+                        mtp_ops(s, d, 1, true, dense_dsa, sparse_dsa);
                         HY_CK(cudaStreamEndCapture(s.st, &gr));
-                        d.gc.capture(gr, dense_dsa, short_graphs);
+                        d.gc.capture(gr, mode, short_graphs);
                     }
                 }
             }
@@ -966,12 +988,34 @@ float mtp_max(int rank) const { return hmargv[rank * (compact_io ? 2 : 1)]; }
 
 void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
     if (mtp) mtp_full_row = !compact_io || full_logits;
-    const bool dense_dsa = short_graphs && (mtp ? hio_m : hio_v)->pos + T <= top_k;
+    const int end = (mtp ? hio_m : hio_v)->pos + T;
+    const int mode = short_graphs && end <= top_k ? 1 : sparse_limit && end <= sparse_limit ? 2 : 0;
+    const bool restore = mode == 2 && !sparse_valid;
+    if (sparse_limit) {
+        sparse_high = std::max(sparse_high,std::min(end,sparse_limit));
+        if (end > sparse_limit) sparse_valid = false;
+    }
+    if (restore) {
+        launch_parallel([&](Shard& s) {
+            for (const auto& layer : s.prefix_kv) {
+                const int il = layer.first;
+                for (int owner = 0; owner < S; ++owner) if (owner != s.g) {
+                    const int count = (sparse_high + S - 1 - owner)/S;
+                    if (!count) continue;
+                    const int base = replica_row_base(owner,s.g,sparse_base,sparse_limit/S);
+                    HY_CK(cudaMemcpyPeerAsync(s.kv[il]+(size_t)base*KV_RB,s.dev,sh[owner].kv[il],sh[owner].dev,
+                                              (size_t)count*KV_RB,s.st));
+                }
+            }
+            HY_CK(cudaStreamSynchronize(s.st));
+        });
+        sparse_valid = true;
+    }
     change_q3_layout(true);
     launch_parallel([&](Shard& s) {
         DShard& d = dsh[s.g];
         DecodeGraph& graph = chain ? d.gc : mtp ? d.gm[T] : d.gv[T];
-        HY_CK(cudaGraphLaunch(graph.select(dense_dsa), s.st));
+        HY_CK(cudaGraphLaunch(graph.select(mode), s.st));
         if (rank_active && !full_logits) {
             const int n=V/S, blocks=(n+1023)/1024, nr=mtp ? 1 : T;
             kd_rank_head<false><<<dim3(blocks,nr),256,0,s.st>>>(d.logits,nullptr,d.rank_tiles,n,blocks,s.g*n);

@@ -194,6 +194,17 @@ struct Model::Impl {
                std::getenv("HY4F_REPLICATE_PREFIX") && !std::getenv("HY4F_OLD_DECODE") &&
                !std::getenv("HY4F_DEC_ATTN2");
     }
+    int sparse_limit = 0, sparse_base = 0, sparse_high = 0;
+    bool sparse_valid = true;
+    void setup_sparse_replica() {
+        const char* limit = std::getenv("HY4F_SPARSE_REPLICA");
+        if (!limit || !replicate_prefix() || !direct_dsa || kpool != 4) return;
+        const int capacity = (int)(o.max_context / S);
+        const int rows = std::min(capacity, std::atoi(limit)) & ~3;
+        if (rows <= top_k) return;
+        sparse_limit = rows;
+        sparse_base = capacity + 1 - (S-1) * (rows/S);
+    }
     void load_draft_experts(const char* path, bool down_only) {
         if (!path || !*path) return;
         auto file = std::make_unique<strata::GgufFile>(path);
@@ -1093,6 +1104,11 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
         if (pos > d.pos_next) throw std::runtime_error("hy4f: prefill out of order");
         if (pos < prefix_pos_) prefix_pos_=-1;
         if (pos + n > d.o.max_context) throw std::runtime_error("hy4f: context full");
+        if (d.sparse_limit) {
+            const int end = (int)(pos+n);
+            if (end > d.sparse_limit) d.sparse_valid = false;
+            d.sparse_high = std::max(d.sparse_high, std::min(end,d.sparse_limit));
+        }
         const auto t_start = std::chrono::steady_clock::now();
         d.change_q3_layout(false);
         if (chunk <= 0) chunk = 1024;
@@ -1100,6 +1116,7 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
         // (experimental, off by default: measured slower - MMQ / attention fill the SMs, the SM-based exchanges cannot run
         // beside them; a real overlap needs DMA transfers)
         const bool mb = d.S > 1 && chunk >= 512 && std::getenv("HY4F_MB") && std::atoi(std::getenv("HY4F_MB")) == 2;
+        if (d.sparse_limit && mb) d.sparse_valid = false;
         const int tmax = mb ? chunk / 2 : chunk;
         if (d.bsh.empty() || d.bsh[0].Tmax < tmax) {
             if (!d.bsh.empty()) throw std::runtime_error("hy4f: prefill chunk grew");
@@ -1703,6 +1720,10 @@ int64_t Model::rewind(int64_t pos, std::string& err, bool restore_prompt, bool* 
         if (pos < prefix_pos_) prefix_pos_=-1;
         if (pos == 0) hw_ = 0;
         d.pos_next = pos;
+        if (d.sparse_limit) {
+            d.sparse_high = (int)std::min<int64_t>(pos,d.sparse_limit);
+            if (pos == 0) d.sparse_valid = true;
+        }
         return pos;
     } catch (const std::exception& e) {
         err = e.what();

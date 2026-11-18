@@ -181,9 +181,9 @@ __global__ void kb_rms(const float* x, int ldx, const float* w, int n, float eps
 }
 // the latent rows of the chunk: RoPE(k_pe) at pos0 + t, RMS * w on c, Q8 into: mode 1 (SWA) the chunk buffer row t,
 // mode 2 (DSA, context parallel) the cache slot when this shard owns the position, mode 3 the ring slot pos % rw.  blockIdx.x = token, 576 threads.
-template<bool CopyPrefix = false>
+template<bool CopyPrefix = false, bool Mirror = false>
 __global__ void kb_kv_prep(const float* kvin, int ld, const float* nw, int kvl, int rope, float eps, float theta,
-                           uint8_t* dst_base, const int* pos0p, int mode, int n_shards, int shard, int rw, uint8_t* prefix = nullptr, int prefix_rows = 0) {
+                           uint8_t* dst_base, const int* pos0p, int mode, int n_shards, int shard, int rw, uint8_t* prefix = nullptr, int prefix_rows = 0, int mirror_base = 0, int mirror_stripe = 0) {
     const int pos0 = *pos0p;
     const int t = blockIdx.x, pos = pos0 + t, j = threadIdx.x;
     __shared__ float row[KV_ROW];
@@ -206,8 +206,10 @@ __global__ void kb_kv_prep(const float* kvin, int ld, const float* nw, int kvl, 
     if (mode == 1) slot = t;
     else if (mode == 3) slot = pos % rw;   // (SWA ring, a multi-token decode step)
     else {
-        if (pos % n_shards != shard && (!CopyPrefix || pos >= prefix_rows)) return;
+        const int source = pos % n_shards;
+        if (!Mirror && source != shard && (!CopyPrefix || pos >= prefix_rows)) return;
         slot = pos / n_shards;
+        if constexpr (Mirror) slot += replica_row_base(source, shard, mirror_base, mirror_stripe);
     }
     uint8_t* primary = dst_base + (size_t) slot * KV_RB;
     uint8_t* dst = primary;
@@ -225,7 +227,7 @@ __global__ void kb_kv_prep(const float* kvin, int ld, const float* nw, int kvl, 
     if (j < KV_ROW) reinterpret_cast<int8_t*>(dst)[j] = (int8_t) (d > 0.0f ? __float2int_rn(v / d) : 0);
     if (j < KV_GROUPS) reinterpret_cast<__half*>(dst + KV_ROW)[j] = __float2half(fmaxf(gmax[2 * j], gmax[2 * j + 1]) / 127.0f);
     if constexpr (CopyPrefix) {
-        if (pos < prefix_rows && pos % n_shards == shard) {
+        if (pos < prefix_rows && (Mirror || pos % n_shards == shard)) {
             __syncthreads();
             if (j < (KV_ROW + KV_GROUPS * sizeof(__half)) / sizeof(uint16_t))
                 reinterpret_cast<uint16_t*>(primary)[j] = reinterpret_cast<uint16_t*>(dst)[j];
