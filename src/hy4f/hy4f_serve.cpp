@@ -182,7 +182,7 @@ struct Lines {
     std::mutex mu;
     std::condition_variable cv;
     std::deque<std::string> q;
-    bool eof = false;
+    bool eof = false, running = false, pending_wrap = false;  // guarded by mu
     std::atomic<bool> stop{false}, wrap{false};
     void start() {
         std::thread([this] {
@@ -200,11 +200,12 @@ struct Lines {
                         stop.store(true);
                         continue;
                     }
+                    std::lock_guard<std::mutex> lk(mu);
                     if (l == "WRAP") {
-                        wrap.store(true);
+                        if (running) wrap.store(true);
+                        else if (!q.empty()) pending_wrap = true;  // GEN and WRAP may arrive in the same read.
                         continue;
                     }
-                    std::lock_guard<std::mutex> lk(mu);
                     q.push_back(std::move(l));
                     cv.notify_one();
                 }
@@ -217,11 +218,19 @@ struct Lines {
     }
     bool next(std::string& out) {
         std::unique_lock<std::mutex> lk(mu);
+        running = false;
         cv.wait(lk, [&] { return !q.empty() || eof; });
         if (q.empty()) return false;
+        running = true;
+        wrap.store(pending_wrap);
+        pending_wrap = false;
         out = std::move(q.front());
         q.pop_front();
         return true;
+    }
+    void finished() {
+        std::lock_guard<std::mutex> lk(mu);
+        running = false;
     }
 };
 
@@ -840,6 +849,7 @@ int serve(Model& m, const ServeOptions& so) {
         }
         stat_line();
         const double t2 = now_ms();
+        in.finished();   // A WRAP after DONE can only belong to a later queued request.
         std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, n, t1 - t0, t2 - t1, finish, d_acc, d_off,
                     from);
         std::fflush(stdout);
