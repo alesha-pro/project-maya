@@ -127,6 +127,7 @@ struct DShard {
     float* cb_buf[2] = {nullptr, nullptr};
     int *ar_flag = nullptr, *cb_flag = nullptr, *ar_ctr = nullptr, *cb_ctr = nullptr, *arrive = nullptr;
     PeersD ar{}, cb{}, head_cb{};
+    DecodeGraph mtp_heads[2];             // BF16 and greedy quantized suffixes when enabled
     DecodeGraph gv[DT + 1], gm[DT + 1], gc;  // verify(T), mtp(T), chained MTP
 };
 std::vector<DShard> dsh;
@@ -140,6 +141,8 @@ struct DFShard {   // the DFly drafter's per-shard state (hy4f_dfly.inc)
 std::vector<DFShard> dfs;
 std::vector<int> df_slot;   // per target layer: the draft layer reading it, -1
 bool has_mtp = false;
+int draft_head_type = 0;
+bool greedy_draft_head = false;
 IoT *hio_v = nullptr, *hio_m = nullptr;
 float* hlogT = nullptr;    // [DT][V] pinned
 float* hargv = nullptr;    // [S][DT] pinned (per shard max)
@@ -869,6 +872,25 @@ void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_
     HY_CK(cudaMemcpyAsync(hargi + (size_t) s.g * DT, d.argi, sizeof(int) * T, cudaMemcpyDeviceToHost, s.st));
 }
 
+void mtp_head_ops(Shard& s, DShard& d, bool quantized) {
+    if (quantized) {
+        const auto& w = s.w.at("mtp.output.weight");
+        const int rows = V / S;
+        k_q8<<<nb(E), 256, 0, s.st>>>(d.mh, E, d.xq);
+        if (w.type == T_Q8_0) kn::native_q8_0_mmvq(w.d, d.xq, d.logits, E, rows, 1, s.st);
+        else kn::native_q4_k_mmvq(w.d, d.xq, d.logits, E, rows, 1, s.st);
+        kd_argmax<<<1, 1024, 0, s.st>>>(d.logits, rows, s.g * rows, d.argv + DT - 1, d.argi + DT - 1);
+    } else {
+        head_rows(s, d, d.mh, 1, d.argv + DT - 1, d.argi + DT - 1);
+    }
+    if (compact_io)
+        kd_runner_up<<<1, 1024, 0, s.st>>>(d.logits, V / S, s.g * (V / S), d.argi + DT - 1, d.argv + DT);
+    const int count = compact_io ? 2 : 1;
+    HY_CK(cudaMemcpyAsync(hmargv + count * s.g, d.argv + DT - 1, count * sizeof(float), cudaMemcpyDeviceToHost, s.st));
+    HY_CK(cudaMemcpyAsync(hmargi + s.g, d.argi + DT - 1, sizeof(int), cudaMemcpyDeviceToHost, s.st));
+    if (!compact_io) HY_CK(cudaMemcpyAsync(hmlog + (size_t) s.g * (V / S), d.logits, sizeof(float) * (V / S), cudaMemcpyDeviceToHost, s.st));
+}
+
 void mtp_ops(Shard& s, DShard& d, int T, bool chain = false, bool dense_dsa = false, bool sparse_dsa = false) {
     HY_CK(cudaMemcpyAsync(d.dio_m, hio_m, sizeof(IoT), cudaMemcpyHostToDevice, s.st));
     const int* pp = &d.dio_m->pos;
@@ -896,13 +918,7 @@ void mtp_ops(Shard& s, DShard& d, int T, bool chain = false, bool dense_dsa = fa
         d_ffn(s, d, L, T, true);
     }
     kb_rms<<<1, 1024, 0, s.st>>>(d.mr + (size_t) (T - 1) * E, E, f32(s, P + "nextn.shared_head_norm.weight"), E, eps, d.mh, E);
-    head_rows(s, d, d.mh, 1, d.argv + DT - 1, d.argi + DT - 1);
-    if (compact_io)
-        kd_runner_up<<<1, 1024, 0, s.st>>>(d.logits, V / S, s.g * (V / S), d.argi + DT - 1, d.argv + DT);
-    const int count = compact_io ? 2 : 1;
-    HY_CK(cudaMemcpyAsync(hmargv + count * s.g, d.argv + DT - 1, count * sizeof(float), cudaMemcpyDeviceToHost, s.st));
-    HY_CK(cudaMemcpyAsync(hmargi + s.g, d.argi + DT - 1, sizeof(int), cudaMemcpyDeviceToHost, s.st));
-    if (!compact_io) HY_CK(cudaMemcpyAsync(hmlog + (size_t) s.g * (V / S), d.logits, sizeof(float) * (V / S), cudaMemcpyDeviceToHost, s.st));
+    if (!draft_head_type) mtp_head_ops(s, d, false);
 }
 
 void dec_setup() {
@@ -995,6 +1011,15 @@ void dec_setup() {
                 }
             }
         }
+        if (has_mtp && draft_head_type) {
+            for (int i = 0; i < 2; ++i) {
+                cudaGraph_t gr = nullptr;
+                HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
+                mtp_head_ops(s, d, i != 0);
+                HY_CK(cudaStreamEndCapture(s.st, &gr));
+                d.mtp_heads[i].capture(gr, 0, false);
+            }
+        }
         if (df_nl) df_capture(s);
         HY_CK(cudaDeviceSynchronize());
     }
@@ -1033,6 +1058,8 @@ void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
         DShard& d = dsh[s.g];
         DecodeGraph& graph = chain ? d.gc : mtp ? d.gm[T] : d.gv[T];
         HY_CK(cudaGraphLaunch(graph.select(mode), s.st));
+        if (mtp && draft_head_type)
+            HY_CK(cudaGraphLaunch(d.mtp_heads[greedy_draft_head && !full_logits].exec, s.st));
         if (rank_active && !full_logits) {
             const int n=V/S, blocks=(n+1023)/1024, nr=mtp ? 1 : T;
             kd_rank_head<false><<<dim3(blocks,nr),256,0,s.st>>>(d.logits,nullptr,d.rank_tiles,n,blocks,s.g*n);

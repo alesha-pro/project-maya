@@ -26,6 +26,7 @@
 #include "hy4f_expert_q8.cuh"
 
 #include "strata/artifact/gguf_reader.hpp"
+#include "ggml.h"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/router_sigmoid.hpp"
@@ -338,6 +339,34 @@ struct Model::Impl {
         return w;
     }
     DW up_full(Shard& s, const std::string& n) { return up_rows(s, n, 0, -1); }
+    void up_draft_head(Shard& s) {
+        const strata::GgufFile* file = nullptr;
+        const auto* tensor = T("output.weight", &file);
+        if (tensor->type != T_BF16 || tensor->shape.size() != 2 ||
+            tensor->shape[0] != (size_t) E || tensor->shape[1] != (size_t) V)
+            throw std::runtime_error("hy4f: draft head quantization requires a BF16 output.weight");
+        const int rows = V / S;
+        const auto type = draft_head_type == T_Q8_0 ? GGML_TYPE_Q8_0 : GGML_TYPE_Q4_K;
+        if (E % ggml_blck_size(type))
+            throw std::runtime_error("hy4f: incompatible draft head input width");
+        auto& weight = s.w["mtp.output.weight"];
+        weight.type = draft_head_type;
+        weight.ne[0] = E;
+        weight.ne[1] = rows;
+        weight.rb = ggml_row_size(type, E);
+        weight.d = walloc(rows * weight.rb);
+        constexpr int chunk = 128;
+        std::vector<float> input((size_t) chunk * E);
+        std::vector<uint8_t> packed(chunk * weight.rb);
+        const auto* bf16 = reinterpret_cast<const ggml_bf16_t*>(file->tensor_data(*tensor)) + (size_t) s.g * rows * E;
+        for (int i = 0; i < rows; i += chunk) {
+            const int n = std::min(rows-i, chunk);
+            ggml_bf16_to_fp32_row(bf16 + (size_t) i * E, input.data(), (int64_t) n * E);
+            const auto bytes = ggml_quantize_chunk(type, input.data(), packed.data(), 0, n, E, nullptr);
+            if (bytes != n * weight.rb) throw std::runtime_error("hy4f: incomplete draft head quantization");
+            HY_CK(cudaMemcpy(static_cast<uint8_t*>(weight.d) + i * weight.rb, packed.data(), bytes, cudaMemcpyHostToDevice));
+        }
+    }
     void up_router(Shard& s, const std::string& name) {
         const strata::GgufFile* file = nullptr;
         const auto* tensor = T(name, &file);
@@ -513,6 +542,7 @@ struct Model::Impl {
         for (const char* n : {"output_norm.weight", "output_hc_fn.weight", "output_hc_scale.weight", "output_hc_base.weight"})
             up_full(s, n);
         up_rows(s, "output.weight", (int64_t) g * V / S, (int64_t) (g + 1) * V / S);
+        if (has_mtp && draft_head_type) up_draft_head(s);
         const char* project_env = std::getenv("HY4F_Q8_KV_PROJ");
         const int project_mask = project_env ? std::atoi(project_env) : 0;
         const bool pack_k = (project_mask & 1) && nope == 192 && kvl == 512;
@@ -990,6 +1020,7 @@ struct Model::Impl {
             for (auto& graph : d.gv) graph.clear();
             for (auto& graph : d.gm) graph.clear();
             d.gc.clear();
+            for (auto& graph : d.mtp_heads) graph.clear();
             if (d.packed_query) cudaFree(d.packed_query);
             if (d.rank_tiles) cudaFree(d.rank_tiles);
             if (d.rank_final) cudaFree(d.rank_final);
@@ -1058,6 +1089,11 @@ bool Model::load(const Options& o, std::string& err) {
             const strata::GgufFile* f = nullptr;
             const strata::TensorInfo* t = d.find("blk." + std::to_string(d.L) + ".nextn.eh_proj.weight", &f);
             const strata::TensorInfo* te = d.find("blk." + std::to_string(d.L) + ".ffn_gate_exps.weight", &f);
+            if (const char* bits = std::getenv("HY4F_MTP_HEAD_Q")) {
+                if (!std::strcmp(bits, "8")) d.draft_head_type = T_Q8_0;
+                else if (!std::strcmp(bits, "4")) d.draft_head_type = T_Q4_K;
+                else throw std::runtime_error("hy4f: HY4F_MTP_HEAD_Q expects 8 or 4");
+            }
             d.has_mtp = t && te && (int) te->type != 30 /*BF16 experts: requantize first (scripts/requant_mtp_q3k.py)*/ &&
                         (int) t->type == 8 && !std::getenv("HY4F_NO_MTP") && (o.dfly.empty() || std::getenv("HY4F_KEEP_MTP"));
         }
@@ -1262,6 +1298,7 @@ bool Model::mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& er
         return false;
     }
 }
+void Model::set_greedy_draft_head(bool enabled) { d_->greedy_draft_head = enabled; }
 bool Model::set_ranked_output(bool enabled) {
     d_->rank_active=enabled && d_->rank_host;
     return d_->rank_active;

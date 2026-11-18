@@ -786,6 +786,7 @@ int serve(Model& m, const ServeOptions& so) {
         // thinking budget or WRAP closing an open reasoning block
         const bool sparse_sample = std::getenv("HY4F_SPARSE_SAMPLE") && r.temperature > 0.f && r.top_k > 0 && r.top_k <= 256;
         Sampler::Sparse sp, sq[4], sr;
+        m.set_greedy_draft_head(r.temperature <= 0.0f);
         const bool ranked=m.set_ranked_output(sparse_sample && r.top_k<=64 && r.bias.empty() &&
             !(r.pen_n && (r.pen_repeat!=1.f || r.pen_freq!=0.f || r.pen_present!=0.f)));
         std::vector<HeadValue> head_values;
