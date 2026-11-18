@@ -600,8 +600,8 @@ __global__ void kb_gate_mul(float* a, int n, const float* gate, int ldg, int T) 
 __device__ __forceinline__ void kb_wait(const Peers& P, int me, int n_shards, int step) {
     if (threadIdx.x < n_shards) {
         volatile int* mine = P.flag[me];
-        while (mine[threadIdx.x] < step) {
-        }
+        const unsigned long long t0 = hy4f_now();
+        while (mine[threadIdx.x] < step) hy4f_spin_guard(t0);
     }
     __syncthreads();
     __threadfence_system();
@@ -749,12 +749,12 @@ __global__ void kb_add(const float* a, const float* b, float* y, size_t n) {
 
 // the batched k-pool selection (blockIdx.x = token of the tile): as k_select_kpool for pos = pos0 + t0 + blockIdx.x
 template <int NT>
-__global__ void kb_select_kpool(const float* __restrict__ score_tile, int ld_score, const int* pos0p, int t0, int kpool, int top_k,
+__global__ void kb_select_kpool(const float* __restrict__ score_tile, int ld_score, const int* pos0p, int t0, int tb, int kpool, int top_k,
                                 int top_pools, int n_cap, int* __restrict__ cells_all) {
     const int pos0 = *pos0p;
     const int tt = blockIdx.x, t = t0 + tt, pos = pos0 + t;
     const float* score = score_tile + (size_t) tt * ld_score;
-    int* cells = cells_all + (size_t) t * n_cap;
+    int* cells = cells_all + (size_t) (t - tb) * n_cap;   // (rows of the attention tile that starts at token tb)
     const int tid = threadIdx.x;
     if (pos + 1 <= top_k) {
         for (int i = tid; i < n_cap; i += NT) cells[i] = i <= pos ? i : -1;
@@ -767,6 +767,8 @@ __global__ void kb_select_kpool(const float* __restrict__ score_tile, int ld_sco
     __shared__ int s_kk;
     if (tid == 0) s_prefix = 0, s_mask = 0, s_kk = k;
     __syncthreads();
+    using SelScan = cub::BlockScan<int, NT>;
+    __shared__ typename SelScan::TempStorage sel_tmp;
     const int shifts[3] = {21, 10, 0}, widths[3] = {11, 11, 10};
     for (int pass = 0; pass < 3; ++pass) {
         const int sh = shifts[pass], nbins = 1 << widths[pass];
@@ -778,18 +780,23 @@ __global__ void kb_select_kpool(const float* __restrict__ score_tile, int ld_sco
             if ((key & mask) == prefix) atomicAdd(&hist[(key >> sh) & (nbins - 1)], 1u);
         }
         __syncthreads();
-        if (tid == 0) {
-            int kk = s_kk;
-            for (int b = nbins - 1; b >= 0; --b) {
-                const int c = (int) hist[b];
-                if (c >= kk) {
-                    s_prefix = prefix | ((unsigned) b << sh);
-                    s_mask = mask | ((unsigned) (nbins - 1) << sh);
-                    break;
-                }
-                kk -= c;
+        {   // the bin where the count from the top crosses kk: a block scan over the bins in descending order (two per
+            // thread) instead of one thread walking up to 2048 bins
+            const int kk = s_kk;
+            const int r0 = nbins - 1 - 2 * tid, r1 = r0 - 1;
+            const int c0 = r0 >= 0 ? (int) hist[r0] : 0, c1 = r1 >= 0 ? (int) hist[r1] : 0;
+            int above, total;
+            SelScan(sel_tmp).ExclusiveSum(c0 + c1, above, total);
+            __syncthreads();   // (every thread has read s_kk and its bins before the winner writes)
+            if (r0 >= 0 && above < kk && kk <= above + c0) {
+                s_prefix = prefix | ((unsigned) r0 << sh);
+                s_mask = mask | ((unsigned) (nbins - 1) << sh);
+                s_kk = kk - above;
+            } else if (r1 >= 0 && above + c0 < kk && kk <= above + c0 + c1) {
+                s_prefix = prefix | ((unsigned) r1 << sh);
+                s_mask = mask | ((unsigned) (nbins - 1) << sh);
+                s_kk = kk - above - c0;
             }
-            s_kk = kk;
         }
         __syncthreads();
     }

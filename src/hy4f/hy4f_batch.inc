@@ -40,6 +40,7 @@ struct BShard {
 };
 std::vector<BShard> bsh;
 int score_tile = 64;
+int attn_tile = 512;   // tokens per attention tile (q_abs / o / partials / cells / the combine are tile-sized)
 int CBW() const { return kvl + 4; }   // a combine partial's row: kvl accumulators, M, L, 2 pad (float4 / WMMA aligned)
 size_t xp_ld = 0, qp_ld = 0, xm_ld = 0;
 
@@ -64,6 +65,7 @@ struct Bump {
 void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_CK(cudaSetDevice(s.dev));
     b.Tmax = Tmax;
+    if (S == 1) attn_tile = Tmax;   // (the single-GPU attention falls back to kb_attn2 over the whole chunk)
     const int T = Tmax, K = n_used, QH = nope + rope, Hmax = std::max(Hd, Hs);
     const int64_t C = o.max_context;
     b.mmq = new strata::prefill::mmq::Context();
@@ -74,7 +76,7 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_BL(cublasSetMathMode(b.blas, CUBLAS_DEFAULT_MATH));
     HY_CK(cudaHostAlloc((void**) &b.hb, sizeof(int) * 4, cudaHostAllocPortable));
     HY_CK(cudaHostAlloc((void**) &b.hmb, sizeof(int) * (nl_max + 1), cudaHostAllocPortable));
-    b.cap = std::min((int64_t) T * K, std::max<int64_t>(2 * (int64_t) T * K / S, 4 * T));
+    b.cap = std::min((int64_t) T * K, std::max<int64_t>(3 * (int64_t) T * K / (2 * S), 2 * T));
     xp_ld = ((size_t) q_lora + KV_ROW + (size_t) Hmax / S * vh + IK + 3) / 4 * 4;
     qp_ld = std::max((size_t) Hd * QH + (size_t) IH * IK, (size_t) Hs / S * QH);
     xm_ld = (size_t) latent + 2 * n_ffx / S;
@@ -83,6 +85,7 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
                                  strata::prefill::mmq::q8_bytes(T, eg_D * (eg_ngram - 1) * eg_heads)});
     const int ts = (T + S - 1) / S, ncol = (eg_ngram - 1) * eg_heads;
     const int Ha = std::max(Hd, Hs / S), Ho = S > 1 ? Hmax / S : Hmax;
+    const int TA = std::min(T, attn_tile);
     // persistent
     auto persistent = [&](Bump& m) {
         b.dbounds = m.take<int>(4);   // {0, T, pos0, -}
@@ -109,13 +112,13 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         // exchanges: one buffer each (the alternation RS -> AG -> RS .. and the waits order every reuse)
         b.ar_buf[0] = b.ar_buf[1] = m.take<float>((size_t) S * ts * E / 2 + 64);
         b.ag_buf[0] = b.ag_buf[1] = m.take<float>((size_t) T * E / 2 + 64);
-        b.cb_buf[0] = b.cb_buf[1] = m.take<float>((size_t) S * T * (Hd / S) * CBW());
+        b.cb_buf[0] = b.cb_buf[1] = m.take<float>((size_t) S * TA * (Hd / S) * CBW());
         b.yn = m.take<__half>((size_t) ts * E);
         b.ag_flag = m.take<int>(4);
         b.ar_flag = m.take<int>(4);
         b.cb_flag = m.take<int>(4);
         b.ctr = m.take<int>(12);
-        b.wdq = m.take<float>(std::max((size_t) Hd * kvl * nope, (size_t) Hmax / S * vh * kvl));
+        b.wdq = m.take<float>(std::max((size_t) Hd, (size_t) Hmax / S) * kvl * nope + (size_t) Hmax / S * vh * kvl);
         b.mr = has_mtp ? m.take<float>((size_t) T * E) : nullptr;
         b.ones = m.take<float>((size_t) T * 8);
         b.hprev = m.take<float>(E);
@@ -124,20 +127,20 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.xp = m.take<float>((size_t) T * xp_ld);
         b.qr = m.take<float>((size_t) T * q_lora);
         b.qp = m.take<float>((size_t) T * qp_ld);
-        b.qabs = m.take<float>((size_t) T * Ha * kvl);
-        b.o = m.take<float>((size_t) T * Ho * kvl);
-        b.part = S > 1 ? m.take<float>((size_t) T * Hd * CBW()) : nullptr;
+        b.qabs = m.take<float>((size_t) TA * Ha * kvl);
+        b.o = m.take<float>((size_t) TA * Ho * kvl);
+        b.part = S > 1 ? m.take<float>((size_t) TA * Hd * CBW()) : nullptr;
         b.a = m.take<float>((size_t) T * Hmax / S * vh);
         b.ao = m.take<float>((size_t) T * E);
         b.ikn = m.take<float>((size_t) T * IK);
         b.ivg = m.take<float>((size_t) T * 2 * IK);
         b.iw = m.take<float>((size_t) T * IH);
-        b.cells = m.take<int>((size_t) T * n_cap);
+        b.cells = m.take<int>((size_t) TA * n_cap);
     };
     auto ffn = [&](Bump& m) {
         b.lg = m.take<float>((size_t) T * n_exp);
         b.xm = m.take<float>((size_t) T * xm_ld);
-        b.gu = m.take<float>((size_t) b.cap * 2 * n_ffx);
+        b.gu = m.take<float>(std::max((size_t) b.cap * n_ffx, (size_t) T * 2 * E));   // (h rows: run_glu writes n_ff; the MTP's concat)
         b.dn = m.take<float>((size_t) b.cap * latent);
         b.moe = m.take<float>((size_t) T * latent);
         b.mu = m.take<float>((size_t) T * E);
@@ -156,6 +159,9 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     engr(me);
     const size_t arena = std::max({ma.off, mf.off, me.off});
     uint8_t* base = nullptr;
+    if (o.verbose)
+        std::fprintf(stderr, "hy4f: batch buffers for %d tokens: persistent %.0f MiB, arena %.0f MiB (attention %.0f, ffn %.0f, engram %.0f)\n",
+                     T, m0.off / 1048576.0, arena / 1048576.0, ma.off / 1048576.0, mf.off / 1048576.0, me.off / 1048576.0);
     HY_CK(cudaMalloc(&base, m0.off + arena));
     HY_CK(cudaMemset(base, 0, m0.off + arena));
     m0 = Bump{base, 0};
@@ -305,26 +311,11 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
     const DW& vb = s.w.at(P + "attn_v_b.weight");
     const float scale = 1.0f / std::sqrt((float) QH);
     const int Ha = sw ? Hl : Hd;   // heads absorbed / attended on this shard
-    // q_abs[t][h] = k_b_h q_nope[t][h]: k_b_h [kvl][nope] row-major
-    kb_deq<<<std::min(nb(Ha * kvl * nope), 1024), 256, 0, s.st>>>(kb.d, kb.type, (size_t) Ha * kvl * nope, b.wdq);
-    bgemm(b, kvl, T, nope, b.wdq, nope, (long long) kvl * nope, b.qp, (int) qp_ld, QH, b.qabs, Ha * kvl, kvl, Ha);
-    if (sw) {
-        if (Hl == 16)
-            kb_mqa_attn<16><<<T, 256, mqa_smem<16>(), s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk,
-                                                            nullptr, 0, b.pp, win, 1, 0,
-                                                            f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, b.o, nullptr, 0);
-        else if (Hl == 32)
-            kb_mqa_attn<32><<<T, 256, mqa_smem<32>(), s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk,
-                                                            nullptr, 0, b.pp, win, 1, 0,
-                                                            f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, b.o, nullptr, 0);
-        else
-            kb_attn2<<<dim3(Hl, T), 256, 0, s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk, nullptr, 0,
-                                                    b.pp, win, 1, 0, f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, b.o,
-                                                    nullptr, Hl);
-        kb_ring_write<<<std::min(T, win), 152, 0, s.st>>>(b.chunk, s.kv[il], T, b.pp, win);
-    } else {
-        // the indexer: pooled keys of the groups completed in the chunk, then the per-token selection in tiles
-        float* iq = b.qp + (size_t) Hd * QH;
+    const bool mqa = sw ? (Hl == 16 || Hl == 32) : (Hd == 32 && S > 1);
+    const int TA = mqa ? std::min(T, attn_tile) : T;
+    float* iq = b.qp + (size_t) Hd * QH;
+    const int64_t ld_sc = o.max_context / kpool + 1;
+    if (!sw) {   // the indexer: pooled keys of the groups completed in the chunk (selection per tile below)
         kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, s.st>>>(iq, (int) qp_ld, IH, IK, IK - rope, rope, b.pp, th);
         kb_rms<<<T, 128, 0, s.st>>>(b.xp + oik, (int) xp_ld, f32(s, P + "indexer.k_norm.weight"), IK, eps, b.ikn, IK);
         const DW& ivw = s.w.at(P + "ivg");
@@ -338,38 +329,66 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
         kb_ring_chunk<<<kpool, 256, 0, s.st>>>(b.ivg, s.ring[il], T, b.pp, IK, kpool);
         blin(s, b, P + "indexer.proj.weight", b.x, E, b.iw, IH, T);
         k_scale<<<nb(T * IH), 256, 0, s.st>>>(b.iw, T * IH, 1.0f / std::sqrt((float) (IK * IH)));
-        const int64_t ld_sc = o.max_context / kpool + 1;
-        for (int t0 = 0; t0 < T; t0 += score_tile) {
-            const int tt = std::min(score_tile, T - t0);
-            const int n_pool_max = (pos0 + t0 + tt - 1) / kpool;
-            if (pos0 + t0 + tt > top_k && n_pool_max > 0)
-                kb_score<<<dim3(nb(n_pool_max * 32), tt), 256, 0, s.st>>>(iq, (int) qp_ld, s.pooled[il], b.iw, IH, IK, IH,
-                                                                          kpool, top_k, b.pp, t0, b.score, (int) ld_sc);
-            kb_select_kpool<1024><<<tt, 1024, 0, s.st>>>(b.score, (int) ld_sc, b.pp, t0, kpool, top_k, top_k / kpool - tail,
-                                                         n_cap, b.cells);
-        }
-        if (S > 1) {
-            if (Hd == 32 && !std::getenv("HY4F_OLD_ATTN"))
-                kb_mqa_attn<32><<<T, 256, mqa_smem<32>(), s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], nullptr,
-                                                                b.cells, n_cap, b.pp, win, S, s.g, nullptr, scale, nullptr,
-                                                                b.part, CBW());
+    }
+    kb_deq<<<std::min(nb(Ha * kvl * nope), 1024), 256, 0, s.st>>>(kb.d, kb.type, (size_t) Ha * kvl * nope, b.wdq);
+    float* wvb = b.wdq + (size_t) Ha * kvl * nope;   // (v_b after k_b in the scratch)
+    kb_deq<<<std::min(nb(Hl * vh * kvl), 1024), 256, 0, s.st>>>(vb.d, vb.type, (size_t) Hl * vh * kvl, wvb);
+    const float* sinks = f32(s, P + "attn_sinks.weight");
+    for (int t0 = 0; t0 < T; t0 += TA) {
+        const int tt = std::min(TA, T - t0);
+        // q_abs[t][h] = k_b_h q_nope[t][h]: k_b_h [kvl][nope] row-major
+        bgemm(b, kvl, tt, nope, b.wdq, nope, (long long) kvl * nope, b.qp + (size_t) t0 * qp_ld, (int) qp_ld, QH, b.qabs,
+              Ha * kvl, kvl, Ha);
+        const float* qt = b.qp + (size_t) t0 * qp_ld;
+        if (sw) {
+            if (Hl == 16)
+                kb_mqa_attn<16><<<tt, 256, mqa_smem<16>(), s.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk,
+                                                                 nullptr, 0, b.pp, t0, win, 1, 0, sinks + s.g * Hl, scale,
+                                                                 b.o, nullptr, 0);
+            else if (Hl == 32)
+                kb_mqa_attn<32><<<tt, 256, mqa_smem<32>(), s.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk,
+                                                                 nullptr, 0, b.pp, t0, win, 1, 0, sinks + s.g * Hl, scale,
+                                                                 b.o, nullptr, 0);
             else
+                kb_attn2<<<dim3(Hl, T), 256, 0, s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk, nullptr, 0,
+                                                        b.pp, win, 1, 0, sinks + s.g * Hl, scale, b.o, nullptr, Hl);
+        } else {
+            for (int s0 = t0; s0 < t0 + tt; s0 += score_tile) {
+                const int st = std::min(score_tile, t0 + tt - s0);
+                const int n_pool_max = (pos0 + s0 + st - 1) / kpool;
+                if (pos0 + s0 + st > top_k && n_pool_max > 0)
+                    kb_score<<<dim3(nb(n_pool_max * 32), st), 256, 0, s.st>>>(iq, (int) qp_ld, s.pooled[il], b.iw, IH, IK,
+                                                                              IH, kpool, top_k, b.pp, s0, b.score,
+                                                                              (int) ld_sc);
+                kb_select_kpool<1024><<<st, 1024, 0, s.st>>>(b.score, (int) ld_sc, b.pp, s0, t0, kpool, top_k,
+                                                             top_k / kpool - tail, n_cap, b.cells);
+            }
+            if (mqa) {
+                kb_mqa_attn<32><<<tt, 256, mqa_smem<32>(), s.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], nullptr,
+                                                                 b.cells, n_cap, b.pp, t0, win, S, s.g, nullptr, scale,
+                                                                 nullptr, b.part, CBW());
+                ++b.step;
+                const size_t per = (size_t) tt * Hl * CBW();
+                push(s, b, b.part, per, 1, Hl, CBW(), b.cb, b.ctr + 4);
+                kb_combine<<<tt, 512, 0, s.st>>>(kvl, CBW(), s.g * Hl, Hl, sinks, b.cb, s.g, S, b.step, per, b.o);
+            } else if (S > 1) {
                 kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], nullptr, b.cells,
                                                         n_cap, b.pp, win, S, s.g, nullptr, scale, nullptr, b.part, Hd);
-            ++b.step;
-            const size_t per = (size_t) T * Hl * CBW();
-            push(s, b, b.part, per, 1, Hl, CBW(), b.cb, b.ctr + 4);
-            kb_combine<<<T, 512, 0, s.st>>>(kvl, CBW(), s.g * Hl, Hl, f32(s, P + "attn_sinks.weight"), b.cb, s.g, S, b.step, per,
-                                            b.o);
-        } else {
-            kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], nullptr, b.cells, n_cap,
-                                                    b.pp, win, 1, 0, f32(s, P + "attn_sinks.weight"), scale, b.o, nullptr, Hd);
+                ++b.step;
+                const size_t per = (size_t) T * Hl * CBW();
+                push(s, b, b.part, per, 1, Hl, CBW(), b.cb, b.ctr + 4);
+                kb_combine<<<T, 512, 0, s.st>>>(kvl, CBW(), s.g * Hl, Hl, sinks, b.cb, s.g, S, b.step, per, b.o);
+            } else {
+                kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], nullptr, b.cells,
+                                                        n_cap, b.pp, win, 1, 0, sinks, scale, b.o, nullptr, Hd);
+            }
         }
+        // a[t][h] = v_b_h o[t][h] (v_b_h [vh][kvl] row-major), then the sigmoid gate
+        bgemm(b, vh, tt, kvl, wvb, kvl, (long long) vh * kvl, b.o, Hl * kvl, kvl, b.a + (size_t) t0 * Hl * vh, Hl * vh, vh, Hl);
+        kb_gate_mul<<<dim3(nb(Hl * vh), tt), 256, 0, s.st>>>(b.a + (size_t) t0 * Hl * vh, Hl * vh,
+                                                             b.xp + og + (size_t) t0 * xp_ld, (int) xp_ld, tt);
     }
-    // a[t][h] = v_b_h o[t][h] (v_b_h [vh][kvl] row-major), then the sigmoid gate
-    kb_deq<<<std::min(nb(Hl * vh * kvl), 1024), 256, 0, s.st>>>(vb.d, vb.type, (size_t) Hl * vh * kvl, b.wdq);
-    bgemm(b, vh, T, kvl, b.wdq, kvl, (long long) vh * kvl, b.o, Hl * kvl, kvl, b.a, Hl * vh, vh, Hl);
-    kb_gate_mul<<<dim3(nb(Hl * vh), T), 256, 0, s.st>>>(b.a, Hl * vh, b.xp + og, (int) xp_ld, T);
+    if (sw) kb_ring_write<<<std::min(T, win), 152, 0, s.st>>>(b.chunk, s.kv[il], T, b.pp, win);
     blin(s, b, P + "attn_output.weight", b.a, Hl * vh, b.ao, E, T);
     b_ar_post(s, b, b.ao, P + "post_attention_norm.weight", T);
 }
@@ -429,9 +448,9 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
             p.total_rows = rows;
             p.max_rows = mx;
             p.dst = b.gu;
-            p.ld_dst = 2 * n_ffx;
+            p.ld_dst = n_ffx;   // (the fused product writes h = silu(g) * u, n_ff values per row)
             b.mmq->run_glu(p, clampv, s.st);
-            mq::quantize(b.gu, nullptr, b.xq2, wd.type, n_ffx, 2 * n_ffx, rows, s.st);
+            mq::quantize(b.gu, nullptr, b.xq2, wd.type, n_ffx, n_ffx, rows, s.st);
             p.w = static_cast<const uint8_t*>(wd.d) + (size_t) ea * wd.rb * (size_t) wd.ne[1];
             p.type = wd.type;
             p.w_rows = latent;

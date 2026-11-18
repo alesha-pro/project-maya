@@ -9,6 +9,7 @@
 // eh_proj -> an ordinary sparse layer with a plain residual -> shared_head_norm -> the trunk's output head.
 
 static constexpr int DT = 4;
+static constexpr int NSP = 16;   // split-K blocks per token of the decode attention
 int ar_push_blocks = std::getenv("HY4F_PUSH_BLOCKS") ? std::atoi(std::getenv("HY4F_PUSH_BLOCKS")) : 2;
 
 struct IoT {   // a multi-token step's inputs (pinned host -> device at the head of each graph)
@@ -29,6 +30,7 @@ struct DShard {
     float *eg_r = nullptr, *eg_kv = nullptr, *logits = nullptr, *argv = nullptr;
     int* argi = nullptr;
     float *me = nullptr, *cat = nullptr, *mr = nullptr, *mh = nullptr;
+    float *spm = nullptr, *spl = nullptr, *spacc = nullptr;   // the split-K attention partials [DT][NSP][Hmax][..]
     Q81 *xq = nullptr, *xlq = nullptr, *q16 = nullptr;
     float* ar_buf[2] = {nullptr, nullptr};
     float* cb_buf[2] = {nullptr, nullptr};
@@ -116,6 +118,9 @@ void dec_alloc(Shard& s, DShard& d) {
     d.cat = dalloc((size_t) DT * 2 * E);
     d.mr = dalloc((size_t) DT * E);
     d.mh = dalloc((size_t) DT * E);
+    d.spm = dalloc((size_t) DT * NSP * std::max(Hd, Hs / S));
+    d.spl = dalloc((size_t) DT * NSP * std::max(Hd, Hs / S));
+    d.spacc = dalloc((size_t) DT * NSP * std::max(Hd, Hs / S) * kvl);
     d.xq = qa((size_t) DT * std::max({2 * E, Hmax / S * vh, n_ff / S, ncol * eg_D, latent}));
     d.xlq = qa((size_t) DT * K * latent);
     d.q16 = qa((size_t) DT * K * n_ffx);
@@ -207,9 +212,17 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp) {
     }
     else
         kb_absorb_bf16<<<dim3(nb(Ha * kvl), T), 256, 0, s.st>>>((const uint16_t*) kb.d, d.qp, qpc, QH, d.qabs, nope, kvl, Ha);
+    const bool split = !std::getenv("HY4F_DEC_ATTN2");
     if (sw) {
-        kb_attn2<<<dim3(Hl, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, nullptr, 0, pp, win, 1, 0,
-                                                f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, d.o, nullptr, Hl);
+        if (split && Hl == 16) {
+            kd_mqa_dec<16><<<dim3(NSP, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
+                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc);
+            kd_mqa_merge<<<dim3(Hl, T), 256, 0, s.st>>>(d.spm, d.spl, d.spacc, NSP, Hl,
+                                                        f32(s, P + "attn_sinks.weight") + s.g * Hl, d.o, nullptr, 0);
+        } else {
+            kb_attn2<<<dim3(Hl, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, nullptr, 0, pp, win, 1,
+                                                    0, f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, d.o, nullptr, Hl);
+        }
     } else {
         float* iq = d.qp + (size_t) Hd * QH;
         kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, s.st>>>(iq, qpc, IH, IK, IK - rope, rope, pp, th);
@@ -225,10 +238,17 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp) {
         const int ld_sc = (int) (o.max_context / kpool + 1);
         kb_score<<<dim3(nb(ld_sc * 32), T), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, IK, IH, kpool, top_k, pp, 0,
                                                             d.score, ld_sc);
-        kb_select_kpool<1024><<<T, 1024, 0, s.st>>>(d.score, ld_sc, pp, 0, kpool, top_k, top_k / kpool - tail, n_cap, d.cells);
+        kb_select_kpool<1024><<<T, 1024, 0, s.st>>>(d.score, ld_sc, pp, 0, 0, kpool, top_k, top_k / kpool - tail, n_cap, d.cells);
         if (S > 1) {
-            kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp, win,
-                                                    S, s.g, nullptr, scale, nullptr, d.part, Hd);
+            if (split && Hd == 32) {
+                kd_mqa_dec<32><<<dim3(NSP, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
+                                                                           n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
+                                                                           d.spacc);
+                kd_mqa_merge<<<dim3(Hd, T), 256, 0, s.st>>>(d.spm, d.spl, d.spacc, NSP, Hd, nullptr, nullptr, d.part, CBW());
+            } else {
+                kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp,
+                                                        win, S, s.g, nullptr, scale, nullptr, d.part, Hd);
+            }
             for (int r = 1; r < S; ++r)
                 kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd, CBW(), Hl, d.cb, s.g,
                                                            (s.g + r) % S, d.cb_ctr, d.arrive + 8);
@@ -377,6 +397,8 @@ void dec_setup() {
     for (auto& s : sh) {
         HY_CK(cudaSetDevice(s.dev));
         HY_CK(cudaFuncSetAttribute(kd_ar_post, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) (sizeof(float) * DT * E)));
+        HY_CK(cudaFuncSetAttribute(kd_mqa_dec<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqd_smem<16>()));
+        HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqd_smem<32>()));
         if (std::getenv("HY4F_DEC_EAGER")) {   // (debug: one eager verify per T with a check after it)
             for (int T = 1; T <= DT; ++T) {
                 hio_v->pos = 0;

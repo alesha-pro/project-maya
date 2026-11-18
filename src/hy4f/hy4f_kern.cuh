@@ -488,6 +488,19 @@ __global__ void k_moe_sum(float* moe, const float* dn, const float* w, const int
 // recv[parity][src][payload], fences, stores the step into the peer's flag slot for it, waits for every peer's flag,
 // then reads ONLY local memory.  Two receive areas by parity: a peer can be at most one step ahead before it waits on
 // our next flag, so the area we read is never overwritten.
+// a stalled exchange (a peer died or a launch failed) traps after ~10 s instead of spinning forever: the process gets
+// an error the server can restart on
+__device__ __forceinline__ unsigned long long hy4f_now() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__device__ __forceinline__ void hy4f_spin_guard(unsigned long long t0) {
+    if (hy4f_now() - t0 > 10000000000ull) {
+        printf("hy4f: exchange stalled (block %d thread %d)\n", (int) blockIdx.x, (int) threadIdx.x);
+        __trap();
+    }
+}
 struct Peers {
     float* buf[4][2];   // shard j's receive area of parity p (device pointers, peer-accessible)
     int* flag[4];       // shard j's flag array [4]
@@ -500,8 +513,8 @@ __device__ __forceinline__ void peers_signal_wait(const Peers& P, int me, int n_
         volatile int* f = P.flag[threadIdx.x];
         f[me] = step;
         volatile int* mine = P.flag[me];
-        while (mine[threadIdx.x] < step) {
-        }
+        const unsigned long long t0 = hy4f_now();
+        while (mine[threadIdx.x] < step) hy4f_spin_guard(t0);
     }
     __syncthreads();
     __threadfence_system();

@@ -211,8 +211,8 @@ __global__ void kd_ar2(const float* __restrict__ x1, const float* __restrict__ x
     if ((int) blockIdx.x >= T) return;
     if (threadIdx.x < n_shards && (int) threadIdx.x != me) {
         volatile int* mine = P.flag[me];
-        while (mine[threadIdx.x] < step) {
-        }
+        const unsigned long long t0 = hy4f_now();
+        while (mine[threadIdx.x] < step) hy4f_spin_guard(t0);
     }
     __syncthreads();
     __threadfence_system();
@@ -264,8 +264,8 @@ __global__ void kd_combine2(const float* __restrict__ part, int T, int H, int kv
     if ((int) blockIdx.x >= T * Hl) return;
     if (threadIdx.x < n_shards && (int) threadIdx.x != me) {
         volatile int* mine = P.flag[me];
-        while (mine[threadIdx.x] < step) {
-        }
+        const unsigned long long t0 = hy4f_now();
+        while (mine[threadIdx.x] < step) hy4f_spin_guard(t0);
     }
     __syncthreads();
     __threadfence_system();
@@ -300,18 +300,11 @@ __global__ void kd_vb_gate(const uint8_t* __restrict__ vb, const float* __restri
     float acc[T];
 #pragma unroll
     for (int t = 0; t < T; ++t) acc[t] = 0.0f;
-    for (int b = lane; b < nbk; b += 32) {
-        const uint8_t* blk = row + b * 34;
-        const float d = __half2float(*reinterpret_cast<const __half*>(blk));
-        const int8_t* q = reinterpret_cast<const int8_t*>(blk + 2);
+    for (int e = lane; e < kvl; e += 32) {   // lane e: one element of each 32-block (coalesced)
+        const uint8_t* blk = row + (e / 32) * 34;
+        const float w = __half2float(*reinterpret_cast<const __half*>(blk)) * (float) reinterpret_cast<const int8_t*>(blk + 2)[e % 32];
 #pragma unroll
-        for (int t = 0; t < T; ++t) {
-            const float* x = o + ((size_t) t * H + h) * kvl + b * 32;
-            float s = 0.0f;
-#pragma unroll
-            for (int i = 0; i < 32; ++i) s += (float) q[i] * x[i];
-            acc[t] += d * s;
-        }
+        for (int t = 0; t < T; ++t) acc[t] += w * o[((size_t) t * H + h) * kvl + e];
     }
 #pragma unroll
     for (int t = 0; t < T; ++t) {
@@ -386,8 +379,8 @@ __global__ void kd_push1(const float* __restrict__ x1, const float* __restrict__
 __device__ __forceinline__ void kd_wait_peers(const Peers& P, int me, int n_shards, int step) {
     if (threadIdx.x < n_shards && (int) threadIdx.x != me) {
         volatile int* mine = P.flag[me];
-        while (mine[threadIdx.x] < step) {
-        }
+        const unsigned long long t0 = hy4f_now();
+        while (mine[threadIdx.x] < step) hy4f_spin_guard(t0);
     }
     __syncthreads();
     __threadfence_system();

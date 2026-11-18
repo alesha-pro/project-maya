@@ -3,6 +3,8 @@
 // and each gathered KV tile is read once for H heads (kb_attn2 read it H times).  Two passes over the rows: the row
 // max / sum, then P = exp(S - m) / l and O += P V - no rescaling of the accumulator fragments.
 //   SWA (cells null): the window over the ring (positions < pos0) and the chunk buffer (>= pos0); full softmax with sink.
+//   Token t of the launch is at position pos0 + t0 + t (an attention tile of the chunk; q / qabs / cells / o / part
+//   rows are the tile's); the chunk buffer's rows stay relative to pos0.
 //   DSA: cells [T][n_cap]; n_shards > 1: this shard's cells (c % S == shard), partial (o unnormalized, M, L) to part.
 #pragma once
 
@@ -25,7 +27,7 @@ template <int H>
 __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qabs, const float* __restrict__ q, int ldq,
                                                    int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                    const uint8_t* __restrict__ chunk, const int* __restrict__ cells,
-                                                   int n_cap, const int* pos0p, int win, int n_shards, int shard,
+                                                   int n_cap, const int* pos0p, int t0, int win, int n_shards, int shard,
                                                    const float* __restrict__ sinks, float scale, float* __restrict__ o,
                                                    float* __restrict__ part, int W) {
     const int pos0 = *pos0p;
@@ -47,7 +49,7 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
     int* cl = reinterpret_cast<int*>(rowp + TR);
     __shared__ int wtot[8], s_n;
 
-    const int t = blockIdx.x, pos = pos0 + t, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int t = blockIdx.x, pos = pos0 + t0 + t, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     // Q tile: scale * [q_abs | RoPE(q_pe)] as fp16
     for (int i = tid; i < H * D; i += 256) {
         const int h = i / D, c = i % D;
@@ -207,6 +209,192 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
     if (partial && tid < H) {
         part[((size_t) t * H + tid) * W + KVL] = sm_m[tid];
         part[((size_t) t * H + tid) * W + KVL + 1] = sm_l[tid];
+    }
+}
+
+
+// ---- the decode form (a few tokens): split-K over the rows, so a token's work spreads over gridDim.x blocks
+// (flash-decoding).  grid (nsplit, T): block (sp, t) takes rows [sp*per, (sp+1)*per) of token t's row list (the SWA
+// window / this shard's cells), all H heads, and writes the unnormalized partial (m, l, acc) of each head; kd_mqa_merge
+// folds the splits (with the sink, or into the combine's partial).  Same tile math as kb_mqa_attn.
+template <int H> constexpr size_t mqd_smem() { return mqa_smem<H>(); }
+
+template <int H>
+__global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs, const float* __restrict__ q, int ldq,
+                                                  int qs, int nope, float theta, const uint8_t* __restrict__ kv,
+                                                  const int* __restrict__ cells, int n_cap, const int* pos0p, int win,
+                                                  int n_shards, int shard, float scale, float* __restrict__ pm,
+                                                  float* __restrict__ pl, float* __restrict__ pacc) {
+    using namespace nvcuda;
+    constexpr int KVL = 512, ROPE = 64, D = 576, LD = MQA_LD, TR = MQA_TR;
+    constexpr int NST = H / 8, KS = 8 / NST, KP = D / KS, OPW = H / 4;
+    extern __shared__ __align__(128) uint8_t smem[];
+    __half* Qs = reinterpret_cast<__half*>(smem);
+    __half* Ks = Qs + (size_t) H * LD;
+    float* Sp = reinterpret_cast<float*>(Ks + (size_t) TR * LD);
+    __half* Ps = reinterpret_cast<__half*>(Sp + 2048);
+    float* sm_m = reinterpret_cast<float*>(Ps + H * 40);
+    float* sm_l = sm_m + H;
+    float* sm_i = sm_l + H;
+    const uint8_t** rowp = reinterpret_cast<const uint8_t**>(sm_i + H);
+    int* cl = reinterpret_cast<int*>(rowp + TR);
+    __shared__ int wtot[8], s_n;
+    const int sp = blockIdx.x, nsp = gridDim.x, t = blockIdx.y, pos = *pos0p + t;
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    for (int i = tid; i < H * D; i += 256) {
+        const int h = i / D, c = i % D;
+        float v;
+        if (c < KVL) v = qabs[((size_t) t * H + h) * KVL + c];
+        else {
+            const int j = c - KVL, jj = j >> 1;
+            const float* qp = q + (size_t) t * ldq + (size_t) h * qs + nope + 2 * jj;
+            float sn, cs;
+            sincosf((float) pos * powf(theta, -2.0f * jj / ROPE), &sn, &cs);
+            v = (j & 1) ? qp[0] * sn + qp[1] * cs : qp[0] * cs - qp[1] * sn;
+        }
+        Qs[(size_t) h * LD + c] = __float2half_rn(v * scale);
+    }
+    int n, lo = 0;
+    if (!cells) {
+        lo = max(0, pos - win + 1);
+        n = pos - lo + 1;
+    } else {
+        const int* cr = cells + (size_t) t * n_cap;
+        if (tid == 0) s_n = 0;
+        __syncthreads();
+        for (int b0 = 0; b0 < n_cap; b0 += 256) {
+            const int i = b0 + tid;
+            const int c = i < n_cap ? cr[i] : -1;
+            const bool own = c >= 0 && (n_shards == 1 || c % n_shards == shard);
+            const unsigned m = __ballot_sync(0xffffffffu, own);
+            if (lane == 0) wtot[w] = __popc(m);
+            __syncthreads();
+            int base = s_n;
+            for (int k = 0; k < w; ++k) base += wtot[k];
+            if (own) cl[base + __popc(m & ((1u << lane) - 1))] = n_shards == 1 ? c : c / n_shards;
+            __syncthreads();
+            if (tid == 0) {
+                int s2 = s_n;
+                for (int k = 0; k < 8; ++k) s2 += wtot[k];
+                s_n = s2;
+            }
+            __syncthreads();
+        }
+        n = s_n;
+    }
+    const int per = ((n + nsp - 1) / nsp + TR - 1) / TR * TR, rb = min(n, sp * per), re = min(n, rb + per);
+    if (tid < H) sm_m[tid] = -INFINITY, sm_l[tid] = 0.0f, sm_i[tid] = 1.0f;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[OPW];
+#pragma unroll
+    for (int i = 0; i < OPW; ++i) wmma::fill_fragment(acc[i], 0.0f);
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int r0 = rb; r0 < re; r0 += TR) {
+            __syncthreads();
+            if (tid < TR) {
+                const int s2 = r0 + tid;
+                const uint8_t* p = nullptr;
+                if (s2 < re) p = !cells ? kv + (size_t) ((lo + s2) % (win + RING_PAD)) * KV_RB : kv + (size_t) cl[s2] * KV_RB;
+                rowp[tid] = p;
+            }
+            __syncthreads();
+            for (int i = tid; i < TR * (D / 8); i += 256) {
+                const int r = i / (D / 8), c = (i % (D / 8)) * 8;
+                const uint8_t* p = rowp[r];
+                uint4 out = make_uint4(0, 0, 0, 0);
+                if (p) {
+                    const int2 v = *reinterpret_cast<const int2*>(p + c);
+                    const float sc = __half2float(reinterpret_cast<const __half*>(p + KV_ROW)[c >> 6]);
+                    const int8_t* bq = reinterpret_cast<const int8_t*>(&v);
+                    __half2* o2 = reinterpret_cast<__half2*>(&out);
+#pragma unroll
+                    for (int k = 0; k < 4; ++k) o2[k] = __floats2half2_rn(bq[2 * k] * sc, bq[2 * k + 1] * sc);
+                }
+                *reinterpret_cast<uint4*>(Ks + (size_t) r * LD + c) = out;
+            }
+            __syncthreads();
+            {
+                const int st = w % NST, kp = w / NST, hi = st >> 1, ni = st & 1;
+                wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::fragment<wmma::accumulator, 16, 16, 16, float> fs;
+                wmma::fill_fragment(fs, 0.0f);
+#pragma unroll 4
+                for (int k = kp * KP; k < (kp + 1) * KP; k += 16) {
+                    wmma::load_matrix_sync(fa, Qs + (size_t) hi * 16 * LD + k, LD);
+                    wmma::load_matrix_sync(fb, Ks + (size_t) ni * 16 * LD + k, LD);
+                    wmma::mma_sync(fs, fa, fb, fs);
+                }
+                wmma::store_matrix_sync(Sp + (size_t) kp * H * 32 + hi * 16 * 32 + ni * 16, fs, 32, wmma::mem_row_major);
+            }
+            __syncthreads();
+            for (int h = w; h < H; h += 8) {
+                float s2 = 0.0f;
+#pragma unroll
+                for (int k = 0; k < KS; ++k) s2 += Sp[(size_t) k * H * 32 + h * 32 + lane];
+                const bool valid = r0 + lane < re;
+                if (pass == 0) {
+                    const float mx = warp_max(valid ? s2 : -INFINITY);
+                    const float mo = sm_m[h], mn = fmaxf(mo, mx);
+                    const float e = warp_sum(valid ? __expf(s2 - mn) : 0.0f);
+                    if (lane == 0) {
+                        sm_l[h] = sm_l[h] * (mo == -INFINITY ? 0.0f : __expf(mo - mn)) + e;
+                        sm_m[h] = mn;
+                    }
+                } else {
+                    const float m = sm_m[h];
+                    Ps[h * 40 + lane] = __float2half_rn(valid && m != -INFINITY ? __expf(s2 - m) : 0.0f);
+                }
+            }
+            if (pass == 1) {
+                __syncthreads();
+#pragma unroll
+                for (int i = 0; i < OPW; ++i) {
+                    const int idx = w * OPW + i, hi = idx >> 5, nj = idx & 31;
+                    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
+                    wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::row_major> fb;
+#pragma unroll
+                    for (int kk = 0; kk < TR; kk += 16) {
+                        wmma::load_matrix_sync(fa, Ps + hi * 16 * 40 + kk, 40);
+                        wmma::load_matrix_sync(fb, Ks + (size_t) kk * LD + nj * 16, LD);
+                        wmma::mma_sync(acc[i], fa, fb, acc[i]);
+                    }
+                }
+            }
+        }
+        __syncthreads();
+    }
+    const size_t pb = ((size_t) t * nsp + sp) * H;
+#pragma unroll
+    for (int i = 0; i < OPW; ++i) {
+        const int idx = w * OPW + i, hi = idx >> 5, nj = idx & 31;
+        wmma::store_matrix_sync(pacc + (pb + hi * 16) * KVL + nj * 16, acc[i], KVL, wmma::mem_row_major);
+    }
+    if (tid < H) pm[pb + tid] = sm_m[tid], pl[pb + tid] = sm_l[tid];
+}
+// fold the splits of (t, h): full (sinks != null): o[t][h] = acc / (L + e^(sink - M)); else the combine's partial
+// part[t][h][W] = (acc, M, L) relative to the splits' common max.  grid (H, T), 256 threads.
+__global__ void kd_mqa_merge(const float* __restrict__ pm, const float* __restrict__ pl, const float* __restrict__ pacc,
+                             int nsp, int H, const float* __restrict__ sinks, float* __restrict__ o, float* __restrict__ part,
+                             int W) {
+    constexpr int KVL = 512;
+    const int h = blockIdx.x, t = blockIdx.y;
+    float M = sinks ? sinks[h] : -INFINITY;
+    for (int sp = 0; sp < nsp; ++sp) M = fmaxf(M, pm[((size_t) t * nsp + sp) * H + h]);
+    float L = sinks && M != -INFINITY ? __expf(sinks[h] - M) : 0.0f, f[32];
+    for (int sp = 0; sp < nsp; ++sp) {
+        const float m = pm[((size_t) t * nsp + sp) * H + h];
+        f[sp] = m == -INFINITY ? 0.0f : __expf(m - M);
+        L += f[sp] * pl[((size_t) t * nsp + sp) * H + h];
+    }
+    for (int c = threadIdx.x; c < KVL; c += blockDim.x) {
+        float a = 0.0f;
+        for (int sp = 0; sp < nsp; ++sp) a += f[sp] * pacc[(((size_t) t * nsp + sp) * H + h) * KVL + c];
+        if (sinks) o[((size_t) t * H + h) * KVL + c] = a / L;
+        else part[((size_t) t * H + h) * W + c] = a;
+    }
+    if (!sinks && threadIdx.x == 0) {
+        part[((size_t) t * H + h) * W + KVL] = M;
+        part[((size_t) t * H + h) * W + KVL + 1] = L;
     }
 }
 
