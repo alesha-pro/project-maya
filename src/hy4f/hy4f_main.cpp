@@ -29,7 +29,7 @@ static std::vector<int> csv(const char* s) {
 int main(int argc, char** argv) {
     strata::hy4f::Options o;
     std::vector<int32_t> toks;
-    int gen = 0;
+    int gen = 0, pchunk = 0, ptail = 0, repeat = 1;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -45,6 +45,9 @@ int main(int argc, char** argv) {
             int32_t t;
             while (f.read((char*) &t, 4)) toks.push_back(t);
         } else if (a == "--ids") for (int t : csv(next())) toks.push_back(t);
+        else if (a == "--prefill") pchunk = std::atoi(next());
+        else if (a == "--prefill-tail") ptail = std::atoi(next());
+        else if (a == "--repeat") repeat = std::atoi(next());
         else if (a == "--gen") gen = std::atoi(next());
         else if (a == "--dump") o.dump_dir = next();
         else if (a == "--max-context") o.max_context = std::atoll(next());
@@ -84,7 +87,25 @@ int main(int argc, char** argv) {
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
         if (pos > 1) steps_s += dt, ++steps;
     };
-    for (int32_t t : toks) run(t);
+    if (repeat > 1) {
+        const std::vector<int32_t> base = toks;
+        for (int r = 1; r < repeat; ++r) toks.insert(toks.end(), base.begin(), base.end());
+    }
+    if (pchunk > 0) {
+        const int np = (int) toks.size() - std::min(ptail, (int) toks.size() - 1);
+        const auto a = std::chrono::steady_clock::now();
+        if (!m.prefill(toks.data(), np, 0, logits.data(), pchunk, err)) {
+            std::fprintf(stderr, "maya-hy4f: prefill failed: %s\n", err.c_str());
+            return 1;
+        }
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
+        std::printf("prefill: %d tokens in %.3f s, %.1f tok/s (chunk %d, first call includes setup)\n", np, dt, np / dt, pchunk);
+        pos = np;
+        for (size_t i = np; i < toks.size(); ++i) run(toks[i]);
+        steps_s = 0, steps = 0;
+    } else {
+        for (int32_t t : toks) run(t);
+    }
     std::printf("prompt: %zu tokens\n", toks.size());
     std::vector<int32_t> out;
     for (int g = 0; g < gen; ++g) {

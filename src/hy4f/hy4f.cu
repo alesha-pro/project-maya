@@ -15,16 +15,22 @@
 #include "hy4f.hpp"
 #include "hy4f_kern.cuh"
 #include "hy4f_select.cuh"
+#include "hy4f_bkern.cuh"
+#include "hy4f_mqa.cuh"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/router_sigmoid.hpp"
+#include "strata/prefill/moe_mmq.hpp"
+
+#include <cublas_v2.h>
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -222,6 +228,13 @@ struct Model::Impl {
         HY_CK(cudaMemset(p, 0, n * sizeof(float)));
         return p;
     }
+    // a weight's device memory with a zeroed tail: MMQ reads whole 256-value k iterations, past the last row's end
+    void* walloc(size_t bytes) {
+        void* p = nullptr;
+        HY_CK(cudaMalloc(&p, bytes + 4096));
+        HY_CK(cudaMemset(static_cast<uint8_t*>(p) + bytes, 0, 4096));
+        return p;
+    }
     const strata::TensorInfo* T(const std::string& n, const strata::GgufFile** f) const {
         const strata::TensorInfo* t = find(n, f);
         if (!t) throw std::runtime_error("hy4f: missing tensor " + n);
@@ -240,7 +253,7 @@ struct Model::Impl {
         if (w.ne[2] > 1) w.ne[2] = (r1 - r0) / w.ne[1];
         else w.ne[1] = r1 - r0;
         const size_t bytes = w.rb * (size_t) (r1 - r0);
-        HY_CK(cudaMalloc(&w.d, bytes));
+        w.d = walloc(bytes);
         HY_CK(cudaMemcpy(w.d, f->tensor_data(*t) + w.rb * (size_t) r0, bytes, cudaMemcpyHostToDevice));
         s.w[n] = w;
         return w;
@@ -261,7 +274,7 @@ struct Model::Impl {
         w.ne[0] = c1 - c0;
         w.ne[1] = ne1;
         w.rb = nrb;
-        HY_CK(cudaMalloc(&w.d, h.size()));
+        w.d = walloc(h.size());
         HY_CK(cudaMemcpy(w.d, h.data(), h.size(), cudaMemcpyHostToDevice));
         s.w[n] = w;
         return w;
@@ -290,7 +303,7 @@ struct Model::Impl {
         w.ne[0] = ne0;
         w.ne[1] = rows;
         w.rb = row_bytes(type, ne0);
-        HY_CK(cudaMalloc(&w.d, h.size()));
+        w.d = walloc(h.size());
         HY_CK(cudaMemcpy(w.d, h.data(), h.size(), cudaMemcpyHostToDevice));
         s.w[out] = w;
         return w;
@@ -378,7 +391,7 @@ struct Model::Impl {
                     w.ne[1] = 2 * per;
                     w.ne[2] = e1 - e0;
                     w.rb = rb;
-                    HY_CK(cudaMalloc(&w.d, h.size()));
+                    w.d = walloc(h.size());
                     HY_CK(cudaMemcpy(w.d, h.data(), h.size(), cudaMemcpyHostToDevice));
                     s.w[P + "ffn_gu_exps"] = w;
                     const strata::GgufFile* fd = nullptr;
@@ -752,6 +765,8 @@ struct Model::Impl {
         }
     }
 
+#include "hy4f_batch.inc"
+
     void capture() {
         for (auto& s : sh) {
             HY_CK(cudaSetDevice(s.dev));
@@ -805,6 +820,58 @@ bool Model::load(const Options& o, std::string& err) {
             HY_CK(cudaDeviceSynchronize());
         }
         if (d.graphs) d.capture();
+        if (o.verbose)
+            for (auto& s : d.sh) {
+                size_t fr = 0, tot = 0;
+                HY_CK(cudaSetDevice(s.dev));
+                HY_CK(cudaMemGetInfo(&fr, &tot));
+                std::fprintf(stderr, "hy4f: GPU %d free %.2f GiB\n", s.dev, fr / 1073741824.0);
+            }
+        return true;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
+
+bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int chunk, std::string& err) {
+    try {
+        Impl& d = *d_;
+        if (pos != d.pos_next) throw std::runtime_error("hy4f: prefill out of order");
+        if (pos + n > d.o.max_context) throw std::runtime_error("hy4f: context full");
+        if (chunk <= 0) chunk = 1024;
+        if (d.bsh.empty() || d.bsh[0].Tmax < chunk) {
+            if (!d.bsh.empty()) throw std::runtime_error("hy4f: prefill chunk grew");
+            d.batch_setup(chunk);
+        }
+        const auto t_start = std::chrono::steady_clock::now();
+        for (int c0 = 0; c0 < n; c0 += chunk) {
+            const int T = std::min(chunk, n - c0);
+            const bool last = c0 + T == n;
+            const int p0 = (int) (pos + c0);
+            d.launch_parallel([&](Shard& s) {
+                Impl::BShard& b = d.bsh[s.g];
+                HY_CK(cudaMemcpyAsync(b.toks, toks + c0, sizeof(int) * T, cudaMemcpyHostToDevice, s.st));
+                d.b_chunk(s, b, p0, T, last && logits);
+            });
+        }
+        for (auto& s : d.sh) {
+            HY_CK(cudaSetDevice(s.dev));
+            HY_CK(cudaStreamSynchronize(s.st));
+        }
+        HY_CK(cudaGetLastError());
+        d.pos_next = pos + n;
+        if (d.o.verbose)
+            std::fprintf(stderr, "hy4f: prefill %d tokens: %.1f ms (%.1f tok/s, setup excluded)\n", n,
+                         1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(),
+                         n / std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count());
+        if (logits) {
+            std::memcpy(logits, d.hlogits, sizeof(float) * d.V);
+            if (!d.o.dump_dir.empty()) {
+                std::FILE* f = std::fopen((d.o.dump_dir + "/logits.f32").c_str(), "ab");
+                if (f) std::fwrite(logits, 4, d.V, f), std::fclose(f);
+            }
+        }
         return true;
     } catch (const std::exception& e) {
         err = e.what();

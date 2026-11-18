@@ -29,6 +29,8 @@ public:
     bool load(const Options& o, std::string& err);
     /// one token at position pos (pos must be the next position); logits (vocab) to the host when `logits` != null
     bool step(int32_t token, int64_t pos, float* logits, std::string& err);
+    /// n tokens at positions pos .. pos + n - 1 in chunks of `chunk` (the batched path); the last token's logits
+    bool prefill(const int32_t* toks, int n, int64_t pos, float* logits, int chunk, std::string& err);
     int vocab() const;
     std::string summary() const;
 
