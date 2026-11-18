@@ -536,9 +536,9 @@ int serve(Model& m, const ServeOptions& so) {
     const bool host_supported = CH == int(HostPrefixIndex::block);
     const int host_slots = host_setting && host_supported &&
         (std::strcmp(host_setting, "2") == 0 || std::strcmp(host_setting, "3") == 0) ? host_setting[0] - '0' : 0;
-    HostPrefixIndex host_keys(host_slots);
+    HostPrefixIndex host_keys(host_slots, std::getenv("HY4F_DEEP_HOST_PREFIX") != nullptr);
     if (host_setting && !host_slots)
-        std::fprintf(stderr, "maya hy4f serve: host prefix cache requires slots 2 or 3, chunk 2048 and sparse replica disabled\n");
+        std::fprintf(stderr, "maya hy4f serve: host prefix cache requires slots 2 or 3 and chunk 2048\n");
     bool prefix_mark = std::getenv("HY4F_PREFIX_CHECKPOINT") != nullptr;
     std::string line;
     std::vector<float> lgT((size_t) 4 * V);   // verify's rows (sampling, penalties, a bias)
@@ -650,6 +650,7 @@ int serve(Model& m, const ServeOptions& so) {
         // Capture only a lineage that used the same 2048-token chunk boundaries as a cold prefill.
         const bool cold_aligned = from == 0 || host_restored || ring_cold_aligned;
         const size_t host_checkpoint = text_cache && cold_aligned ? HostPrefixIndex::checkpoint(n) : 0;
+        const size_t deep_checkpoint = text_cache && cold_aligned ? host_keys.deep_checkpoint(n) : 0;
         state.resize(from);
         held.erase(std::remove_if(held.begin(), held.end(), [&](const Held& q) { return q.start + q.n > (long long) from; }),
                    held.end());
@@ -705,7 +706,7 @@ int serve(Model& m, const ServeOptions& so) {
                 fatal("prefill at " + std::to_string(a) + ": " + err, 0, n);
             state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + T);
             a += (size_t) T;
-            if (a == host_checkpoint) {
+            if (a == host_checkpoint || a == deep_checkpoint) {
                 const int slot = host_keys.destination(state);
                 if (slot >= 0) {
                     const double started = now_ms();
