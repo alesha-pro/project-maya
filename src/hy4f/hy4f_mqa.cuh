@@ -305,7 +305,7 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
                                                   int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                   const int* __restrict__ cells, int n_cap, const int* pos0p, int win,
                                                   int n_shards, int shard, float scale, float* __restrict__ pm,
-                                                  float* __restrict__ pl, float* __restrict__ pacc, int top_k = 0, int groups = 0) {
+                                                  float* __restrict__ pl, float* __restrict__ pacc, int top_k = 0, int groups = 0, const __half* packed_q = nullptr) {
     using namespace nvcuda;
     constexpr int KVL = 512, ROPE = 64, D = 576, LD = MQA_LD, TR = MQA_TR;
     constexpr int NST = H / 8, KS = 8 / NST, KP = D / KS, OPW = H / (4 * ValueGroups);
@@ -360,7 +360,22 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
         if (vg == 0 && tid < H) pm[pb + tid] = -INFINITY, pl[pb + tid] = 0.0f;
         return;  // merge only reads accumulator slices belonging to active splits
     }
-    for (int i = tid; i < H * D; i += 256) {
+    if (packed_q) {
+        for (int i=tid;i<H*(D/8);i+=256) {
+            const int h=i/(D/8),col=i%(D/8)*8;
+            auto* dst=Qs+(size_t)h*LD+col;
+            auto* src=packed_q+((size_t)t*H+h)*D+col;
+#if __CUDA_ARCH__ >= 800
+            unsigned da=(unsigned)__cvta_generic_to_shared(dst);
+            asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(da),"l"(src));
+#else
+            *reinterpret_cast<uint4*>(dst)=*reinterpret_cast<const uint4*>(src);
+#endif
+        }
+#if __CUDA_ARCH__ >= 800
+        asm volatile("cp.async.commit_group;"); asm volatile("cp.async.wait_group 0;" ::: "memory");
+#endif
+    } else for (int i = tid; i < H * D; i += 256) {
         const int h = i / D, c = i % D;
         float v;
         if (c < KVL) v = qabs[((size_t) t * H + h) * KVL + c];

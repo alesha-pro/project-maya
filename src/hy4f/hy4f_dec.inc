@@ -407,27 +407,30 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     const DW& vb = s.w.at(P + "attn_v_b.weight");
     const float scale = 1.0f / std::sqrt((float) QH);
     const int Ha = sw ? Hl : Hd;
+    const bool split = !std::getenv("HY4F_DEC_ATTN2");
+    const bool pack_query = std::getenv("HY4F_PACK_QUERY") && split && kb.type==T_Q8_0 && kvl==512 && rope==64
+        && ((sw && Hl==16) || (!sw && S>1 && Hd==32)) && (size_t)Ha*576<=size_t(n_used)*2*n_ffx*2;
+    __half* qh=pack_query ? reinterpret_cast<__half*>(d.ga16) : nullptr;
     if (kb.type == T_Q8_0) {
         const uint8_t* kw = (const uint8_t*) kb.d;
         const int g = nb(Ha * kvl * 32);
         switch (T) {
-        case 1: kd_absorb<1><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
-        case 2: kd_absorb<2><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
-        case 3: kd_absorb<3><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
-        case 4: kd_absorb<4><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
-        case 5: kd_absorb<5><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
-        default: kd_absorb<6><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
+        case 1: (pack_query ? kd_absorb<1,true> : kd_absorb<1,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
+        case 2: (pack_query ? kd_absorb<2,true> : kd_absorb<2,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
+        case 3: (pack_query ? kd_absorb<3,true> : kd_absorb<3,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
+        case 4: (pack_query ? kd_absorb<4,true> : kd_absorb<4,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
+        case 5: (pack_query ? kd_absorb<5,true> : kd_absorb<5,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
+        default: (pack_query ? kd_absorb<6,true> : kd_absorb<6,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
         }
     }
     else
         kb_absorb_bf16<<<dim3(nb(Ha * kvl), T), 256, 0, s.st>>>((const uint16_t*) kb.d, d.qp, qpc, QH, d.qabs, nope, kvl, Ha);
     if (side) HY_CK(cudaStreamWaitEvent(s.st, d.attention_join));
-    const bool split = !std::getenv("HY4F_DEC_ATTN2");
     const int value_groups = T<=2 && std::getenv("HY4F_VALUE_GROUPS") ? 4 : 1;
     if (sw) {
         if (split && Hl == 16) {
             (value_groups==4 ? kd_mqa_dec<16,false,4> : kd_mqa_dec<16>)<<<dim3(NSP*value_groups, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
-                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc);
+                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh);
             if (std::getenv("HY4F_MQA_FOLD"))
                 kd_mqa_fold<false><<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hl,
                     f32(s,P+"attn_sinks.weight")+s.g*Hl,d.o,nullptr,0,d.cb,s.g,S,nullptr);
@@ -474,7 +477,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
             if (split && Hd == 32) {
                 (value_groups==4 ? (dense_dsa ? kd_mqa_dec<32,true,4> : kd_mqa_dec<32,false,4>) : (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>))<<<dim3(NSP*value_groups, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
                                                                            n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
-                                                                           d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail);
+                                                                           d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail, qh);
                 if (std::getenv("HY4F_HEAD_SEND")) {
                     kd_mqa_fold<true><<<dim3(Hd,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hd,nullptr,nullptr,
                                                                d.part,CBW(),d.head_cb,s.g,S,d.cb_ctr);

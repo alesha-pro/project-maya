@@ -335,9 +335,9 @@ __global__ void kd_vb_gate(const uint8_t* __restrict__ vb, const float* __restri
     }
 }
 // qabs[t][h][j] = k_b[h*kvl + j] . q_nope[t][h] for T rows, k_b Q8_0 [Ha*kvl][nope] read once (warp per row)
-template <int T>
+template <int T, bool Pack = false>
 __global__ void kd_absorb(const uint8_t* __restrict__ kb, const float* __restrict__ q, int ldq, int qs,
-                          float* __restrict__ qabs, int nope, int kvl, int H) {
+                          float* __restrict__ qabs, int nope, int kvl, int H, __half* packed = nullptr, const int* pos = nullptr, float theta = 0.f, float scale = 1.f) {
     const int r = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (r >= H * kvl) return;
     const int h = r / kvl, nbk = nope / 32;
@@ -354,7 +354,17 @@ __global__ void kd_absorb(const uint8_t* __restrict__ kb, const float* __restric
 #pragma unroll
     for (int t = 0; t < T; ++t) {
         const float s = warp_sum(acc[t]);
-        if (lane == 0) qabs[((size_t) t * H + h) * kvl + (r % kvl)] = s;
+        if constexpr (Pack) {
+            auto* row=packed+((size_t)t*H+h)*576;
+            if (lane==0) row[r%kvl]=__float2half_rn(s*scale);
+            if ((r%kvl)==0) {
+                const float* qp=q+(size_t)t*ldq+(size_t)h*qs+nope+2*lane;
+                float sn,cs;
+                sincosf((float)(*pos+t)*powf(theta,-2.f*lane/64),&sn,&cs);
+                const float even=qp[0]*cs-qp[1]*sn, odd=qp[0]*sn+qp[1]*cs;
+                reinterpret_cast<__half2*>(row+512)[lane]=__floats2half2_rn(even*scale,odd*scale);
+            }
+        } else if (lane==0) qabs[((size_t)t*H+h)*kvl+(r%kvl)]=s;
     }
 }
 
