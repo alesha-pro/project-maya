@@ -856,6 +856,13 @@ struct Model::Impl {
             pool->cv.notify_all();
             for (auto& t : pool->th) t.join();
         }
+        for (size_t i = 0; i < dsh.size(); ++i) {
+            cudaSetDevice(sh[i].dev);
+            auto& d = dsh[i];
+            for (auto& graph : d.gv) graph.clear();
+            for (auto& graph : d.gm) graph.clear();
+            d.gc.clear();
+        }
     }
 
 #include "hy4f_batch.inc"

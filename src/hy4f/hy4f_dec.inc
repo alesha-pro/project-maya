@@ -31,6 +31,38 @@ struct IoT {   // a multi-token step's inputs (pinned host -> device at the head
     int toks[8];
 };
 
+// Hold both captured topologies on the host. Only the active one needs executable
+// graph memory on the GPU. A switch can happen when decoding crosses top_k or
+// when a later request reuses a shorter prefix; ordinary steps reuse the same exec.
+struct DecodeGraph {
+    cudaGraph_t shape[2] = {};
+    cudaGraphExec_t exec = nullptr;
+    bool short_active = false;
+
+    void capture(cudaGraph_t graph, bool dense_dsa, bool both) {
+        if (both) {
+            shape[int(dense_dsa)] = graph;
+            if (!dense_dsa) return;
+        }
+        HY_CK(cudaGraphInstantiate(&exec, graph, 0));
+        short_active = dense_dsa;
+        if (!both) HY_CK(cudaGraphDestroy(graph));
+    }
+    cudaGraphExec_t select(bool dense_dsa) {
+        if (dense_dsa != short_active) {
+            HY_CK(cudaGraphExecDestroy(exec));
+            exec = nullptr;
+            HY_CK(cudaGraphInstantiate(&exec, shape[int(dense_dsa)], 0));
+            short_active = dense_dsa;
+        }
+        return exec;
+    }
+    void clear() {
+        if (exec) cudaGraphExecDestroy(exec);
+        for (auto graph : shape) if (graph) cudaGraphDestroy(graph);
+    }
+};
+
 struct DShard {
     IoT *dio_v = nullptr, *dio_m = nullptr;
     float *X = nullptr, *x = nullptr, *h = nullptr, *post = nullptr, *hcp = nullptr, *hcs = nullptr, *ones = nullptr;
@@ -53,8 +85,7 @@ struct DShard {
     float* cb_buf[2] = {nullptr, nullptr};
     int *ar_flag = nullptr, *cb_flag = nullptr, *ar_ctr = nullptr, *cb_ctr = nullptr, *arrive = nullptr;
     PeersD ar{}, cb{};
-    cudaGraphExec_t gv_short[DT + 1] = {}, gm_short[DT + 1] = {}, gc_short = nullptr;
-    cudaGraphExec_t gv[DT + 1] = {}, gm[DT + 1] = {}, gc = nullptr;   // verify(T), mtp(T), the chained draft
+    DecodeGraph gv[DT + 1], gm[DT + 1], gc;  // verify(T), mtp(T), chained MTP
 };
 std::vector<DShard> dsh;
 struct DFShard {   // the DFly drafter's per-shard state (hy4f_dfly.inc)
@@ -591,20 +622,17 @@ void dec_setup() {
                 verify_ops(s, d, T, dense_dsa);
                 HY_CK(cudaStreamEndCapture(s.st, &gr));
                 kn::native_mmvq_set_multi_exact(false);
-                HY_CK(cudaGraphInstantiate(dense_dsa ? &d.gv_short[T] : &d.gv[T], gr, 0));
-                HY_CK(cudaGraphDestroy(gr));
+                d.gv[T].capture(gr, dense_dsa, short_graphs);
                 if (has_mtp) {
                     HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
                     mtp_ops(s, d, T, false, dense_dsa);
                     HY_CK(cudaStreamEndCapture(s.st, &gr));
-                    HY_CK(cudaGraphInstantiate(dense_dsa ? &d.gm_short[T] : &d.gm[T], gr, 0));
-                    HY_CK(cudaGraphDestroy(gr));
+                    d.gm[T].capture(gr, dense_dsa, short_graphs);
                     if (T == 1) {
                         HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
                         mtp_ops(s, d, 1, true, dense_dsa);
                         HY_CK(cudaStreamEndCapture(s.st, &gr));
-                        HY_CK(cudaGraphInstantiate(dense_dsa ? &d.gc_short : &d.gc, gr, 0));
-                        HY_CK(cudaGraphDestroy(gr));
+                        d.gc.capture(gr, dense_dsa, short_graphs);
                     }
                 }
             }
@@ -618,9 +646,8 @@ void dec_launch(bool mtp, int T, bool chain = false) {
     const bool dense_dsa = short_graphs && (mtp ? hio_m : hio_v)->pos + T <= top_k;
     launch_parallel([&](Shard& s) {
         DShard& d = dsh[s.g];
-        const cudaGraphExec_t graph = dense_dsa ? (chain ? d.gc_short : mtp ? d.gm_short[T] : d.gv_short[T])
-                                                : (chain ? d.gc : mtp ? d.gm[T] : d.gv[T]);
-        HY_CK(cudaGraphLaunch(graph, s.st));
+        DecodeGraph& graph = chain ? d.gc : mtp ? d.gm[T] : d.gv[T];
+        HY_CK(cudaGraphLaunch(graph.select(dense_dsa), s.st));
     });
     for (auto& s : sh) {
         HY_CK(cudaSetDevice(s.dev));
