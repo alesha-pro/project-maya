@@ -438,7 +438,7 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
     const int first_row = std::max(0, pos0 - win + 1);
     const int expand_rows = pos0 + T - first_row;
     const __half* expanded = nullptr;
-    if ((mqa_opt & 2) && sw && mqa && b.chunk_cur == b.chunk && b.pp_attn == b.pp
+    if ((mqa_opt & 6) && sw && mqa && b.chunk_cur == b.chunk && b.pp_attn == b.pp
         && (size_t)expand_rows * KV_ROW * sizeof(__half) <= (size_t)std::min(b.Tmax, attn_tile) * n_cap * sizeof(int)) {
         auto* dst = reinterpret_cast<__half*>(b.cells);
         kb_swa_expand<<<expand_rows, 96, 0, b.st>>>(s.kv[il], b.chunk_cur, b.pp_attn, win, first_row, dst);
@@ -451,7 +451,15 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
               Ha * kvl, kvl, Ha);
         const float* qt = b.qp + (size_t) t0 * qp_ld;
         if (sw) {
-            if (Hl == 16)
+            if ((mqa_opt & 4) && expanded && b.part && Hd >= 16 && Hl == 16 && win == 512 && pos0+t0 >= win-1) {
+                auto* qh = reinterpret_cast<__half*>(b.o);
+                auto* ph = reinterpret_cast<__half*>(b.qabs);
+                const int base = pos0 + t0 - win + 1 - first_row;
+                kb_swa_queries<<<dim3(nb(16 * 576), tt),256,0,b.st>>>(b.qabs, qt, (int)qp_ld, QH, nope, th, pos0+t0, scale, qh);
+                kb_swa_scores<<<dim3(16, (tt+3)/4),256,0,b.st>>>(qh, expanded, base, tt, b.part);
+                kb_swa_probs<<<tt,512,0,b.st>>>(b.part,sinks+s.g*Hl,ph);
+                kb_swa_values<<<dim3(4,tt),256,0,b.st>>>(ph,expanded,base,b.o);
+            } else if (Hl == 16)
                 kb_mqa_attn<16><<<tt, 256, mqa_smem<16>(), b.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk_cur,
                                                                  nullptr, 0, b.pp_attn, b.toff + t0, win, 1, 0, sinks + s.g * Hl, scale,
                                                                  b.o, b.part, CBW(), expanded, first_row, (mqa_opt & 1) && Hd >= Hl);
