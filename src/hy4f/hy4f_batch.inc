@@ -57,6 +57,7 @@ int dma_mask = std::getenv("HY4F_PF_DMA") ? std::atoi(std::getenv("HY4F_PF_DMA")
 bool paired = !std::getenv("HY4F_RING_PUSH");   // exchanges in XOR-paired phases (S a power of two)
 int peer_of(int g, int r) const { return paired && (S & (S - 1)) == 0 ? (g ^ r) : (g + r) % S; }
 int cap_num = 3, cap_den = 2;   // expert rows buffered per shard: cap_num/cap_den x the even share (ranges past it)
+bool compact_arena = std::getenv("HY4F_PF_COMPACT") != nullptr;
 int attn_tile = 512;
 int mqa_opt = std::getenv("HY4F_PF_MQA") ? std::atoi(std::getenv("HY4F_PF_MQA")) : 0;
 int64_t idx_split_from = std::getenv("HY4F_IDX_SPLIT_FROM") ? std::atoll(std::getenv("HY4F_IDX_SPLIT_FROM")) : 16384;   // indexer split by tokens from this depth   // tokens per attention tile (q_abs / o / partials / cells / the combine are tile-sized)
@@ -148,26 +149,41 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
             b.cellsx[1] = m.take<int>((size_t) TA * n_cap);
         }
         b.wdq = m.take<float>(std::max((size_t) Hd, (size_t) Hmax / S) * kvl * nope + (size_t) Hmax / S * vh * kvl);
-        b.mr = has_mtp ? m.take<float>((size_t) T * E) : nullptr;
+        b.mr = has_mtp ? (compact_arena ? b.X : m.take<float>((size_t) T * E)) : nullptr;
         b.ones = m.take<float>((size_t) T * 8);
         b.hprev = m.take<float>(E);
         b.hold = m.take<float>(E);
     };
     auto attn = [&](Bump& m) {
         b.xp = m.take<float>((size_t) T * xp_ld);
-        b.qr = m.take<float>((size_t) T * q_lora);
+        b.qr = m.take<float>((size_t)T * (compact_arena ? std::max(q_lora, Hmax / S * vh) : q_lora));
         b.qp = m.take<float>((size_t) T * qp_ld);
         b.qabs = m.take<float>((size_t) TA * Ha * kvl);
         b.o = m.take<float>((size_t) TA * Ho * kvl);
         b.part = S > 1 ? m.take<float>((size_t) TA * Hd * CBW()) : nullptr;
-        b.a = m.take<float>((size_t) T * Hmax / S * vh);
-        b.ao = m.take<float>((size_t) T * E);
+        b.a = compact_arena ? b.qr : m.take<float>((size_t) T * Hmax / S * vh);
+        b.ao = compact_arena ? b.x : m.take<float>((size_t) T * E);
         b.ikn = m.take<float>((size_t) T * IK);
         b.ivg = m.take<float>((size_t) T * 2 * IK);
         b.iw = m.take<float>((size_t) T * IH);
         b.cells = m.take<int>((size_t) TA * n_cap);
     };
     auto ffn = [&](Bump& m) {
+        if (compact_arena) {
+            // xm and the routed sum must survive every expert range. The other
+            // FFN buffers are private either to the experts or to the final projections.
+            b.xm = m.take<float>((size_t)T * xm_ld);
+            b.moe = m.take<float>((size_t)T * latent);
+            Bump experts = m, final = m;
+            const size_t work = std::max({(size_t)b.cap * n_ffx, (size_t)b.cap * latent,
+                                          (size_t)T * 2 * E, (size_t)T * n_exp});
+            b.lg = b.gu = b.dn = experts.take<float>(work);
+            b.mu = final.take<float>((size_t)T * E);
+            b.shh = final.take<float>((size_t)T * std::max(n_ffx / S, n_ff / S));
+            b.shd = b.ffo = final.take<float>((size_t)T * std::max(E, 2 * n_ff / S));
+            m.off = std::max(experts.off, final.off);
+            return;
+        }
         b.lg = m.take<float>((size_t) T * n_exp);
         b.xm = m.take<float>((size_t) T * xm_ld);
         b.gu = m.take<float>(std::max((size_t) b.cap * n_ffx, (size_t) T * 2 * E));   // (h rows: run_glu writes n_ff; the MTP's concat)
@@ -676,17 +692,16 @@ void b_chunk(Shard& s, BShard& b, int pos0, int T, bool want_logits, const std::
 // the MTP layer over Tm rows at positions *dbounds[3] ..: h = [hrow0 (if given); this pass's x rows 0 .. nx-1], the next
 // tokens toks[0 .. Tm)
 void b_mtp(Shard& s, BShard& b, const float* hrow0, int nx, const int* toks, int Tm, int mpos0) {
-    float* hin = b.ao;   // (attention arena: free until the MTP attention)
     const int r0 = hrow0 ? 1 : 0;
-    if (hrow0) HY_CK(cudaMemcpyAsync(hin, hrow0, sizeof(float) * E, cudaMemcpyDeviceToDevice, b.st));
-    if (nx > 0) HY_CK(cudaMemcpyAsync(hin + (size_t) r0 * E, b.x, sizeof(float) * (size_t) nx * E, cudaMemcpyDeviceToDevice, b.st));
     const std::string P = "blk." + std::to_string(L) + ".";
     const DW& emb = s.w.at("token_embd.weight");
-    float* me = b.mu;    // (FFN arena)
+    float* me = b.mr;    // consumed by enorm before eh_proj writes its output
     float* cat = b.gu;
     kd_embed_rows<<<dim3(nb(E), Tm), 256, 0, b.st>>>((const uint8_t*) emb.d, emb.rb, toks, E, me);
     kb_rms<<<Tm, 1024, 0, b.st>>>(me, E, f32(s, P + "nextn.enorm.weight"), E, eps, cat, 2 * E);
-    kb_rms<<<Tm, 1024, 0, b.st>>>(hin, E, f32(s, P + "nextn.hnorm.weight"), E, eps, cat + E, 2 * E);
+    const float* hnorm = f32(s, P + "nextn.hnorm.weight");
+    if (hrow0) kb_rms<<<1, 1024, 0, b.st>>>(hrow0, E, hnorm, E, eps, cat + E, 2 * E);
+    if (nx) kb_rms<<<nx, 1024, 0, b.st>>>(b.x, E, hnorm, E, eps, cat + (size_t)r0 * 2 * E + E, 2 * E);
     blin(s, b, P + "nextn.eh_proj.weight", cat, 2 * E, b.mr, E, Tm);
     b.mtp = true;
     b.pp = b.dbounds + 3;
