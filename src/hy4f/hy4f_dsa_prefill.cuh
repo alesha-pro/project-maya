@@ -17,21 +17,29 @@ __device__ __forceinline__ uint4 dsa_half8(const uint8_t* row, int col) {
     return v;
 }
 
+__global__ void kb_dsa_expand(const uint8_t* kv, __half* out) {
+    const int row=blockIdx.x, col=threadIdx.x*8;
+    if(col<KV_ROW) *reinterpret_cast<uint4*>(out+(size_t)row*KV_ROW+col)=dsa_half8(kv+(size_t)row*KV_RB,col);
+}
+
 __global__ void kb_dsa_scores(const __half* queries, const uint8_t* kv, const int* cells,
                               const uint16_t* wire, int groups, int top_k, int cap, int start,
-                              int shard, float* scores) {
+                              int shard, float* scores, const __half* expanded) {
     using namespace nvcuda;
     constexpr int D=576, H=32, K=144, LD=152, N=32;
     __shared__ __align__(32) __half a[2][H][LD], b[2][N][LD];
     __shared__ const uint8_t* ptr[N];
+    __shared__ const __half* fp[N];
     int t=blockIdx.y, pos=start+t, tid=threadIdx.x, warp=tid/32;
     int tile=blockIdx.x*N, split=warp/4, h0=((warp/2)&1)*16, r0=(warp&1)*16;
     int n=grouped_rows(pos,top_k,groups,cap,shard);
     if (tile >= n) return;
     if (tid<N) {
         int j=tile+tid;
-        ptr[tid]= j>=n ? nullptr : kv+(size_t)grouped_kv_row(j,pos,top_k,groups,cells+(size_t)t*cap,
-            wire ? wire+(size_t)t*((groups+7)/8*8) : nullptr)*KV_RB;
+        const int id=j<n?grouped_kv_row(j,pos,top_k,groups,cells+(size_t)t*cap,
+            wire ? wire+(size_t)t*((groups+7)/8*8) : nullptr):0;
+        ptr[tid]=j<n?kv+(size_t)id*KV_RB:nullptr;
+        fp[tid]=j<n && expanded ? expanded+(size_t)id*D:nullptr;
     }
     __syncthreads();
     wmma::fragment<wmma::accumulator,16,16,16,float> acc;
@@ -41,7 +49,7 @@ __global__ void kb_dsa_scores(const __half* queries, const uint8_t* kv, const in
             const int sp=i/(H*(K/8)), row=(i/(K/8))%H, c=(i%(K/8))*8;
             const int k=sp*288+step*K+c;
             *reinterpret_cast<uint4*>(&a[sp][row][c])=*reinterpret_cast<const uint4*>(queries+((size_t)t*H+row)*D+k);
-            *reinterpret_cast<uint4*>(&b[sp][row][c])=dsa_half8(ptr[row],k);
+            *reinterpret_cast<uint4*>(&b[sp][row][c])=expanded ? (fp[row]?*reinterpret_cast<const uint4*>(fp[row]+k):make_uint4(0,0,0,0)):dsa_half8(ptr[row],k);
         }
         __syncthreads();
 #pragma unroll
@@ -86,25 +94,30 @@ __global__ void kb_dsa_probs(const float* scores, int start, int top_k, int grou
 
 __global__ void kb_dsa_values(const __half* probs,const uint8_t* kv,const int* cells,
                               const uint16_t* wire,int groups,int top_k,int cap,int start,
-                              int shard,float* out,int stride) {
+                              int shard,float* out,int stride,const __half* expanded) {
     using namespace nvcuda;
     constexpr int C=64, LD=72;
     __shared__ __align__(32) __half p[32][40], v[32][LD];
     __shared__ const uint8_t* ptr[32];
+    __shared__ const __half* fp[32];
     const int t=blockIdx.y,tid=threadIdx.x,w=tid/32,pos=start+t;
     const int n=grouped_rows(pos,top_k,groups,cap,shard),col=blockIdx.x*C;
     wmma::fragment<wmma::accumulator,16,16,16,float> acc;
     wmma::fill_fragment(acc,0.f);
     for(int g=0;g<n;g+=32) {
-        if(tid<32) ptr[tid]=g+tid>=n?nullptr:kv+(size_t)grouped_kv_row(g+tid,pos,top_k,groups,
-            cells+(size_t)t*cap,wire?wire+(size_t)t*((groups+7)/8*8):nullptr)*KV_RB;
+        if(tid<32) {
+            int id=g+tid<n?grouped_kv_row(g+tid,pos,top_k,groups,cells+(size_t)t*cap,
+                wire?wire+(size_t)t*((groups+7)/8*8):nullptr):0;
+            ptr[tid]=g+tid<n?kv+(size_t)id*KV_RB:nullptr;
+            fp[tid]=g+tid<n && expanded?expanded+(size_t)id*KV_ROW:nullptr;
+        }
         if(tid<128) {
             const int h=tid/4,k=tid%4*8;
             *reinterpret_cast<uint4*>(&p[h][k])=*reinterpret_cast<const uint4*>(probs+((size_t)t*32+h)*512+g+k);
         }
         __syncthreads();
         const int row=tid/8,c=tid%8*8;
-        *reinterpret_cast<uint4*>(&v[row][c])=dsa_half8(ptr[row],col+c);
+        *reinterpret_cast<uint4*>(&v[row][c])=expanded ? (fp[row]?*reinterpret_cast<const uint4*>(fp[row]+col+c):make_uint4(0,0,0,0)):dsa_half8(ptr[row],col+c);
         __syncthreads();
 #pragma unroll
         for(int k=0;k<32;k+=16) {

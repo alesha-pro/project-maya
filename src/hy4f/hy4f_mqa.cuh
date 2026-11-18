@@ -140,7 +140,31 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
     for (int pass = 0; pass < 2; ++pass) {
         for (int r0 = 0; r0 < n; r0 += TR) {
             __syncthreads();   // (the previous tile's readers are done)
-            if (expanded) {
+            if (expanded && cells) {
+                if (tid < TR) {
+                    const int r = r0+tid;
+                    int row=0;
+                    if (r<n) row=top_k ? grouped_kv_row(r,pos,top_k,groups,cells+(size_t)t*n_cap,
+                        wire ? wire+(size_t)t*((groups+7)/8*8) : nullptr) : cl[r];
+                    rowp[tid]=reinterpret_cast<const uint8_t*>(expanded+(size_t)row*D);
+                }
+                __syncthreads();
+                for(int i=tid;i<TR*(D/8);i+=256) {
+                    int row=i/(D/8), col=i%(D/8)*8;
+                    __half* dst=Ks+(size_t)row*LD+col;
+                    const __half* src=reinterpret_cast<const __half*>(rowp[row])+col;
+#if __CUDA_ARCH__ >= 800
+                    unsigned address=(unsigned)__cvta_generic_to_shared(dst);
+                    int size=r0+row<n ? 16:0;
+                    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(address),"l"(src),"r"(size));
+#else
+                    *reinterpret_cast<uint4*>(dst)=r0+row<n ? *reinterpret_cast<const uint4*>(src):make_uint4(0,0,0,0);
+#endif
+                }
+#if __CUDA_ARCH__ >= 800
+                asm volatile("cp.async.commit_group;"); asm volatile("cp.async.wait_group 0;" ::: "memory");
+#endif
+            } else if (expanded) {
                 for (int i = tid; i < TR * (D / 8); i += 256) {
                     const int row = i / (D / 8), group = i % (D / 8);
                     const int r = r0 + row;

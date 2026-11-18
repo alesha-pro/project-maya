@@ -32,6 +32,7 @@ struct BShard {
     int64_t* eg_ids = nullptr;
     float* ar_buf[2] = {nullptr, nullptr};   // reduce-scatter receive [src][ts][E] bf16
     float* ag_buf[2] = {nullptr, nullptr};   // all-gather receive [T][E] fp16
+    __half* dsa_half = nullptr;
     __half* yn = nullptr;                    // this shard's normalized slice [ts][E] fp16
     const __half* pending_ag = nullptr;
     int* ag_flag = nullptr;
@@ -168,6 +169,8 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.qp = m.take<float>((size_t) T * qp_ld);
         b.qabs = m.take<float>((size_t) TA * Ha * kvl);
         b.o = m.take<float>((size_t) TA * Ho * kvl);
+        if (std::getenv("HY4F_PF_DSA_HALF") && S==4 && kpool==4 && Hd==32)
+            b.dsa_half=m.take<__half>(((C+S-1)/S)*KV_ROW);
         b.part = S > 1 ? m.take<float>((size_t) TA * Hd * CBW()) : nullptr;
         b.a = compact_arena ? b.qr : m.take<float>((size_t) T * Hmax / S * vh);
         b.ao = compact_arena ? b.x : m.take<float>((size_t) T * E);
@@ -488,6 +491,12 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
         kb_swa_expand<<<expand_rows, 96, 0, b.st>>>(s.kv[il], b.chunk_cur, b.pp_attn, win, first_row, dst);
         expanded = dst;
     }
+    const __half* dsa_half = nullptr;
+    if (!sw && b.dsa_half && mbs.empty() && T >= 512) {
+        const int nr=(pos0+T+S-1-s.g)/S;
+        if (nr) kb_dsa_expand<<<nr,96,0,b.st>>>(s.kv[il],b.dsa_half);
+        dsa_half=b.dsa_half;
+    }
     for (int t0 = 0; t0 < T; t0 += TA) {
         const int tt = std::min(TA, T - t0);
         // q_abs[t][h] = k_b_h q_nope[t][h]: k_b_h [kvl][nope] row-major
@@ -592,12 +601,12 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                     auto* ph = reinterpret_cast<__half*>(b.o);
                     const int start = pos0 + t0;
                     kb_mqa_queries<32><<<dim3(nb(32*576),tt),256,0,b.st>>>(b.qabs,qt,(int)qp_ld,QH,nope,th,start,scale,qh);
-                    kb_dsa_scores<<<dim3(16,tt),256,0,b.st>>>(qh,s.kv[il],cells,selected,groups,top_k,n_cap,start,s.g,b.qabs);
+                    kb_dsa_scores<<<dim3(16,tt),256,0,b.st>>>(qh,s.kv[il],cells,selected,groups,top_k,n_cap,start,s.g,b.qabs,dsa_half);
                     kb_dsa_probs<<<dim3(tt,4),256,0,b.st>>>(b.qabs,start,top_k,groups,n_cap,s.g,ph,b.part,CBW());
-                    kb_dsa_values<<<dim3(8,tt),256,0,b.st>>>(ph,s.kv[il],cells,selected,groups,top_k,n_cap,start,s.g,b.part,CBW());
+                    kb_dsa_values<<<dim3(8,tt),256,0,b.st>>>(ph,s.kv[il],cells,selected,groups,top_k,n_cap,start,s.g,b.part,CBW(),dsa_half);
                 } else kb_mqa_attn<32><<<tt, 256, mqa_smem<32>(), b.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], nullptr,
                                                                  cells, n_cap, b.pp, t0, win, S, s.g, nullptr, scale,
-                                                                 nullptr, b.part, CBW(), nullptr, 0, mqa_opt & 1, direct ? top_k : 0, groups, selected);
+                                                                 nullptr, b.part, CBW(), dsa_half, 0, mqa_opt & 1, direct ? top_k : 0, groups, selected);
                 ++b.step;
                 if (std::getenv("HY4F_CB32")) {
                     const size_t per = (size_t) tt * Hl * CBW();
