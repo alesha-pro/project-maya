@@ -1086,7 +1086,39 @@ __global__ void kd_add(const float* __restrict__ a, const float* __restrict__ b,
 __device__ __forceinline__ int art_g(int s, int s2) {   // index of G[s][s2] (s <= s2) among the 10
     return s == 0 ? s2 : s == 1 ? 3 + s2 : s == 2 ? 5 + s2 : 9;
 }
-template <bool FusedSend = false>
+// The existing X-dependent HC partials can run alongside the sublayer.
+__global__ void kd_art_prepare(const float* X, int n, int hc, HcNext nx, float* part) {
+    const int t=blockIdx.y,b=blockIdx.x,tid=threadIdx.x,i=b*256+tid;
+    float xs[4];
+#pragma unroll
+    for (int h=0;h<4;++h) xs[h]=h<hc ? X[((size_t)t*hc+h)*n+i] : 0.f;
+    __shared__ float sums[8][19];
+#pragma unroll
+    for (int j=0;j<8;++j) {
+        float a=0.f;
+        if (j<nx.n_mix)
+#pragma unroll
+            for (int h=0;h<4;++h)
+                if (h<hc) a+=nx.fn[((size_t)j*hc+h)*n+i]*xs[h];
+        const float w=warp_sum(a);
+        if ((tid&31)==0) sums[tid/32][j]=w;
+    }
+#pragma unroll
+    for (int h=0;h<4;++h)
+#pragma unroll
+        for (int j=h;j<4;++j) {
+            const float w=warp_sum(xs[h]*xs[j]);
+            if ((tid&31)==0) sums[tid/32][8+art_g(h,j)]=w;
+        }
+    __syncthreads();
+    if(tid<18) {
+        float v=0.f;
+#pragma unroll
+        for (int j=0;j<8;++j) v+=sums[j][tid];
+        part[((size_t)t*gridDim.x+b)*32+(tid<8?1+tid:9+tid)]=v;
+    }
+}
+template<bool FusedSend = false, bool Prepared = false>
 __global__ void __launch_bounds__(256) kd_art_a(const float* __restrict__ x1, const float* __restrict__ x2, int T, int n,
                                                 PeersD P, int me, int n_shards, int* counter, int* arrive,
                                                 const float* __restrict__ nw, const float* __restrict__ X,
@@ -1143,7 +1175,7 @@ __global__ void __launch_bounds__(256) kd_art_a(const float* __restrict__ x1, co
             for (int s2 = 0; s2 < 4; ++s2)
                 if (s2 < hc) {
                     const float f = nx.fn[(size_t) q * hc * n + (size_t) s2 * n + i];
-                    A += f * xs[s2];
+                    if constexpr (!Prepared) A += f * xs[s2];
                     B += pp[s2] * (f * yp);
                 }
         a[1 + q] = A;
@@ -1152,18 +1184,19 @@ __global__ void __launch_bounds__(256) kd_art_a(const float* __restrict__ x1, co
 #pragma unroll
     for (int s2 = 0; s2 < 4; ++s2)
 #pragma unroll
-        for (int s3 = s2; s3 < 4; ++s3) a[17 + art_g(s2, s3)] = xs[s2] * xs[s3];
+        for (int s3 = s2; s3 < 4; ++s3) if constexpr (!Prepared) a[17 + art_g(s2, s3)] = xs[s2] * xs[s3];
 #pragma unroll
     for (int s2 = 0; s2 < 4; ++s2) a[27 + s2] = xs[s2] * yp;
     a[31] = yp * yp;
     __shared__ float red[8][33];
 #pragma unroll
     for (int q = 0; q < 32; ++q) {
+        if constexpr (Prepared) if ((q >= 1 && q <= 8) || (q >= 17 && q <= 26)) continue;
         const float w = warp_sum(a[q]);
         if (lane == 0) red[wid][q] = w;
     }
     __syncthreads();
-    if (tid < 32) {
+    if (tid < 32 && (!Prepared || !((tid >= 1 && tid <= 8) || (tid >= 17 && tid <= 26)))) {
         float w = 0.0f;
         for (int k = 0; k < (int) (blockDim.x >> 5); ++k) w += red[k][tid];
         part[((size_t) t * nbk + b) * 32 + tid] = w;

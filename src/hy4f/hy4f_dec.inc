@@ -65,6 +65,8 @@ struct DecodeGraph {
 };
 
 struct DShard {
+    cudaStream_t hc_side = nullptr;
+    cudaEvent_t hc_fork = nullptr, hc_join = nullptr;
     cudaStream_t attention_side = nullptr;
     cudaEvent_t attention_fork = nullptr, attention_join = nullptr;
     cudaStream_t side = nullptr;
@@ -196,6 +198,11 @@ void dec_alloc(Shard& s, DShard& d) {
     d.xq = qa((size_t) DT * std::max({2 * E, Hmax / S * vh, n_ff / S, ncol * eg_D, latent}));
     d.xlq = qa((size_t) DT * K * latent);
     d.q16 = qa((size_t) DT * K * n_ffx);
+    if (std::getenv("HY4F_HC_OVERLAP") && !std::getenv("HY4F_AR1") && E == 3072 && !ll_overlap && !tail_old) {
+        HY_CK(cudaStreamCreateWithFlags(&d.hc_side,cudaStreamNonBlocking));
+        HY_CK(cudaEventCreateWithFlags(&d.hc_fork,cudaEventDisableTiming));
+        HY_CK(cudaEventCreateWithFlags(&d.hc_join,cudaEventDisableTiming));
+    }
     if (std::getenv("HY4F_ATTN_OVERLAP")) {
         HY_CK(cudaStreamCreateWithFlags(&d.attention_side, cudaStreamNonBlocking));
         HY_CK(cudaEventCreateWithFlags(&d.attention_fork, cudaEventDisableTiming));
@@ -243,6 +250,12 @@ HcNext hc_next(Shard& s, const std::string& P, const std::string& k, const std::
     return n;
 }
 bool fuse_ok() const { return E == 3072 && hc <= 4 && !std::getenv("HY4F_NO_FUSE"); }
+void d_hc_prepare(Shard& s, DShard& d, const HcNext& nx, int T) {
+    HY_CK(cudaEventRecord(d.hc_fork,s.st));
+    HY_CK(cudaStreamWaitEvent(d.hc_side,d.hc_fork));
+    kd_art_prepare<<<dim3(E/256,T),256,0,d.hc_side>>>(d.X,E,hc,nx,d.tpart);
+    HY_CK(cudaEventRecord(d.hc_join,d.hc_side));
+}
 void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::string& norm, int T, bool mtp,
           const HcNext* nx = nullptr) {
     float* X = mtp ? d.mr : d.X;
@@ -275,8 +288,9 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
         for (int r = 1; r < S; ++r)
             kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, (s.g + r) % S, d.ar_ctr, d.arrive);
     if (nx && !mtp && E % 256 == 0 && E / 256 <= 16 && !tail_old) {   // (two wide kernels)
-        if (!overlap) kd_art_a<false><<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), d.X, d.post,
+        if (!overlap) (d.hc_side ? kd_art_a<false,true> : kd_art_a<false,false>)<<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), d.X, d.post,
                                                      hc, *nx, d.ysc, d.tpart, d.tppost);
+        if (d.hc_side) HY_CK(cudaStreamWaitEvent(s.st,d.hc_join));
         kd_art_b<<<dim3(E / 256, T), 256, 0, s.st>>>(E, f32(s, norm), eps, d.X, d.post, hc, *nx, hc_eps, d.ysc, d.tpart, d.tppost,
                                                      d.x, d.xq, overlap ? d.ar_ctr : nullptr);
     } else if (nx && !mtp)
@@ -330,6 +344,8 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         else d_norm_in(s, d, P, "hc_attn", P + "attn_norm.weight", 2 * hc, hc_mag, T);
         k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
     }
+    if (d.hc_side && !mtp && fuse_ok())
+        d_hc_prepare(s,d,hc_next(s,P,"hc_ffn",P+"ffn_norm.weight",2*hc,hc_mag),T);
     dec_mmvq(s, P + "xproj", d.xq, d.xp, T);
     // KV and the pooled index keys depend only on xproj. Compute them on
     // another graph branch during the query projection and absorption.
@@ -481,6 +497,7 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         else d_norm_in(s, d, P, "hc_ffn", P + "ffn_norm.weight", 2 * hc, hc_mag, T);
         k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
     }
+    if (d.hc_side && !mtp && nx_after) d_hc_prepare(s,d,*nx_after,T);
     if (il < dense_lead) {
         const int fl = n_ff / S;
         dec_mmvq(s, P + "dense_gu", d.xq, d.ga, T);
