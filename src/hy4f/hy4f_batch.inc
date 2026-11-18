@@ -52,6 +52,7 @@ struct BShard {
 };
 std::vector<BShard> bsh;
 int score_tile = 64;
+int dma_mask = std::getenv("HY4F_PF_DMA") ? std::atoi(std::getenv("HY4F_PF_DMA")) : 0;   // RS=1, AG=2, DSA=4, residual=8
 bool paired = !std::getenv("HY4F_RING_PUSH");   // exchanges in XOR-paired phases (S a power of two)
 int peer_of(int g, int r) const { return paired && (S & (S - 1)) == 0 ? (g ^ r) : (g + r) % S; }
 int cap_num = 3, cap_den = 2;   // expert rows buffered per shard: cap_num/cap_den x the even share (ranges past it)
@@ -109,7 +110,9 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.dbounds = m.take<int>(4);   // {0, T, pos0, -}
         b.iota = m.take<int>((size_t) T * K + strata::prefill::mmq::IDS_PAD);
         b.toks = m.take<int>(T);
-        b.xq = m.take<uint8_t>(q8a);
+        const size_t pack_rs = (dma_mask & 1) ? (size_t)T * E * sizeof(__nv_bfloat16) : 0;
+        const size_t pack_cb = (dma_mask & 4) ? (size_t)TA * Hd * CB_SLOT : 0;
+        b.xq = m.take<uint8_t>(std::max({q8a, pack_rs, pack_cb}));
         b.xq2 = m.take<uint8_t>(q8a);
         b.X = m.take<float>((size_t) T * hc * E);
         b.R = b.X;   // (X = R + post * y and R = X: the same values everywhere in the batched path)
@@ -284,6 +287,16 @@ void bgemm(BShard& b, int m, int n, int k, const float* A, int lda, long long sA
                                     sC, batch));
 }
 
+void b_copy(Shard& s, BShard& b, Peers& P, int j, const void* src, size_t offset, size_t len) {
+    auto dst = reinterpret_cast<uint8_t*>(P.buf[j][b.step & 1]) + offset;
+    if (len && j == s.g)
+        HY_CK(cudaMemcpyAsync(dst, src, len, cudaMemcpyDeviceToDevice, b.st));
+    else if (len)
+        HY_CK(cudaMemcpyPeerAsync(dst, sh[j].dev, src, s.dev, len, b.st));
+    kb_copy_done<<<1, 32, 0, b.st>>>(P.flag[j], s.g, b.step);
+    if (paired && j != s.g) kb_wait_one<<<1, 32, 0, b.st>>>(P, s.g, j, b.step);
+}
+
 // all-reduce of y [T][E] then RMS * w, X = R + post * y: reduce-scatter (bf16) by token slices, all-gather (fp16)
 void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int T) {
     float* X = b.mtp ? b.mr : b.X;
@@ -295,23 +308,44 @@ void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int
     }
     const int ts = (T + S - 1) / S, blocks = std::min(nb(ts * E / 8, 512), 160);
     ++b.step;
-    kb_rs_push<<<blocks, 512, 0, b.st>>>(y, T, E, ts, b.ar, s.g, b.step, b.ctr, s.g);   // (this shard's own slice)
-    for (int r = 1; r < S; ++r) {
-        const int j = peer_of(s.g, r);
-        kb_rs_push<<<blocks, 512, 0, b.st>>>(y, T, E, ts, b.ar, s.g, b.step, b.ctr, j);
-        if (paired) kb_wait_one<<<1, 32, 0, b.st>>>(b.ar, s.g, j, b.step);
+    if (dma_mask & 1) {
+        auto pack = reinterpret_cast<__nv_bfloat162*>(b.xq);
+        kb_rs_pack<<<nb(T * E / 2), 256, 0, b.st>>>(y, pack, T * E / 2);
+        for (int r = 0; r < S; ++r) {
+            const int j = peer_of(s.g, r), row = std::min(T, j * ts);
+            const int nr = std::min(ts, T - row);
+            b_copy(s, b, b.ar, j, reinterpret_cast<uint8_t*>(pack) + (size_t)row * E * 2,
+                   (size_t)s.g * ts * E * 2, (size_t)nr * E * 2);
+        }
+    } else {
+        kb_rs_push<<<blocks, 512, 0, b.st>>>(y, T, E, ts, b.ar, s.g, b.step, b.ctr, s.g);   // (this shard's own slice)
+        for (int r = 1; r < S; ++r) {
+            const int j = peer_of(s.g, r);
+            kb_rs_push<<<blocks, 512, 0, b.st>>>(y, T, E, ts, b.ar, s.g, b.step, b.ctr, j);
+            if (paired) kb_wait_one<<<1, 32, 0, b.st>>>(b.ar, s.g, j, b.step);
+        }
     }
     kb_wait_k<<<1, 32, 0, b.st>>>(b.ar, s.g, S, b.step);
     kb_rs_post<<<ts, 1024, 0, b.st>>>(T, E, ts, b.ar, s.g, S, b.step, f32(s, norm), eps, b.yn);
     ++b.step;
-    kb_ag_push<<<blocks, 512, 0, b.st>>>(b.yn, T, E, ts, b.ag, s.g, b.step, b.ctr + 8, s.g);
-    for (int r = 1; r < S; ++r) {
-        const int j = peer_of(s.g, r);
-        kb_ag_push<<<blocks, 512, 0, b.st>>>(b.yn, T, E, ts, b.ag, s.g, b.step, b.ctr + 8, j);
-        if (paired) kb_wait_one<<<1, 32, 0, b.st>>>(b.ag, s.g, j, b.step);
+    if (dma_mask & 2) {
+        const int row = std::min(T, s.g * ts), nr = std::min(ts, T - row);
+        for (int r = 0; r < S; ++r)
+            b_copy(s, b, b.ag, peer_of(s.g, r), b.yn, (size_t)row * E * 2, (size_t)nr * E * 2);
+    } else {
+        kb_ag_push<<<blocks, 512, 0, b.st>>>(b.yn, T, E, ts, b.ag, s.g, b.step, b.ctr + 8, s.g);
+        for (int r = 1; r < S; ++r) {
+            const int j = peer_of(s.g, r);
+            kb_ag_push<<<blocks, 512, 0, b.st>>>(b.yn, T, E, ts, b.ag, s.g, b.step, b.ctr + 8, j);
+            if (paired) kb_wait_one<<<1, 32, 0, b.st>>>(b.ag, s.g, j, b.step);
+        }
     }
     kb_wait_k<<<1, 32, 0, b.st>>>(b.ag, s.g, S, b.step);
-    kb_ag_post<<<T, 1024, 0, b.st>>>(E, b.ag, s.g, S, b.step, X, X, post, hcn);
+    if ((dma_mask & 8) && E % 4 == 0)
+        kb_ag_residual<<<dim3(nb(E / 4), T, hcn), 256, 0, b.st>>>(
+            reinterpret_cast<const __half*>(b.ag.buf[s.g][b.step & 1]), X, post, E, hcn);
+    else
+        kb_ag_post<<<T, 1024, 0, b.st>>>(E, b.ag, s.g, S, b.step, X, X, post, hcn);
 }
 
 void b_norm_in(Shard& s, BShard& b, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
@@ -455,11 +489,21 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                     kb_combine<<<tt, 512, 0, b.st>>>(kvl, CBW(), s.g * Hl, Hl, sinks, b.cb, s.g, S, b.step, per, b.o);
                 } else {   // fp16 slots: half the bytes (the local partial goes through the same path)
                     const int blocks = std::min(nb(tt * Hl * 256, 512), 160);
-                    kb_push_cb16<<<blocks, 512, 0, b.st>>>(b.part, tt, Hd, CBW(), Hl, b.cb, s.g, b.step, b.ctr + 4, s.g);
-                    for (int r = 1; r < S; ++r) {
-                        const int j = peer_of(s.g, r);
-                        kb_push_cb16<<<blocks, 512, 0, b.st>>>(b.part, tt, Hd, CBW(), Hl, b.cb, s.g, b.step, b.ctr + 4, j);
-                        if (paired) kb_wait_one<<<1, 32, 0, b.st>>>(b.cb, s.g, j, b.step);
+                    if (dma_mask & 4) {
+                        auto pack = reinterpret_cast<uint8_t*>(b.xq);
+                        kb_pack_cb16<<<dim3(tt,Hd), 256, 0, b.st>>>(b.part, tt, Hd, CBW(), Hl, pack);
+                        const size_t len = (size_t)tt * Hl * CB_SLOT;
+                        for (int r = 0; r < S; ++r) {
+                            const int j = peer_of(s.g, r);
+                            b_copy(s, b, b.cb, j, pack + (size_t)j * len, (size_t)s.g * len, len);
+                        }
+                    } else {
+                        kb_push_cb16<<<blocks, 512, 0, b.st>>>(b.part, tt, Hd, CBW(), Hl, b.cb, s.g, b.step, b.ctr + 4, s.g);
+                        for (int r = 1; r < S; ++r) {
+                            const int j = peer_of(s.g, r);
+                            kb_push_cb16<<<blocks, 512, 0, b.st>>>(b.part, tt, Hd, CBW(), Hl, b.cb, s.g, b.step, b.ctr + 4, j);
+                            if (paired) kb_wait_one<<<1, 32, 0, b.st>>>(b.cb, s.g, j, b.step);
+                        }
                     }
                     kb_wait_k<<<1, 32, 0, b.st>>>(b.cb, s.g, S, b.step);
                     kb_combine16<<<tt, 256, 0, b.st>>>(kvl, s.g * Hl, Hl, sinks, b.cb, s.g, S, b.step, tt, b.o);

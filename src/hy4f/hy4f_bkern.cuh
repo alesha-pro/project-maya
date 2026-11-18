@@ -713,6 +713,42 @@ __global__ void kb_combine(int kvl, int W, int h0, int Hl, const float* sinks_al
 }
 // ---- the all-reduce as reduce-scatter (bf16 partials) + all-gather (fp16 normalized rows), by token slices: shard j
 // owns tokens [j*ts, min(T, (j+1)*ts)).  ~1/8 of the fp32 push-to-everyone traffic.
+// Stage contiguous local payloads for the PCIe copy engines. All numeric conversions
+// have the same order and rounding as the direct-to-peer push kernels.
+__global__ void kb_rs_pack(const float* __restrict__ y, __nv_bfloat162* __restrict__ dst, int pairs) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < pairs) {
+        const float2 v = reinterpret_cast<const float2*>(y)[i];
+        dst[i] = __floats2bfloat162_rn(v.x, v.y);
+    }
+}
+__global__ void kb_pack_cb16(const float* __restrict__ part, int T, int H, int W, int Hl, uint8_t* __restrict__ dst) {
+    const int t = blockIdx.x, h = blockIdx.y, c = threadIdx.x;
+    const int peer = h / Hl, hl = h % Hl;
+    const float* row = part + ((size_t) t * H + h) * W;
+    uint8_t* out = dst + (((size_t) peer * T + t) * Hl + hl) * CB_SLOT;
+    const float L = row[513], inv = L > 0.0f ? 1.0f / L : 0.0f;
+    const float2 v = reinterpret_cast<const float2*>(row)[c];
+    reinterpret_cast<__half2*>(out)[c] = __floats2half2_rn(v.x * inv, v.y * inv);
+    if (c == 0) *reinterpret_cast<float2*>(out + 1024) = make_float2(row[512], L);
+}
+// The preceding D2D copy and this kernel are ordered by the source stream.
+__global__ void kb_copy_done(int* peer_flags, int from, int step) {
+    if (threadIdx.x == 0) reinterpret_cast<volatile int*>(peer_flags)[from] = step;
+}
+__global__ void kb_ag_residual(const __half* __restrict__ yn, float* __restrict__ X,
+                               const float* __restrict__ post, int E, int hc) {
+    const int t = blockIdx.y, h = blockIdx.z;
+    const int i = (blockIdx.x * blockDim.x + threadIdx.x) * 4;
+    if (i >= E) return;
+    const size_t col = (size_t)t * E + i;
+    const __half2* y = reinterpret_cast<const __half2*>(yn + col);
+    const float2 a = __half22float2(y[0]), b = __half22float2(y[1]);
+    float4* dst = reinterpret_cast<float4*>(X + ((size_t)t * hc + h) * E + i);
+    const float4 v = *dst;
+    const float w = post[t * 8 + h];
+    *dst = make_float4(v.x + w * a.x, v.y + w * a.y, v.z + w * b.x, v.w + w * b.y);
+}
 // RS push to peer j: rows of j's slice of y [T][E] (fp32) as bf16 into j's area [me][ts][E]
 __global__ void kb_rs_push(const float* y, int T, int E, int ts, Peers P, int me, int step, int* arrive, int j) {
     const int r0 = j * ts, nr = max(0, min(T, r0 + ts) - r0);
