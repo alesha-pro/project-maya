@@ -863,7 +863,9 @@ __global__ void __launch_bounds__(1024) kb_hc_norm_fused(float* X, const __half*
     const int g = tid / Subgroup, local = tid % Subgroup, warp = local / 32;
     const int col = g * Chunk + local;
     X += (size_t)t * H * E;
-    float keep[H][3];
+    // Keeping two streams in shared memory avoids register spills at 1024 threads.
+    __shared__ float shared_x[2 * E];
+    float keep[H - 2][3];
 #pragma unroll
     for (int h = 0; h < H; ++h) {
         const int seg = h * 4 + g;
@@ -877,7 +879,8 @@ __global__ void __launch_bounds__(1024) kb_hc_norm_fused(float* X, const __half*
                 v += weight * __half2float(yn[(size_t)t * E + c]);
                 X[i] = v;
             }
-            keep[h][j] = v;
+            if (h < 2) shared_x[h * E + c] = v;
+            else keep[h - 2][j] = v;
             sq += v * v;
 #pragma unroll
             for (int r = 0; r < 8; ++r)
@@ -916,7 +919,9 @@ __global__ void __launch_bounds__(1024) kb_hc_norm_fused(float* X, const __half*
     for (int j = 0; j < 3; ++j) {
         float v = 0;
 #pragma unroll
-        for (int h = 0; h < H; ++h) v += pre[h] * keep[h][j];
+        for (int h = 0; h < H; ++h) {
+            v += pre[h] * (h < 2 ? shared_x[h * E + col + j * Subgroup] : keep[h - 2][j]);
+        }
         sm.cur[col + j * Subgroup] = v;
     }
     __syncthreads();

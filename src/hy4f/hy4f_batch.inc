@@ -394,20 +394,15 @@ void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int
 
 void b_norm_in(Shard& s, BShard& b, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
                float mag, int T, size_t t0 = 0) {
-    if (fuse_hc && hc == 4 && E == 3072 && HC_SPLIT == 16 && mbs.empty()) {
+    if (b.pending_ag) {
         float* X = b.X + t0 * hc * E;
         const float* fn = f32(s, P + k + "_fn.weight");
         const float* scale = f32(s, P + k + "_scale.weight");
         const float* base = f32(s, P + k + "_base.weight");
         const float* nw = f32(s, norm);
-        if (b.pending_ag) {
-            kb_hc_norm_fused<true><<<T, 1024, 0, b.st>>>(X, b.pending_ag + t0 * E, b.post + t0 * 8,
-                fn, scale, base, nw, n_mix, eps, hc_eps, mag, b.x, b.post);
-            b.pending_ag = nullptr;
-        } else {
-            kb_hc_norm_fused<false><<<T, 1024, 0, b.st>>>(X, nullptr, nullptr, fn, scale, base, nw,
-                n_mix, eps, hc_eps, mag, b.x, b.post);
-        }
+        kb_hc_norm_fused<true><<<T, 1024, 0, b.st>>>(X, b.pending_ag + t0 * E, b.post + t0 * 8,
+            fn, scale, base, nw, n_mix, eps, hc_eps, mag, b.x, b.post);
+        b.pending_ag = nullptr;
         return;
     }
     const float* X = b.X + t0 * hc * E;
