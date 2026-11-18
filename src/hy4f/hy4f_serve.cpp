@@ -619,7 +619,8 @@ int serve(Model& m, const ServeOptions& so) {
             saved_prompt = 0;
             from = std::min(from, n - 1);
         }
-        const int64_t kept = m.rewind((int64_t) from, err, full_hit);
+        bool ring_cold_aligned = false;
+        const int64_t kept = m.rewind((int64_t) from, err, full_hit, host_keys.enabled() ? &ring_cold_aligned : nullptr);
         if (kept < 0) fatal("rewind: " + err, 0, n);
         if ((size_t) kept != from)
             std::fprintf(stderr, "maya hy4f serve: the prompt departs from the cache at %zu (the rings no longer hold it): "
@@ -647,7 +648,8 @@ int serve(Model& m, const ServeOptions& so) {
             }
         }
         // Capture only a lineage that used the same 2048-token chunk boundaries as a cold prefill.
-        const size_t host_checkpoint = text_cache && (from == 0 || host_restored) ? HostPrefixIndex::checkpoint(n) : 0;
+        const bool cold_aligned = text_cache && (from == 0 || host_restored || ring_cold_aligned);
+        const size_t host_checkpoint = cold_aligned ? HostPrefixIndex::checkpoint(n) : 0;
         state.resize(from);
         held.erase(std::remove_if(held.begin(), held.end(), [&](const Held& q) { return q.start + q.n > (long long) from; }),
                    held.end());
@@ -718,7 +720,7 @@ int serve(Model& m, const ServeOptions& so) {
                 }
             }
             if (prefix_mark && a >= 2*(size_t)CH && a%CH == 0 && a<n && n-a <= (size_t)CH) {
-                if (!m.mark_prefix(err)) {
+                if (!m.mark_prefix(err, cold_aligned)) {
                     std::fprintf(stderr,"maya hy4f serve: prefix checkpoint unavailable (%s)\n",err.c_str());
                     prefix_mark=false;
                 }
@@ -739,7 +741,7 @@ int serve(Model& m, const ServeOptions& so) {
             std::fflush(stdout);
             continue;
         }
-        if (mark_ok && !full_hit && !m.mark(err, from % CH == 0 && n % CH == 0)) {   // (the rings at the prompt's end: the next turn may go back here)
+        if (mark_ok && !full_hit && !m.mark(err, from % CH == 0 && n % CH == 0, cold_aligned && n % CH == 0)) {   // (the rings at the prompt's end: the next turn may go back here)
             std::fprintf(stderr, "maya hy4f serve: no copy of the rings (%s) - a turn that departs from the answer "
                                  "reads its prompt again\n", err.c_str());
             mark_ok = false;

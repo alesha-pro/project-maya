@@ -1428,6 +1428,7 @@ bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
 // pooled groups and indexer ring: its ring is copied and restored with the trunk's; elsewhere it is best effort - a
 // stale MTP row only costs draft acceptance, never a token (every draft is verified by the trunk).
 struct Model::Snap {
+    bool cold_aligned = false;  // host cache provenance for exact 2048-token continuations
     bool aligned_start = false;
     int64_t pos = -1;                                   // the position mark() copied at (-1: none)
     std::vector<int> devices;
@@ -1457,6 +1458,7 @@ std::pair<void*, size_t> serve_ring(Shard& s, int il, bool sw, int win, int kpoo
 }  // namespace
 
 struct Model::PrefixSnap {
+    bool cold_aligned = false;
     std::vector<uint8_t*> buffers;
     ~PrefixSnap() { for (auto* p : buffers) if (p) cudaFreeHost(p); }
 };
@@ -1580,12 +1582,13 @@ bool Model::load_host_prefix(int i, int64_t pos, std::string& err) {
     } catch (const std::exception& e) { err = e.what(); return false; }
 }
 
-bool Model::mark_prefix(std::string& err) {
+bool Model::mark_prefix(std::string& err, bool cold_aligned) {
     prefix_pos_=-1;
     try {
         if(d_->bsh.empty() || d_->pos_next<=0) return true;
         transfer_prefix(true);
         prefix_pos_=d_->pos_next;
+        prefix_->cold_aligned = cold_aligned;
         return true;
     } catch(const std::exception& e) {
         err=e.what();
@@ -1593,7 +1596,7 @@ bool Model::mark_prefix(std::string& err) {
     }
 }
 
-bool Model::mark(std::string& err, bool aligned_start) {
+bool Model::mark(std::string& err, bool aligned_start, bool cold_aligned) {
     try {
         Impl& d = *d_;
         const int Lm = d.L + (d.has_mtp ? 1 : 0);
@@ -1632,6 +1635,7 @@ bool Model::mark(std::string& err, bool aligned_start) {
         }
         snap_->pos = d.pos_next;
         snap_->aligned_start = aligned_start;
+        snap_->cold_aligned = cold_aligned;
         return true;
     } catch (const std::exception& e) {
         if (snap_) snap_->pos = -1;
@@ -1640,7 +1644,8 @@ bool Model::mark(std::string& err, bool aligned_start) {
     }
 }
 
-int64_t Model::rewind(int64_t pos, std::string& err, bool restore_prompt) {
+int64_t Model::rewind(int64_t pos, std::string& err, bool restore_prompt, bool* cold_aligned) {
+    if (cold_aligned) *cold_aligned = false;
     try {
         Impl& d = *d_;
         const int Lm = d.L + (d.has_mtp ? 1 : 0);
@@ -1679,6 +1684,9 @@ int64_t Model::rewind(int64_t pos, std::string& err, bool restore_prompt) {
                     HY_CK(cudaSetDevice(s.dev));
                     HY_CK(cudaStreamSynchronize(s.st));
                 }
+                if (cold_aligned && pos == m && snap_->cold_aligned &&
+                    (!d.has_mtp || snap_->rows[0].count(Lm)))
+                    *cold_aligned = true;
                 hw_ = m;                                // (the rings as they were at m)
             } else if (can_round) {
                 pos = down;                             // (the indexer group's start: < kpool tokens read again)
@@ -1686,6 +1694,7 @@ int64_t Model::rewind(int64_t pos, std::string& err, bool restore_prompt) {
                 transfer_prefix(false);
                 pos=prefix_pos_;
                 hw_=pos;
+                if (cold_aligned) *cold_aligned = prefix_->cold_aligned;
             } else {
                 pos = 0;
             }

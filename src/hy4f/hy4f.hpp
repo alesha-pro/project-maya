@@ -88,15 +88,15 @@ public:
     /// past it aliases a row it needs) or where mark()'s copy does, else the start of pos's indexer group where that is
     /// enough, else 0.  The MTP layer's caches follow best effort (a stale row only costs draft acceptance).  Returns
     /// the position kept (<= pos), -1 on a CUDA error (err).
-    int64_t rewind(int64_t pos, std::string& err, bool restore_prompt = false);
+    int64_t rewind(int64_t pos, std::string& err, bool restore_prompt = false, bool* cold_aligned = nullptr);
     /// back to position 0 (no copy: the caches are overwritten as the positions come again)
     void reset();
     /// copy the rings (trunk and MTP layer) as they are now (the prompt read, before the answer): a later rewind to
     /// this position, or to the one before it, gets them back - the next turn of a chat whose template drops the
     /// answer's reasoning
-    bool mark(std::string& err, bool aligned_start = false);
+    bool mark(std::string& err, bool aligned_start = false, bool cold_aligned = false);
     // Save one chunk-aligned prefix before a long prompt's tail.
-    bool mark_prefix(std::string& err);
+    bool mark_prefix(std::string& err, bool cold_aligned = false);
     // Complete, bounded text-prefix snapshots, independent of the current sequence on the GPUs.
     bool save_host_prefix(int slot, std::string& err);
     bool load_host_prefix(int slot, int64_t pos, std::string& err);
