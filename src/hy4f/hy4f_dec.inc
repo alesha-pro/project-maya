@@ -92,7 +92,7 @@ struct DShard {
     float* ar_buf[2] = {nullptr, nullptr};
     float* cb_buf[2] = {nullptr, nullptr};
     int *ar_flag = nullptr, *cb_flag = nullptr, *ar_ctr = nullptr, *cb_ctr = nullptr, *arrive = nullptr;
-    PeersD ar{}, cb{};
+    PeersD ar{}, cb{}, head_cb{};
     DecodeGraph gv[DT + 1], gm[DT + 1], gc;  // verify(T), mtp(T), chained MTP
 };
 std::vector<DShard> dsh;
@@ -223,7 +223,7 @@ void dec_alloc(Shard& s, DShard& d) {
     d.ysc = dalloc((size_t) DT * E);
     d.tpart = dalloc((size_t) DT * 16 * 32);
     d.tppost = dalloc((size_t) DT * 4);
-    d.cb_flag = ia(4);
+    d.cb_flag = ia(std::getenv("HY4F_HEAD_SEND") ? 4+DT*Hd : 4);
     d.ar_ctr = ia(1);
     d.cb_ctr = ia(1);
     d.arrive = ia(16);   // [0..4] all-reduce pushes / tail, [8..12] combine
@@ -399,7 +399,10 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         if (split && Hl == 16) {
             kd_mqa_dec<16><<<dim3(NSP, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
                                                                        win, 1, 0, scale, d.spm, d.spl, d.spacc);
-            kd_mqa_merge<<<dim3(Hl, T), 256, 0, s.st>>>(d.spm, d.spl, d.spacc, NSP, Hl,
+            if (std::getenv("HY4F_MQA_FOLD"))
+                kd_mqa_fold<false><<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hl,
+                    f32(s,P+"attn_sinks.weight")+s.g*Hl,d.o,nullptr,0,d.cb,s.g,S,nullptr);
+            else kd_mqa_merge<<<dim3(Hl, T), 256, 0, s.st>>>(d.spm, d.spl, d.spacc, NSP, Hl,
                                                         f32(s, P + "attn_sinks.weight") + s.g * Hl, d.o, nullptr, 0);
         } else {
             kb_attn2<<<dim3(Hl, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, nullptr, 0, pp, win, 1,
@@ -443,13 +446,21 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                 (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>)<<<dim3(NSP, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
                                                                            n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
                                                                            d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail);
-                kd_mqa_merge<<<dim3(Hd, T), 256, 0, s.st>>>(d.spm, d.spl, d.spacc, NSP, Hd, nullptr, nullptr, d.part, CBW());
+                if (std::getenv("HY4F_HEAD_SEND")) {
+                    kd_mqa_fold<true><<<dim3(Hd,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hd,nullptr,nullptr,
+                                                               d.part,CBW(),d.head_cb,s.g,S,d.cb_ctr);
+                } else if (std::getenv("HY4F_MQA_FOLD")) {
+                    kd_mqa_fold<false><<<dim3(Hd,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hd,nullptr,nullptr,
+                                                                d.part,CBW(),d.cb,s.g,S,nullptr);
+                } else kd_mqa_merge<<<dim3(Hd, T), 256, 0, s.st>>>(d.spm, d.spl, d.spacc, NSP, Hd, nullptr, nullptr, d.part, CBW());
             } else {
                 kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp,
                                                         win, S, s.g, nullptr, scale, nullptr, d.part, Hd);
             }
-            PeersD cb = d.cb;
-            if (std::getenv("HY4F_CB_DMA") && push_seq) {
+            const bool sent = split && Hd==32 && std::getenv("HY4F_HEAD_SEND");
+            PeersD cb = sent ? d.head_cb : d.cb;
+            if (sent) { /* kd_mqa_fold published each remote head. */ }
+            else if (std::getenv("HY4F_CB_DMA") && push_seq) {
                 // This exchange is followed by a blocking residual reduction
                 // on every rank. A single receive slot therefore suffices.
                 const size_t slice = (size_t) Hl * CBW();
@@ -478,7 +489,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                     kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd, CBW(), Hl, d.cb, s.g,
                                                                (s.g + r) % S, d.cb_ctr, d.arrive + 8);
             kd_cb_tail<<<T * Hl, 256, 0, s.st>>>(d.part, T, Hd, kvl, CBW(), s.g * Hl, Hl, f32(s, P + "attn_sinks.weight"),
-                                                 cb, s.g, S, d.cb_ctr, d.arrive + 12, d.o);
+                                                 cb, s.g, S, d.cb_ctr, d.arrive + 12, d.o, sent);
         } else {
             kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp, win,
                                                     1, 0, f32(s, P + "attn_sinks.weight"), scale, d.o, nullptr, Hd);
@@ -699,7 +710,10 @@ void dec_setup() {
     // (decode all-reduce partials in BF16 like the prefill's reduce-scatter: half the PCIe bytes; HY4F_AR_F32 = F32)
     ar.bf = push_seq && !push_all && !push_one && !std::getenv("HY4F_AR1") && !std::getenv("HY4F_AR_F32") ? 1 : 0;
     if (ar.bf && !std::getenv("HY4F_AR_FLAGS")) ar.bf = 2;   // (LL: 2 BF16 + the step per 8-byte store, no fence/flag)
-    for (auto& d : dsh) d.ar = ar, d.cb = cb;
+    for (auto& d : dsh) {
+        d.ar=ar; d.cb=cb; d.head_cb=cb;
+        for (int j=0;j<S;++j) d.head_cb.flag[j]=dsh[j].cb_flag+4;
+    }
     if (df_nl) df_setup();
     kn::native_mmvq_set_multi_exact(false);   // (one weight read for the T columns; set before the captures)
     for (auto& s : sh) {

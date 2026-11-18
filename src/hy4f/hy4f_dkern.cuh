@@ -453,9 +453,21 @@ __global__ void kd_cb_publish(int* flag, int me, const int* counter) {
 // combine tail: block b = (t, hl)
 __global__ void kd_cb_tail(const float* __restrict__ part, int T, int H, int kvl, int W, int h0, int Hl,
                            const float* __restrict__ sinks_all, PeersD P, int me, int n_shards, int* counter, int* arrive,
-                           float* __restrict__ o) {
+                           float* __restrict__ o, bool head_flags = false) {
     const int step = counter[0] + 1, slice = Hl * W, per = T * slice;
-    kd_wait_peers(P, me, n_shards, step);
+    if (head_flags) {
+        if ((int)threadIdx.x < n_shards && (int)threadIdx.x != me) {
+            const int* signal=P.flag[me]+blockIdx.x*n_shards+threadIdx.x;
+            const auto begin=hy4f_now();
+            int value;
+            do {
+                asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(value) : "l"(signal) : "memory");
+                if(value==step) break;
+                hy4f_spin_guard(begin);
+            } while(true);
+        }
+        __syncthreads();
+    } else kd_wait_peers(P, me, n_shards, step);
     const int t = blockIdx.x / Hl, hl = blockIdx.x % Hl, h = h0 + hl;
     const float* rv = P.buf[me][step & 1];
     auto at = [&](int j, int c) -> float {

@@ -475,6 +475,58 @@ __global__ void kd_mqa_merge(const float* __restrict__ pm, const float* __restri
 }
 
 
+// Compute each split's exponential once per head. The denominator and the
+// value sum preserve consecutive split order; only the maximum is parallel.
+template<bool Send>
+__global__ void kd_mqa_fold(const float* pm, const float* pl, const float* acc, int nsp, int H,
+                            const float* sinks, float* output, float* part, int W, PeersD peers,
+                            int me, int ranks, const int* counter) {
+    const int h=blockIdx.x,t=blockIdx.y,tid=threadIdx.x;
+    __shared__ float factor[32], maxval, denominator;
+    __shared__ int active;
+    if(tid<32) {
+        size_t i=((size_t)t*nsp+tid)*H+h;
+        const float m=tid<nsp?pm[i]:-INFINITY;
+        const float l=tid<nsp?pl[i]:0.f;
+        const int live=32-__clz(__ballot_sync(~0u,m!=-INFINITY));
+        const float mx=fmaxf(warp_max(m),sinks?sinks[h]:-INFINITY);
+        const float f=m==-INFINITY?0.f:__expf(m-mx);
+        factor[tid]=f;
+        float den=sinks && mx!=-INFINITY?__expf(sinks[h]-mx):0.f;
+        for(int j=0;j<live;++j) {
+            const float fj=__shfl_sync(~0u,f,j), lj=__shfl_sync(~0u,l,j);
+            den+=fj*lj;
+        }
+        if(tid==0) { active=live; maxval=mx; denominator=den; }
+    }
+    __syncthreads();
+    int dest=me, hl=0, step=0;
+    float* row=part ? part+((size_t)t*H+h)*W : nullptr;
+    if constexpr (Send) {
+        const int local_heads=H/ranks;
+        dest=h/local_heads; hl=h%local_heads;
+        step=*counter+1;
+        if(dest!=me) row=peers.buf[dest][step&1]+(((size_t)me*gridDim.y+t)*local_heads+hl)*W;
+    }
+    for(int c=tid;c<512;c+=blockDim.x) {
+        float x=0.f;
+        for(int j=0;j<active;++j) x+=factor[j]*acc[(((size_t)t*nsp+j)*H+h)*512+c];
+        if(sinks) output[((size_t)t*H+h)*512+c]=x/denominator;
+        else row[c]=x;
+    }
+    if(!sinks && tid==0) { row[512]=maxval; row[513]=denominator; }
+    if constexpr (Send) {
+        if(dest!=me) {
+            __threadfence_system();
+            __syncthreads();
+            if(tid==0) {
+                int* signal=peers.flag[dest]+(t*(H/ranks)+hl)*ranks+me;
+                asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(signal), "r"(step) : "memory");
+            }
+        }
+    }
+}
+
 // ---- the k-pool indexer scores on tensor cores: score[tt][g] = sum_h relu(q[t][h] . k[g]) * w[t][h] for the score
 // tile's tokens tt = 0 .. tt_n-1 (token t0 + tt) and the pooled groups g < pos / kpool.  Block (gs, tb): tokens
 // tb*8 .. tb*8+7 (warp = token: its 16 heads are one 16-row WMMA tile, loaded once), groups [gs*per, (gs+1)*per) in
