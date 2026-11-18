@@ -87,12 +87,18 @@ public:
     /// this position, or to the one before it, gets them back - the next turn of a chat whose template drops the
     /// answer's reasoning
     bool mark(std::string& err);
+    // Save one chunk-aligned prefix before a long prompt's tail.
+    bool mark_prefix(std::string& err);
 
 private:
     struct Impl;
     std::unique_ptr<Impl> d_;
     struct Snap;                  // (mark()'s copy; shared_ptr: complete only in hy4f.cu's serve block)
     std::shared_ptr<Snap> snap_;
+    struct PrefixSnap;
+    std::shared_ptr<PrefixSnap> prefix_;
+    int64_t prefix_pos_ = -1;
+    void transfer_prefix(bool save);
     int64_t hw_ = 0;              // positions ever written since the last reset (the rings may hold up to it)
 };
 

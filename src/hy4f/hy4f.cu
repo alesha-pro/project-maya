@@ -1068,6 +1068,7 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
     try {
         Impl& d = *d_;
         if (pos > d.pos_next) throw std::runtime_error("hy4f: prefill out of order");
+        if (pos < prefix_pos_) prefix_pos_=-1;
         if (pos + n > d.o.max_context) throw std::runtime_error("hy4f: context full");
         const auto t_start = std::chrono::steady_clock::now();
         d.change_q3_layout(false);
@@ -1145,6 +1146,7 @@ bool Model::verify(const int32_t* toks, int T, int64_t pos, float* logits, int32
         if (d.dsh.empty()) throw std::runtime_error("hy4f: multi-token steps need the CUDA graphs");
         if (T < 1 || T > Impl::DT) throw std::runtime_error("hy4f: verify takes 1.." + std::to_string(Impl::DT) + " tokens");
         if (pos > d.pos_next) throw std::runtime_error("hy4f: verify out of order");
+        if (pos < prefix_pos_) prefix_pos_=-1;
         if (pos + T > d.o.max_context) throw std::runtime_error("hy4f: context full");
         d.hio_v->pos = (int) pos;
         d.hio_v->n = T;
@@ -1385,6 +1387,59 @@ std::pair<void*, size_t> serve_ring(Shard& s, int il, bool sw, int win, int kpoo
 }
 }  // namespace
 
+struct Model::PrefixSnap {
+    std::vector<uint8_t*> buffers;
+    ~PrefixSnap() { for (auto* p : buffers) if (p) cudaFreeHost(p); }
+};
+
+void Model::transfer_prefix(bool save) {
+    Impl& d = *d_;
+    const int layers = d.L + int(d.has_mtp);
+    if (!prefix_) {
+        auto snap = std::make_shared<PrefixSnap>();
+        snap->buffers.resize(d.S);
+        for (auto& s : d.sh) {
+            size_t bytes = d.has_mtp ? sizeof(float)*d.E : 0;
+            for (int il=0;il<layers;++il)
+                bytes += serve_ring(s,il,d.swa[il]!=0,d.win,d.kpool,d.IK).second;
+            HY_CK(cudaHostAlloc((void**)&snap->buffers[s.g],bytes,cudaHostAllocPortable));
+        }
+        prefix_=std::move(snap);
+    }
+    d.launch_parallel([&](Shard& s) {
+        uint8_t* host=prefix_->buffers[s.g];
+        auto copy=[&](void* gpu,size_t bytes) {
+            if(save) HY_CK(cudaMemcpyAsync(host,gpu,bytes,cudaMemcpyDeviceToHost,s.st));
+            else HY_CK(cudaMemcpyAsync(gpu,host,bytes,cudaMemcpyHostToDevice,s.st));
+            host += bytes;
+        };
+        for(int il=0;il<layers;++il) {
+            auto row=serve_ring(s,il,d.swa[il]!=0,d.win,d.kpool,d.IK);
+            copy(row.first,row.second);
+        }
+        if(d.has_mtp) {
+            auto* prev=d.bsh[s.g].hprev;
+            copy(prev,sizeof(float)*d.E);
+            if(!save && !d.dsh.empty())
+                HY_CK(cudaMemcpyAsync(d.dsh[s.g].h,prev,sizeof(float)*d.E,cudaMemcpyDeviceToDevice,s.st));
+        }
+        HY_CK(cudaStreamSynchronize(s.st));
+    });
+}
+
+bool Model::mark_prefix(std::string& err) {
+    prefix_pos_=-1;
+    try {
+        if(d_->bsh.empty() || d_->pos_next<=0) return true;
+        transfer_prefix(true);
+        prefix_pos_=d_->pos_next;
+        return true;
+    } catch(const std::exception& e) {
+        err=e.what();
+        return false;
+    }
+}
+
 bool Model::mark(std::string& err) {
     try {
         Impl& d = *d_;
@@ -1452,11 +1507,16 @@ int64_t Model::rewind(int64_t pos, std::string& err) {
                 hw_ = m;                                // (the rings as they were at m)
             } else if (const int64_t down = has_dsa ? pos - pos % d.kpool : 0; down > 0 && keeps(down, hw_)) {
                 pos = down;                             // (the indexer group's start: < kpool tokens read again)
+            } else if (prefix_pos_ > 0 && prefix_pos_ <= pos) {
+                transfer_prefix(false);
+                pos=prefix_pos_;
+                hw_=pos;
             } else {
                 pos = 0;
             }
         }
         if (snap_ && pos < m) snap_->pos = -1;          // (positions before the copy's are written anew)
+        if (pos < prefix_pos_) prefix_pos_=-1;
         if (pos == 0) hw_ = 0;
         d.pos_next = pos;
         return pos;

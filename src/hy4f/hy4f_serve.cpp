@@ -482,6 +482,7 @@ int serve(Model& m, const ServeOptions& so) {
     Sampler sampler;
     unsigned long long counter = 0;
     bool mark_ok = true;
+    bool prefix_mark = std::getenv("HY4F_PREFIX_CHECKPOINT") != nullptr;
     std::string line;
     std::vector<float> lgT((size_t) 4 * V);   // verify's rows (sampling, penalties, a bias)
     struct Held {
@@ -612,6 +613,12 @@ int serve(Model& m, const ServeOptions& so) {
                 fatal("prefill at " + std::to_string(a) + ": " + err, 0, n);
             state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + T);
             a += (size_t) T;
+            if (prefix_mark && a >= 2*(size_t)CH && a%CH == 0 && a<n && n-a <= (size_t)CH) {
+                if (!m.mark_prefix(err)) {
+                    std::fprintf(stderr,"maya hy4f serve: prefix checkpoint unavailable (%s)\n",err.c_str());
+                    prefix_mark=false;
+                }
+            }
             pp_line(a);
             if (in.stop.load() && !last) {
                 cancel = true;
