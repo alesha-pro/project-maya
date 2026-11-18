@@ -14,6 +14,19 @@ __device__ __forceinline__ float ar_own(const PeersD& P, float v) { return P.bf 
 // P.bf == 2: the LL form (NCCL's low-latency protocol): every 8-byte word = 2 BF16 values + the step, stored by the
 // sender in one 8-byte store with no fence and no flag; the receiver polls the word until it carries its step
 __device__ __forceinline__ float ar_peer(const PeersD& P, int step, const float* rv, size_t idx) {
+    if (P.bf == 3) {
+        const unsigned index = (unsigned) idx;
+        const unsigned packet = index / 3u;
+        const unsigned field = index - 3u * packet;
+        const uint2* word = reinterpret_cast<const uint2*>(rv) + packet;
+        uint2 bits;
+        do {
+            asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];"
+                         : "=r"(bits.x), "=r"(bits.y) : "l"(word));
+        } while (bits.y >> 16 != ((unsigned)step & 0xffffu));
+        const unsigned value = field == 2 ? bits.y : bits.x >> (field * 16);
+        return __bfloat162float(__ushort_as_bfloat16((unsigned short)value));
+    }
     if (P.bf == 2) {
         const volatile uint2* w = reinterpret_cast<const volatile uint2*>(rv) + idx / 2;
         uint2 u;
@@ -450,7 +463,7 @@ __global__ void kd_ar_tail(const float* __restrict__ x1, const float* __restrict
                            int n_shards, int* counter, int* arrive, const float* __restrict__ nw, float eps, float* X,
                            const float* __restrict__ post, int hc) {
     const int step = counter[0] + 1, tn = T * n, t = blockIdx.x;
-    if (P.bf != 2) kd_wait_peers(P, me, n_shards, step);
+    if (P.bf < 2) kd_wait_peers(P, me, n_shards, step);
     const float* rv = P.buf[me][step & 1];
     __shared__ float ys[4096];
     float sq = 0.0f;
@@ -741,6 +754,30 @@ __global__ void kd_push_all(const float* __restrict__ x1, const float* __restric
 
 // the peers one after another inside one launch (a single launch per exchange instead of one per peer; still one peer
 // at a time per block): each block writes its slice to peer me+1, fences, counts in; then me+2, ...
+// Each 8-byte PCIe store carries three rounded values and a 16-bit epoch.
+__global__ void kd_push_ll3(const float* x1, const float* x2, int n, PeersD P, int me, int ranks,
+                            const int* counter) {
+    const unsigned step = (unsigned)*counter + 1u;
+    const int packets = n / 3;
+    for (int r = 1; r < ranks; ++r) {
+        const int peer = (me + r) % ranks;
+        uint2* dst = reinterpret_cast<uint2*>(P.buf[peer][step & 1u]) + me * packets;
+        for (int i = threadIdx.x; i < packets; i += blockDim.x) {
+            float a = x1[3*i], b = x1[3*i+1], c = x1[3*i+2];
+            if (x2) {
+                a += x2[3*i];
+                b += x2[3*i+1];
+                c += x2[3*i+2];
+            }
+            const auto pair = __floats2bfloat162_rn(a,b);
+            const unsigned low = *reinterpret_cast<const unsigned*>(&pair);
+            const unsigned high = (step << 16) | __bfloat16_as_ushort(__float2bfloat16_rn(c));
+            asm volatile("st.volatile.global.v2.u32 [%0], {%1, %2};"
+                         :: "l"(dst+i), "r"(low), "r"(high) : "memory");
+        }
+    }
+}
+
 __global__ void kd_push_seq(const float* __restrict__ x1, const float* __restrict__ x2, int tn, int mode, int T, int H,
                             int W, int Hl, PeersD P, int me, int n_shards, const int* counter, int* arrive) {
     const int step = counter[0] + 1, par = step & 1;
@@ -858,7 +895,7 @@ __global__ void __launch_bounds__(1024) kd_ar_tail_hc(const float* __restrict__ 
                                                       HcNext nx, float hc_eps, float* __restrict__ xo, Q81* __restrict__ xq) {
     constexpr int PER = 3;
     const int step = counter[0] + 1, tn = T * n, t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
-    if (P.bf != 2) kd_wait_peers(P, me, n_shards, step);
+    if (P.bf < 2) kd_wait_peers(P, me, n_shards, step);
     const float* rv = P.buf[me][step & 1];
     float ysum[PER], sq = 0.0f;
 #pragma unroll
@@ -1274,7 +1311,7 @@ __global__ void __launch_bounds__(256) kd_art_a(const float* __restrict__ x1, co
         }
     }
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5, i = b * blockDim.x + tid;
-    if (P.bf != 2) kd_wait_peers(P, me, n_shards, step);
+    if (P.bf < 2) kd_wait_peers(P, me, n_shards, step);
     const float* rv = P.buf[me][step & 1];
     float v = 0.0f;
     for (int j = 0; j < n_shards; ++j)

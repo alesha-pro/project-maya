@@ -50,6 +50,7 @@ bool push_seq = std::getenv("HY4F_PUSH_PER_PEER") == nullptr;
 bool push_one = std::getenv("HY4F_PUSH_ONEFENCE") != nullptr;
 bool ll_overlap = std::getenv("HY4F_LL_FUSED") != nullptr;
 bool tail_old = std::getenv("HY4F_TAIL_OLD") != nullptr;
+bool ar_ll3 = std::getenv("HY4F_AR_LL3") && std::atoi(std::getenv("HY4F_AR_LL3")) != 0;
 int ar_push_blocks = std::getenv("HY4F_PUSH_BLOCKS") ? std::atoi(std::getenv("HY4F_PUSH_BLOCKS")) : 1;
 int ar_push_threads = std::getenv("HY4F_PUSH_THREADS") ? std::atoi(std::getenv("HY4F_PUSH_THREADS")) : 256;
 
@@ -250,7 +251,10 @@ void dec_alloc(Shard& s, DShard& d) {
         HY_CK(cudaEventCreateWithFlags(&d.shared_done, cudaEventDisableTiming));
     }
     for (int p = 0; p < 2; ++p) {
-        d.ar_buf[p] = dalloc((size_t) S * DT * E);
+        // Keep separate address ranges for T=3 and T=4. Their 16-bit epochs
+        // can wrap even when only one width has been running for a long time.
+        const size_t ll3_words = ar_ll3 && E % 3 == 0 ? (size_t)S * (E/3) * (3+4) * 2 : 0;
+        d.ar_buf[p] = dalloc((size_t) S * DT * E + ll3_words);
         d.cb_buf[p] = dalloc((size_t) S * DT * (Hd / S) * CBW());
     }
     d.ar_flag = ia(4);
@@ -258,7 +262,7 @@ void dec_alloc(Shard& s, DShard& d) {
     d.tpart = dalloc((size_t) DT * 16 * 32);
     d.tppost = dalloc((size_t) DT * 4);
     d.cb_flag = ia(std::getenv("HY4F_HEAD_SEND") ? 4+DT*Hd : 4);
-    d.ar_ctr = ia(1);
+    d.ar_ctr = ia(ar_ll3 ? 3 : 1);
     d.cb_ctr = ia(1);
     d.arrive = ia(16);   // [0..4] all-reduce pushes / tail, [8..12] combine
 }
@@ -301,40 +305,52 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
         return;
     }
     const int tn = T * E;
-    const bool overlap = ll_overlap && d.ar.bf == 2 && nx && !mtp && E == 3072 && T <= 4 && !tail_old;
+    PeersD ar = d.ar;
+    int* counter = d.ar_ctr;
+    if (ar_ll3 && ar.bf == 2 && E % 3 == 0 && (T == 3 || T == 4)) {
+        ar.bf = 3;
+        counter += T - 2;
+        const size_t offset = (size_t)S * DT * E + (T == 4 ? (size_t)S * (E/3) * 3 * 2 : 0);
+        for (int j = 0; j < S; ++j)
+            for (int parity = 0; parity < 2; ++parity)
+                ar.buf[j][parity] += offset;
+    }
+    const bool overlap = ll_overlap && ar.bf == 2 && nx && !mtp && E == 3072 && T <= 4 && !tail_old;
     if (overlap) {
         dim3 grid(E / 256 + 1, T);
         int* arrive = d.arrive + 4;
         const float* w = f32(s, norm);
-        auto args = std::make_tuple(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, arrive, w, d.X, d.post, hc,
+        auto args = std::make_tuple(x1, x2, T, E, ar, s.g, S, counter, arrive, w, d.X, d.post, hc,
                                     *nx, d.ysc, d.tpart, d.tppost);
         std::apply([&](auto&... val) {
             void* params[] = { (void*)&val... };
             HY_CK(cudaLaunchCooperativeKernel((const void*)kd_art_a<true>, grid, dim3(256), params, 0, s.st));
         }, args);
-    } else if (push_seq)
-        (push_one ? kd_push_seq1 : kd_push_seq)<<<ar_push_blocks, ar_push_threads, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, S, d.ar_ctr,
+    } else if (ar.bf == 3)
+        kd_push_ll3<<<1, 256, 0, s.st>>>(x1, x2, tn, ar, s.g, S, counter);
+    else if (push_seq)
+        (push_one ? kd_push_seq1 : kd_push_seq)<<<ar_push_blocks, ar_push_threads, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, ar, s.g, S, counter,
                                                                           d.arrive);
     else if (push_all)
-        kd_push_all<<<ar_push_blocks * (S - 1), 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, S, ar_push_blocks,
-                                                                d.ar_ctr, d.arrive);
+        kd_push_all<<<ar_push_blocks * (S - 1), 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, ar, s.g, S, ar_push_blocks,
+                                                                counter, d.arrive);
     else
         for (int r = 1; r < S; ++r)
-            kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, (s.g + r) % S, d.ar_ctr, d.arrive);
+            kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, ar, s.g, (s.g + r) % S, counter, d.arrive);
     if (nx && !mtp && E % 256 == 0 && E / 256 <= 16 && !tail_old) {   // (two wide kernels)
-        if (!overlap && !d.hc_side && d.ar.bf==2 && std::getenv("HY4F_HC_COLUMNS"))
-            kd_art_columns<<<dim3(E/256,T,4),256,0,s.st>>>(x1,x2,T,E,d.ar,s.g,S,d.ar_ctr,d.arrive+4,
+        if (!overlap && !d.hc_side && ar.bf>=2 && std::getenv("HY4F_HC_COLUMNS"))
+            kd_art_columns<<<dim3(E/256,T,4),256,0,s.st>>>(x1,x2,T,E,ar,s.g,S,counter,d.arrive+4,
                 f32(s,norm),d.X,d.post,hc,*nx,d.ysc,d.tpart,d.tppost);
-        else if (!overlap) (d.hc_side ? kd_art_a<false,true> : kd_art_a<false,false>)<<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), d.X, d.post,
+        else if (!overlap) (d.hc_side ? kd_art_a<false,true> : kd_art_a<false,false>)<<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, ar, s.g, S, counter, d.arrive + 4, f32(s, norm), d.X, d.post,
                                                      hc, *nx, d.ysc, d.tpart, d.tppost);
         if (d.hc_side) HY_CK(cudaStreamWaitEvent(s.st,d.hc_join));
         kd_art_b<<<dim3(E / 256, T), 256, 0, s.st>>>(E, f32(s, norm), eps, d.X, d.post, hc, *nx, hc_eps, d.ysc, d.tpart, d.tppost,
-                                                     d.x, d.xq, overlap ? d.ar_ctr : nullptr);
+                                                     d.x, d.xq, overlap ? counter : nullptr);
     } else if (nx && !mtp)
-        kd_ar_tail_hc<<<T, 1024, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), eps, d.X, d.post,
+        kd_ar_tail_hc<<<T, 1024, 0, s.st>>>(x1, x2, T, E, ar, s.g, S, counter, d.arrive + 4, f32(s, norm), eps, d.X, d.post,
                                             hc, *nx, hc_eps, d.x, d.xq);
     else
-        kd_ar_tail<<<T, 1024, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, norm.empty() ? nullptr : f32(s, norm),
+        kd_ar_tail<<<T, 1024, 0, s.st>>>(x1, x2, T, E, ar, s.g, S, counter, d.arrive + 4, norm.empty() ? nullptr : f32(s, norm),
                                           eps, X, post, hcn);
 }
 void d_norm_in(Shard& s, DShard& d, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
