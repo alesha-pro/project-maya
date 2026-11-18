@@ -423,9 +423,10 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         kb_absorb_bf16<<<dim3(nb(Ha * kvl), T), 256, 0, s.st>>>((const uint16_t*) kb.d, d.qp, qpc, QH, d.qabs, nope, kvl, Ha);
     if (side) HY_CK(cudaStreamWaitEvent(s.st, d.attention_join));
     const bool split = !std::getenv("HY4F_DEC_ATTN2");
+    const int value_groups = T<=2 && std::getenv("HY4F_VALUE_GROUPS") ? 4 : 1;
     if (sw) {
         if (split && Hl == 16) {
-            kd_mqa_dec<16><<<dim3(NSP, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
+            (value_groups==4 ? kd_mqa_dec<16,false,4> : kd_mqa_dec<16>)<<<dim3(NSP*value_groups, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
                                                                        win, 1, 0, scale, d.spm, d.spl, d.spacc);
             if (std::getenv("HY4F_MQA_FOLD"))
                 kd_mqa_fold<false><<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hl,
@@ -471,7 +472,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                                   cudaMemcpyDeviceToDevice, s.st));
         if (S > 1) {
             if (split && Hd == 32) {
-                (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>)<<<dim3(NSP, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
+                (value_groups==4 ? (dense_dsa ? kd_mqa_dec<32,true,4> : kd_mqa_dec<32,false,4>) : (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>))<<<dim3(NSP*value_groups, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
                                                                            n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
                                                                            d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail);
                 if (std::getenv("HY4F_HEAD_SEND")) {
@@ -751,6 +752,11 @@ void dec_setup() {
     for (auto& s : sh) {
         HY_CK(cudaSetDevice(s.dev));
         HY_CK(cudaFuncSetAttribute(kd_ar_post, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) (sizeof(float) * DT * E)));
+        if (std::getenv("HY4F_VALUE_GROUPS")) {
+            HY_CK(cudaFuncSetAttribute(kd_mqa_dec<16,false,4>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<16>()));
+            HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32,false,4>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<32>()));
+            HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32,true,4>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<32>()));
+        }
         HY_CK(cudaFuncSetAttribute(kd_mqa_dec<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqd_smem<16>()));
         HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqd_smem<32>()));
         if (short_graphs)
