@@ -625,7 +625,16 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     }
     const bool grouped = !std::getenv("HY4F_IDS_LOOP");
     const bool mp = T > 4;   // (more than 4 slots per expert possible: the multi-pass copy of the grouped kernel)
-    if (grouped) kd_moe_groups<<<1, T * K <= 64 ? 64 : 128, 0, s.st>>>(d.eloc, T * K, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
+    if (grouped) {
+        const int slots = T * K, threads = slots <= 64 ? 64 : 128;
+        if (!std::getenv("HY4F_GROUP_MATCH"))
+            kd_moe_groups<<<1, threads, 0, s.st>>>(d.eloc, slots, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
+        else if (T == 1 && K <= 32)
+            kd_groups_one<<<1, 32, 0, s.st>>>(d.eloc, slots, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
+        else
+            kd_groups_match<<<1, threads, (e1 - e0) * (threads / 32) * sizeof(unsigned), s.st>>>(
+                d.eloc, slots, e1 - e0, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
+    }
     auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out) {
         const size_t eb = w.rb * (size_t) w.ne[1];
         if (grouped) {

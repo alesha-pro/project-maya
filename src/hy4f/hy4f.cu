@@ -21,6 +21,7 @@
 #include "hy4f_dsa_prefill.cuh"
 #include "hy4f_dkern.cuh"
 #include "hy4f_project.cuh"
+#include "hy4f_groups.cuh"
 #include "hy4f_q3packed.cuh"
 
 #include "strata/artifact/gguf_reader.hpp"
