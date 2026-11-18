@@ -117,6 +117,7 @@ struct DShard {
     int64_t* eg_ids = nullptr;
     float *eg_r = nullptr, *eg_kv = nullptr, *logits = nullptr, *argv = nullptr;
     int* argi = nullptr;
+    HeadValue *rank_tiles=nullptr, *rank_final=nullptr;
     float *me = nullptr, *cat = nullptr, *mr = nullptr, *mh = nullptr;
     float *spm = nullptr, *spl = nullptr, *spacc = nullptr;   // the split-K attention partials [DT][NSP][Hmax][..]
     Q81 *xq = nullptr, *xlq = nullptr, *q16 = nullptr;
@@ -146,6 +147,9 @@ int* hargi = nullptr;
 float* hmargv = nullptr;   // [S] (MTP draft)
 const bool compact_io = std::getenv("HY4F_COMPACT_LOGITS") != nullptr;
 bool mtp_full_row = false;
+HeadValue* rank_host=nullptr;  // [row][shard][head_candidates]
+bool rank_active=false;
+
 float* hmlog = nullptr;    // [V] pinned: the MTP head's logits row (for drafts sampled from it)
 int* hmargi = nullptr;
 int64_t m_next = 0;        // next MTP position
@@ -223,6 +227,11 @@ void dec_alloc(Shard& s, DShard& d) {
     d.eg_r = dalloc((size_t) DT * ncol * eg_D);
     d.eg_kv = dalloc((size_t) DT * (hc + 1) * E);
     d.logits = dalloc((size_t) DT * (V / S));
+    if (rank_host) {
+        const int blocks=(V/S+1023)/1024;
+        HY_CK(cudaMalloc(&d.rank_tiles,sizeof(HeadValue)*DT*blocks*head_candidates));
+        HY_CK(cudaMalloc(&d.rank_final,sizeof(HeadValue)*DT*head_candidates));
+    }
     d.argv = dalloc(DT + int(compact_io));
     d.argi = ia(DT);
     d.me = dalloc((size_t) DT * E);
@@ -874,6 +883,9 @@ void dec_setup() {
     HY_CK(cudaHostAlloc((void**) &hmlog, sizeof(float) * V, cudaHostAllocPortable));
     std::memset(hio_v, 0, sizeof(IoT));
     std::memset(hio_m, 0, sizeof(IoT));
+    if (compact_io && std::getenv("HY4F_RANKED_SAMPLE") && V/S>=head_candidates &&
+        ((V/S+1023)/1024)*head_candidates<=2048)
+        HY_CK(cudaHostAlloc(&rank_host,sizeof(HeadValue)*DT*S*head_candidates,cudaHostAllocPortable));
     dsh.resize(sh.size());
     for (size_t i = 0; i < sh.size(); ++i) dec_alloc(sh[i], dsh[i]);
     PeersD ar{}, cb{};
@@ -959,6 +971,14 @@ void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
         DShard& d = dsh[s.g];
         DecodeGraph& graph = chain ? d.gc : mtp ? d.gm[T] : d.gv[T];
         HY_CK(cudaGraphLaunch(graph.select(dense_dsa), s.st));
+        if (rank_active && !full_logits) {
+            const int n=V/S, blocks=(n+1023)/1024, nr=mtp ? 1 : T;
+            kd_rank_head<false><<<dim3(blocks,nr),256,0,s.st>>>(d.logits,nullptr,d.rank_tiles,n,blocks,s.g*n);
+            kd_rank_head<true><<<dim3(1,nr),256,0,s.st>>>(nullptr,d.rank_tiles,d.rank_final,n,blocks,s.g*n);
+            HY_CK(cudaMemcpy2DAsync(rank_host+s.g*head_candidates,sizeof(HeadValue)*S*head_candidates,
+                                    d.rank_final,sizeof(HeadValue)*head_candidates,sizeof(HeadValue)*head_candidates,
+                                    nr,cudaMemcpyDeviceToHost,s.st));
+        }
         if (compact_io && full_logits) {
             const int rows = V / S;
             if (mtp)

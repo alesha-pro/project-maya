@@ -20,6 +20,7 @@
 #include "hy4f_swa_prefill.cuh"
 #include "hy4f_dsa_prefill.cuh"
 #include "hy4f_dkern.cuh"
+#include "hy4f_ranked.cuh"
 #include "hy4f_project.cuh"
 #include "hy4f_q3packed.cuh"
 #include "hy4f_expert_q8.cuh"
@@ -973,7 +974,10 @@ struct Model::Impl {
             for (auto& graph : d.gm) graph.clear();
             d.gc.clear();
             if (d.packed_query) cudaFree(d.packed_query);
+            if (d.rank_tiles) cudaFree(d.rank_tiles);
+            if (d.rank_final) cudaFree(d.rank_final);
         }
+        if (rank_host) cudaFreeHost(rank_host);
         for (size_t g = 0; g < bsh.size(); ++g) {
             auto& b = bsh[g];
             cudaSetDevice(sh[g].dev);
@@ -1235,6 +1239,37 @@ bool Model::mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& er
         return false;
     }
 }
+bool Model::set_ranked_output(bool enabled) {
+    d_->rank_active=enabled && d_->rank_host;
+    return d_->rank_active;
+}
+bool Model::ranked_row(int row, int k, float inv_temp, std::vector<HeadValue>& values, float* fallback) {
+    Impl& d=*d_;
+    const int n=d.V/d.S;
+    bool ambiguous=false;
+    const HeadValue* ranks=d.rank_host+(size_t)row*d.S*head_candidates;
+    for (int g=0; g<d.S; ++g) {
+        const auto* v=ranks+g*head_candidates;
+        // Scaling raw logits can create a tie at the truncation boundary.
+        // The full sampler breaks such ties by vocabulary ID.
+        ambiguous |= v[0].id<0 || !std::isfinite(v[0].logit*inv_temp) ||
+                     v[k-1].logit*inv_temp==v[k].logit*inv_temp;
+    }
+    if (ambiguous) {
+        d.launch_parallel([&](Shard& s) {
+            HY_CK(cudaMemcpy(fallback+(size_t)s.g*n,d.dsh[s.g].logits+(size_t)row*n,
+                              sizeof(float)*n,cudaMemcpyDeviceToHost));
+        });
+        return false;
+    }
+    values.clear();
+    for (int g=0; g<d.S; ++g) {
+        const auto* v=ranks+g*head_candidates;
+        values.insert(values.end(),v,v+k);
+    }
+    return true;
+}
+
 float Model::draft_margin(int token) const {
     const Impl& d = *d_;
     const int rows = d.V / d.S, owner = token / rows;

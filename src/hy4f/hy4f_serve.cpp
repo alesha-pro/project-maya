@@ -407,6 +407,22 @@ struct Sampler {
 #endif
         for (; t < V; ++t) offer(t);
         std::sort_heap(c.begin(), c.end(), better);
+        normalize_sparse(r,out);
+    }
+    void ranked_probs(const std::vector<HeadValue>& values, const Req& r, Sparse& out) {
+        const float inv=1.f/r.temperature;
+        float mx=-INFINITY;
+        for (const auto& v : values) mx=std::max(mx,v.logit);
+        c.clear();
+        for (const auto& v : values) if ((v.logit-mx)*inv>-20.f)
+            c.emplace_back(v.logit*inv,v.id);
+        std::sort(c.begin(),c.end(),[](const auto& a,const auto& b) {
+            return a.first>b.first || (a.first==b.first && a.second<b.second);
+        });
+        if (c.size()>(size_t)r.top_k) c.resize(r.top_k);
+        normalize_sparse(r,out);
+    }
+    void normalize_sparse(const Req& r, Sparse& out) {
         // Use the same types, rounding points and summation order as probs().
         exponent.resize(c.size());
         double total = 0.;
@@ -705,9 +721,17 @@ int serve(Model& m, const ServeOptions& so) {
         // thinking budget or WRAP closing an open reasoning block
         const bool sparse_sample = std::getenv("HY4F_SPARSE_SAMPLE") && r.temperature > 0.f && r.top_k > 0 && r.top_k <= 256;
         Sampler::Sparse sp, sq[4], sr;
-        auto pick = [&](const float* row, int32_t amx) -> int {
+        const bool ranked=m.set_ranked_output(sparse_sample && r.top_k<=64 && r.bias.empty() &&
+            !(r.pen_n && (r.pen_repeat!=1.f || r.pen_freq!=0.f || r.pen_present!=0.f)));
+        std::vector<HeadValue> head_values;
+        auto sparse_row = [&](float* row, int i, const Req& req, Sampler::Sparse& probs) {
+            if (ranked && i>=0 && m.ranked_row(i,req.top_k,1.f/req.temperature,head_values,row))
+                sampler.ranked_probs(head_values,req,probs);
+            else sampler.sparse_probs(row,V,req,state,probs);
+        };
+        auto pick = [&](float* row, int32_t amx, int i=-1) -> int {
             int t;
-            if (sparse_sample) { sampler.sparse_probs(row, V, r, state, sp); t = Sampler::sparse_draw(sp, rng); }
+            if (sparse_sample) { sparse_row(row,i,r,sp); t = Sampler::sparse_draw(sp, rng); }
             else t = rows ? sampler.next(row, V, r, state, rng) : amx;
             if (in_think && (produced >= r.think_budget || in.wrap.load()) && t != r.think_end) t = r.think_end;
             return t;
@@ -748,10 +772,10 @@ int serve(Model& m, const ServeOptions& so) {
         if (width.enabled()) kc.k = 3;
         int offered = kc.k;
         auto draft = [&](const int32_t* nt, int T, int64_t mpos) {
-            if (!m.mtp(nt, T, mpos, &dr[0], err, ssamp ? mlg.data() : nullptr))
+            if (!m.mtp(nt, T, mpos, &dr[0], err, ssamp && !ranked ? mlg.data() : nullptr))
                 fatal("mtp at " + std::to_string(mpos) + ": " + err, produced, n);
             if (sparse_sample) {
-                sampler.sparse_probs(mlg.data(), V, rq, state, sq[0]);
+                sparse_row(mlg.data(),0,rq,sq[0]);
                 dr[0] = Sampler::sparse_draw(sq[0], rng);
             } else if (ssamp) {
                 sampler.probs(mlg.data(), V, rq, state, Q[0]);
@@ -766,10 +790,10 @@ int serve(Model& m, const ServeOptions& so) {
             borrowed = copied > 0;
             if (borrowed) { offered += copied; return; }
             for (int i = 1; i < room && width.extend(i - 1); ++i) {
-                if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err, ssamp ? mlg.data() : nullptr))
+                if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err, ssamp && !ranked ? mlg.data() : nullptr))
                     fatal("mtp_chain at " + std::to_string(next + i - 1) + ": " + err, produced, n);
                 if (sparse_sample) {
-                    sampler.sparse_probs(mlg.data(), V, rq, state, sq[i]);
+                    sparse_row(mlg.data(),0,rq,sq[i]);
                     dr[i] = Sampler::sparse_draw(sq[i], rng);
                 } else if (ssamp) {
                     sampler.probs(mlg.data(), V, rq, state, Q[i]);
@@ -790,7 +814,7 @@ int serve(Model& m, const ServeOptions& so) {
             if (pos >= C) break;   // (the context is full: length)
             const int kk = spec ? (int) std::min<long long>({(long long) offered, C - pos - 1, r.max_new - produced}) : 0;
             const int32_t vt[4] = {tok, dr[0], dr[1], dr[2]};
-            if (!m.verify(vt, kk + 1, pos, rows ? lgT.data() : nullptr, am, err))
+            if (!m.verify(vt, kk + 1, pos, rows && !ranked ? lgT.data() : nullptr, am, err))
                 fatal("verify at " + std::to_string(pos) + ": " + err, produced, n);
             state.push_back(tok);
             int acc = 0;
@@ -798,8 +822,8 @@ int serve(Model& m, const ServeOptions& so) {
                 int y;
                 bool kept;
                 if (ssamp && i < kk) {
-                    const float* logits = lgT.data() + (size_t)i * V;
-                    if (sparse_sample) sampler.sparse_probs(logits, V, r, state, sp);
+                    float* logits = lgT.data() + (size_t)i * V;
+                    if (sparse_sample) sparse_row(logits,i,r,sp);
                     else sampler.probs(logits, V, r, state, Pr);
                     const float pq = sparse_sample ? Sampler::at(sp, dr[i]) : Pr[(size_t)dr[i]];
                     const float qq = sparse_sample ? Sampler::at(sq[i], dr[i]) : Q[i][(size_t)dr[i]];
@@ -830,7 +854,7 @@ int serve(Model& m, const ServeOptions& so) {
                         kept = y == dr[i];
                     }
                 } else {
-                    y = pick(lgT.data() + (size_t) i * V, am[i]);
+                    y = pick(lgT.data() + (size_t) i * V, am[i], i);
                     kept = i < kk && y == dr[i];
                 }
                 if (i < kk && kept) {   // the draft kept: its row is the cache's now

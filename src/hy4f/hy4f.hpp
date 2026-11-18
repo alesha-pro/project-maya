@@ -31,6 +31,9 @@ struct EmbdSpan {
     const float* rows = nullptr;
 };
 
+struct HeadValue { float logit; int id; };
+inline constexpr int head_candidates = 65;
+
 class Model {
 public:
     Model();
@@ -60,6 +63,11 @@ public:
     bool mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& err, float* logits = nullptr);
     /// Gap between the last greedy MTP token and its runner-up in the already transferred draft logits.
     float draft_margin(int token) const;
+    // For unwarped top-k sampling, transfer the best 65 raw scores from each vocabulary shard.
+    bool set_ranked_output(bool enabled);
+    // On an ambiguous cutoff, copies the full device row to fallback and returns false.
+    bool ranked_row(int row, int k, float inv_temp, std::vector<HeadValue>& values, float* fallback);
+
     bool has_mtp() const;
     /// DFly2 drafts: n (1..5) draft tokens after `bonus` (the token at position `anchor`, not yet in the cache), from the
     /// last verify's row `src_row` (the last accepted token: its final hidden state and its top-k cells at the drafter's
