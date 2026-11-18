@@ -595,11 +595,15 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
             kd_replica_merge<<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,T,
                 f32(s,P+"attn_sinks.weight")+s.g*Hl,d.o);
         } else if (S > 1) {
+            const bool contiguous_cb = split && Hd == 32 && S == 4 && std::getenv("HY4F_CB_CONTIG");
             if (split && Hd == 32) {
                 (value_groups==4 ? (dense_dsa ? kd_mqa_dec<32,true,4> : kd_mqa_dec<32,false,4>) : (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>))<<<dim3(NSP*value_groups, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
                                                                            n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
                                                                            d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail, qh, false, 0, 0);
-                if (std::getenv("HY4F_HEAD_SEND")) {
+                if (contiguous_cb) {
+                    kd_mqa_fold<false,true><<<dim3(Hd,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hd,nullptr,nullptr,
+                                                                      d.part,CBW(),d.cb,s.g,S,nullptr);
+                } else if (std::getenv("HY4F_HEAD_SEND")) {
                     kd_mqa_fold<true><<<dim3(Hd,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hd,nullptr,nullptr,
                                                                d.part,CBW(),d.head_cb,s.g,S,d.cb_ctr);
                 } else if (std::getenv("HY4F_MQA_FOLD")) {
@@ -610,9 +614,18 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                 kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp,
                                                         win, S, s.g, nullptr, scale, nullptr, d.part, Hd);
             }
-            const bool sent = split && Hd==32 && std::getenv("HY4F_HEAD_SEND");
+            const bool sent = !contiguous_cb && split && Hd==32 && std::getenv("HY4F_HEAD_SEND");
             PeersD cb = sent ? d.head_cb : d.cb;
-            if (sent) { /* kd_mqa_fold published each remote head. */ }
+            if (contiguous_cb) {
+                // The following residual all-reduce keeps the source and single
+                // destination slot alive until all previous readers are done.
+                const size_t span = (size_t)T * Hl * CBW();
+                for (int r=1; r<S; ++r) {
+                    const int peer = (s.g+r) % S;
+                    HY_CK(cudaMemcpyAsync(cb.buf[peer][0] + s.g * span, d.part + peer * span,
+                                          span * sizeof(float), cudaMemcpyDeviceToDevice, s.st));
+                }
+            } else if (sent) { /* kd_mqa_fold published each remote head. */ }
             else if (std::getenv("HY4F_CB_DMA") && push_seq) {
                 // This exchange is followed by a blocking residual reduction
                 // on every rank. A single receive slot therefore suffices.
@@ -641,7 +654,10 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                 for (int r = 1; r < S; ++r)
                     kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd, CBW(), Hl, d.cb, s.g,
                                                                (s.g + r) % S, d.cb_ctr, d.arrive + 8);
-            kd_cb_tail<<<T * Hl, 256, 0, s.st>>>(d.part, T, Hd, kvl, CBW(), s.g * Hl, Hl, f32(s, P + "attn_sinks.weight"),
+            if (contiguous_cb)
+                kd_cb_dma_tail<<<T * Hl,256,0,s.st>>>(d.part,T,Hd,kvl,CBW(),f32(s,P+"attn_sinks.weight"),
+                                                     cb,s.g,S,d.cb_ctr,d.arrive+12,d.o);
+            else kd_cb_tail<<<T * Hl, 256, 0, s.st>>>(d.part, T, Hd, kvl, CBW(), s.g * Hl, Hl, f32(s, P + "attn_sinks.weight"),
                                                  cb, s.g, S, d.cb_ctr, d.arrive + 12, d.o, sent);
         } else {
             kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp, win,

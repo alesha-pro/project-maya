@@ -591,6 +591,63 @@ __global__ void kd_cb_tail(const float* __restrict__ part, int T, int H, int kvl
     kd_post_done(counter, arrive, step);
 }
 
+// The producer fold writes all T rows for a destination contiguously. The
+// same stream completes three peer copies before any CTA publishes its epoch.
+__global__ void kd_cb_dma_tail(const float* part, int T, int H, int kvl, int W,
+                               const float* sinks, PeersD peers, int me, int ranks,
+                               int* counter, int* arrive, float* out) {
+    const int tid = threadIdx.x, heads = H / ranks;
+    const int step = *counter + 1, t = blockIdx.x / heads, hl = blockIdx.x % heads;
+    bool publish = false;
+    if (tid < 32) {
+        // Each CTA can be the first to arrive. One warp sends the three
+        // signals for the grid, regardless of CTA scheduling order.
+        unsigned ticket = 0;
+        if (tid == 0) ticket = atomicInc(reinterpret_cast<unsigned*>(arrive + 1), gridDim.x - 1);
+        publish = __shfl_sync(0xffffffffu, ticket, 0) == 0;
+    }
+    if (tid < ranks && tid != me) {
+        if (publish)
+            asm volatile("st.release.sys.global.u32 [%0], %1;" :: "l"(peers.flag[tid] + me), "r"(step) : "memory");
+        int epoch;
+        const auto begin = hy4f_now();
+        do {
+            asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(epoch) : "l"(peers.flag[me] + tid) : "memory");
+            if (epoch >= step) break;
+            hy4f_spin_guard(begin);
+        } while (true);
+    }
+    __syncthreads();
+    const int head = me * heads + hl;
+    const size_t row = (size_t)t * heads + hl, slice = (size_t)T * heads * W;
+    const float* local = part + me * slice + row * W;
+    const float* inbox = peers.buf[me][0] + row * W;
+    auto value = [&](int rank, int col) {
+        return rank == me ? local[col] : __ldcv(inbox + rank * slice + col);
+    };
+    __shared__ float factor[4], denominator;
+    if (tid < 32) {
+        const float mj = tid < ranks ? value(tid, kvl) : -INFINITY;
+        const float lj = tid < ranks ? value(tid, kvl+1) : 0.f;
+        const float maximum = fmaxf(warp_max(mj), sinks[head]);
+        const float f = mj == -INFINITY ? 0.f : __expf(mj - maximum);
+        if (tid < ranks) factor[tid] = f;
+        float den = __expf(sinks[head] - maximum);
+        for (int rank = 0; rank < ranks; ++rank) {
+            const float fj = __shfl_sync(0xffffffffu, f, rank);
+            const float l = __shfl_sync(0xffffffffu, lj, rank);
+            den += fj * l;
+        }
+        if (tid == 0) denominator = den;
+    }
+    __syncthreads();
+    for (int col = tid; col < kvl; col += blockDim.x) {
+        float acc = 0.f;
+        for (int rank = 0; rank < ranks; ++rank) acc += factor[rank] * value(rank,col);
+        out[row * kvl + col] = acc / denominator;
+    }
+    kd_post_done(counter, arrive, step);
+}
 
 // ---- the k-pool selection for a few tokens (decode) over gridDim.x blocks per token instead of one: the same set of
 // cells as kb_select_kpool (top k groups by hy4f_key, ties taken in index order, then the current group's tail), the

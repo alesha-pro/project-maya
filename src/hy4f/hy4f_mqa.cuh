@@ -569,7 +569,7 @@ __global__ void kd_mqa_merge(const float* __restrict__ pm, const float* __restri
 
 // Compute each split's exponential once per head. The denominator and the
 // value sum preserve consecutive split order; only the maximum is parallel.
-template<bool Send>
+template<bool Send, bool ByDestination = false>
 __global__ void kd_mqa_fold(const float* pm, const float* pl, const float* acc, int nsp, int H,
                             const float* sinks, float* output, float* part, int W, PeersD peers,
                             int me, int ranks, const int* counter) {
@@ -594,6 +594,10 @@ __global__ void kd_mqa_fold(const float* pm, const float* pl, const float* acc, 
     __syncthreads();
     int dest=me, hl=0, step=0;
     float* row=part ? part+((size_t)t*H+h)*W : nullptr;
+    if constexpr (ByDestination) {
+        const int heads = H / ranks;
+        row = part + (((size_t)(h / heads) * gridDim.y + t) * heads + h % heads) * W;
+    }
     if constexpr (Send) {
         const int local_heads=H/ranks;
         dest=h/local_heads; hl=h%local_heads;
