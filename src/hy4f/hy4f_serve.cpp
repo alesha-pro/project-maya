@@ -62,6 +62,9 @@
 #include <vector>
 
 #include <unistd.h>
+#if defined(__SSE2__)
+#include <emmintrin.h>
+#endif
 
 namespace strata::hy4f {
 namespace {
@@ -230,7 +233,7 @@ struct Sampler {
     // the warped distribution of a row as dense probabilities P [V] (0 outside the kept set): logit_bias, the penalties,
     // temperature, then top_k / min_p / top_p on the candidates (no sort over the whole vocabulary unless a cutoff
     // needs it: the candidates are the tokens within 30 nats of the best)
-    void probs(const float* lg, int V, const Req& r, const std::vector<int32_t>& hist, std::vector<float>& P) {
+    const float* warp_row(const float* lg, int V, const Req& r, const std::vector<int32_t>& hist) {
         const bool pen = r.pen_n != 0 && (r.pen_repeat != 1.0f || r.pen_freq != 0.0f || r.pen_present != 0.0f);
         if (pen || !r.bias.empty()) {
             row.assign(lg, lg + V);
@@ -247,8 +250,12 @@ struct Sampler {
                     x -= r.pen_freq * (float) k + r.pen_present;
                 }
             }
-            lg = row.data();
+            return row.data();
         }
+        return lg;
+    }
+    void probs(const float* lg, int V, const Req& r, const std::vector<int32_t>& hist, std::vector<float>& P) {
+        lg = warp_row(lg, V, r, hist);
         P.assign((size_t) V, 0.0f);
         const float inv = 1.0f / r.temperature;
         float mx = lg[0];
@@ -306,6 +313,89 @@ struct Sampler {
             }
         return last;
     }
+    using Entry = std::pair<int, float>;
+    using Sparse = std::vector<Entry>;  // increasing token ID, matching dense draw order
+    static float at(const Sparse& p, int id) {
+        auto i = std::lower_bound(p.begin(), p.end(), id, [](const Entry& v, int key) { return v.first < key; });
+        return i == p.end() || i->first != id ? 0.f : i->second;
+    }
+    static int sparse_draw(const Sparse& p, std::mt19937_64& rng) {
+        const double u = std::uniform_real_distribution<double>(0., 1.)(rng);
+        double acc = 0.;
+        for (const auto& v : p) {
+            acc += v.second;
+            if (u <= acc) return v.first;
+        }
+        return p.back().first;
+    }
+    static void residual(const Sparse& p, const Sparse& q, Sparse& out) {
+        out.clear();
+        auto j = q.begin();
+        double sum = 0.;
+        for (const auto& v : p) {
+            while (j != q.end() && j->first < v.first) ++j;
+            const float diff = v.second - (j != q.end() && j->first == v.first ? j->second : 0.f);
+            if (diff > 0.f) { out.emplace_back(v.first, diff); sum += diff; }
+        }
+        if (sum > 0.) {
+            const float inv = (float)(1. / sum);
+            for (auto& v : out) v.second *= inv;
+        }
+    }
+    void sparse_probs(const float* input, int V, const Req& r, const std::vector<int32_t>& hist, Sparse& out) {
+        const float* lg = warp_row(input, V, r, hist);
+        const float mx = *std::max_element(lg, lg + V);
+        const float inv = 1.f / r.temperature;
+        const size_t k = (size_t)r.top_k;
+        auto better = [](const auto& a, const auto& b) {
+            return a.first > b.first || (a.first == b.first && a.second < b.second);
+        };
+        c.clear();
+        auto offer = [&](int id) {
+            if (!((lg[id] - mx) * inv > -20.f)) return;
+            const std::pair<float,int> v = {lg[id] * inv, id};
+            if (c.size() < k) {
+                c.push_back(v);
+                std::push_heap(c.begin(), c.end(), better);
+            } else if (better(v, c.front())) {
+                std::pop_heap(c.begin(), c.end(), better);
+                c.back() = v;
+                std::push_heap(c.begin(), c.end(), better);
+            }
+        };
+        int t = 0;
+        for (; t < V && c.size() < k; ++t) offer(t);
+#if defined(__SSE2__)
+        // Ties with the heap floor cannot replace an earlier (lower-ID) token.
+        const __m128 factor = _mm_set1_ps(inv);
+        for (; t+4 <= V; t+=4) {
+            const __m128 score = _mm_mul_ps(_mm_loadu_ps(lg+t), factor);
+            unsigned mask = (unsigned)_mm_movemask_ps(_mm_cmpgt_ps(score, _mm_set1_ps(c.front().first)));
+            while (mask) { offer(t + __builtin_ctz(mask)); mask &= mask-1; }
+        }
+#endif
+        for (; t < V; ++t) offer(t);
+        std::sort_heap(c.begin(), c.end(), better);
+        // Use the same types, rounding points and summation order as probs().
+        exponent.resize(c.size());
+        double total = 0.;
+        for (size_t j = 0; j < c.size(); ++j)
+            total += (exponent[j] = std::exp((double)(c[j].first - c[0].first)));
+        out.clear();
+        double cum = 0., sum = 0.;
+        for (size_t j = 0; j < c.size(); ++j) {
+            const auto e = exponent[j];
+            cum += e / total;
+            if (j > 0 && r.min_p > 0.f && e < r.min_p * exponent.front()) break;
+            out.emplace_back(c[j].second, (float)e);
+            sum += (float)e;
+            if (r.top_p < 1.f && cum >= r.top_p) break;
+        }
+        const float norm = (float)(1. / sum);
+        for (auto& v : out) v.second *= norm;
+        std::sort(out.begin(), out.end(), [](const Entry& a, const Entry& b) { return a.first < b.first; });
+    }
+    std::vector<double> exponent;
     std::vector<float> pd;
     int next(const float* lg, int V, const Req& r, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
         if (!(r.temperature > 0.0f)) {
@@ -566,8 +656,12 @@ int serve(Model& m, const ServeOptions& so) {
                           (r.pen_n != 0 && (r.pen_repeat != 1.0f || r.pen_freq != 0.0f || r.pen_present != 0.0f));
         // the token for a row: drawn from the target (greedy without a bias / penalty: the verify's argmax), then the
         // thinking budget or WRAP closing an open reasoning block
+        const bool sparse_sample = std::getenv("HY4F_SPARSE_SAMPLE") && r.temperature > 0.f && r.top_k > 0 && r.top_k <= 256;
+        Sampler::Sparse sp, sq[4], sr;
         auto pick = [&](const float* row, int32_t amx) -> int {
-            int t = rows ? sampler.next(row, V, r, state, rng) : amx;
+            int t;
+            if (sparse_sample) { sampler.sparse_probs(row, V, r, state, sp); t = Sampler::sparse_draw(sp, rng); }
+            else t = rows ? sampler.next(row, V, r, state, rng) : amx;
             if (in_think && (produced >= r.think_budget || in.wrap.load()) && t != r.think_end) t = r.think_end;
             return t;
         };
@@ -606,7 +700,10 @@ int serve(Model& m, const ServeOptions& so) {
         auto draft = [&](const int32_t* nt, int T, int64_t mpos) {
             if (!m.mtp(nt, T, mpos, &dr[0], err, ssamp ? mlg.data() : width.logits()))
                 fatal("mtp at " + std::to_string(mpos) + ": " + err, produced, n);
-            if (ssamp) {
+            if (sparse_sample) {
+                sampler.sparse_probs(mlg.data(), V, rq, state, sq[0]);
+                dr[0] = Sampler::sparse_draw(sq[0], rng);
+            } else if (ssamp) {
                 sampler.probs(mlg.data(), V, rq, state, Q[0]);
                 dr[0] = Sampler::draw(Q[0], rng);
             }
@@ -618,7 +715,10 @@ int serve(Model& m, const ServeOptions& so) {
             for (int i = 1; i < room && width.extend(i - 1); ++i) {
                 if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err, ssamp ? mlg.data() : width.logits()))
                     fatal("mtp_chain at " + std::to_string(next + i - 1) + ": " + err, produced, n);
-                if (ssamp) {
+                if (sparse_sample) {
+                    sampler.sparse_probs(mlg.data(), V, rq, state, sq[i]);
+                    dr[i] = Sampler::sparse_draw(sq[i], rng);
+                } else if (ssamp) {
                     sampler.probs(mlg.data(), V, rq, state, Q[i]);
                     dr[i] = Sampler::draw(Q[i], rng);
                 }
@@ -645,12 +745,18 @@ int serve(Model& m, const ServeOptions& so) {
                 int y;
                 bool kept;
                 if (ssamp && i < kk) {
-                    sampler.probs(lgT.data() + (size_t) i * V, V, r, state, Pr);
-                    const float pq = Pr[(size_t) dr[i]], qq = Q[i][(size_t) dr[i]];
+                    const float* logits = lgT.data() + (size_t)i * V;
+                    if (sparse_sample) sampler.sparse_probs(logits, V, r, state, sp);
+                    else sampler.probs(logits, V, r, state, Pr);
+                    const float pq = sparse_sample ? Sampler::at(sp, dr[i]) : Pr[(size_t)dr[i]];
+                    const float qq = sparse_sample ? Sampler::at(sq[i], dr[i]) : Q[i][(size_t)dr[i]];
                     const double u = std::uniform_real_distribution<double>(0.0, 1.0)(rng);
                     kept = qq > 0.0f && u < std::min(1.0, (double) pq / (double) qq);
                     if (kept) {
                         y = dr[i];
+                    } else if (sparse_sample) {
+                        Sampler::residual(sp, sq[i], sr);
+                        y = Sampler::sparse_draw(sr.empty() ? sp : sr, rng);
                     } else {
                         Res.assign((size_t) V, 0.0f);
                         double rs = 0;
