@@ -533,7 +533,7 @@ int serve(Model& m, const ServeOptions& so) {
     const bool turn_mark = std::getenv("HY4F_PREFIX_TURN_MARK") != nullptr;
     size_t saved_prompt = 0;
     const char* host_setting = std::getenv("HY4F_HOST_PREFIX_SLOTS");
-    const bool host_supported = CH == int(HostPrefixIndex::block) && !std::getenv("HY4F_SPARSE_REPLICA");
+    const bool host_supported = CH == int(HostPrefixIndex::block);
     const int host_slots = host_setting && host_supported &&
         (std::strcmp(host_setting, "2") == 0 || std::strcmp(host_setting, "3") == 0) ? host_setting[0] - '0' : 0;
     HostPrefixIndex host_keys(host_slots);
