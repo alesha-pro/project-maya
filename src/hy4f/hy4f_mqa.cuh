@@ -775,7 +775,7 @@ __global__ void __launch_bounds__(256) kd_score_tile(const float* iq, int ldq, c
     using namespace nvcuda;
     constexpr int D=128, LD=136, H=16, KeyWarps=8/Rows, Groups=16*KeyWarps;
     __shared__ __align__(32) __half qs[Rows][H][LD], keys[Groups][LD];
-    __shared__ __align__(32) float dots[8][16][20];
+    __shared__ __align__(32) float dots[8][16][16];
     __shared__ float weight[Rows][H];
     const int tid=threadIdx.x, warp=tid/32, lane=tid%32;
     const int pos0=*pos0p+t0;
@@ -807,7 +807,7 @@ __global__ void __launch_bounds__(256) kd_score_tile(const float* iq, int ldq, c
                 wmma::load_matrix_sync(b,&keys[key_start][k*16],LD);
                 wmma::mma_sync(a,q[k],b,a);
             }
-            wmma::store_matrix_sync(&dots[warp][0][0],a,20,wmma::mem_row_major);
+            wmma::store_matrix_sync(&dots[warp][0][0],a,16,wmma::mem_row_major);
             __syncwarp();
             const int g=gb+key_start+lane;
             if (lane<16 && pos0+token+1>top_k && g<(pos0+token)/kpool) {
