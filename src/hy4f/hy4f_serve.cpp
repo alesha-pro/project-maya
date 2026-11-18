@@ -3,18 +3,28 @@
 //
 //   engine -> server   NOTE <text>, INFO key=value ..., then `READY <context> stop`
 //   server -> engine   GEN <max_new> [key=value ...] <id,id,...>      one request (one conversation at a time)
-//   engine -> server   PP <read> <total> <ms> <tok/s> <reused>         while the prompt is read (every --chunk tokens)
+//   engine -> server   PP <read> <total> <ms> <tok/s> <reused>         after each prefill chunk (--chunk, 2048)
 //                      T <id>                                          each answer token
-//                      STAT tok_s=F ms_tok=F                           every 8 tokens, and at the end
-//                      DONE <generated> <prompt> <prompt ms> <decode ms> <stop|length|cancel> 0 0 <reused> 0 0
+//                      STAT tok_s=F ms_tok=F [drafts=F draft_acc=N draft_off=N k=N]   every 8 tokens, and at the end
+//                      DONE <generated> <prompt> <prompt ms> <decode ms> <stop|length|cancel> <drafts kept> <offered>
+//                           <reused> 0 0
 //   server -> engine   STOP (ends the request: DONE ... cancel), WRAP (the server is stopping: a reasoning block still
 //                      open is closed with think_end and the answer follows), QUIT
 //
 // Keys: temperature (<= 0 or absent: greedy, the argmax, ties to the lower id), top_p, top_k, min_p, seed,
 // penalty_last_n / penalty_repeat / penalty_freq / penalty_present (llama.cpp's, over the last n tokens of the
 // conversation), logit_bias=id:bias,..., think_budget + think_end (an open reasoning block is closed with think_end after
-// that many answer tokens); other keys are taken and ignored.  Sampling runs on the host over the whole row of logits.
+// that many answer tokens), spec=0|1|2..4 (this request's verify window: 0 / 1 no drafts, w: w - 1 drafts fixed);
+// other keys are taken and ignored.  Sampling runs on the host over the whole row of logits.
 // The answer ends at an eos id (--eos; default 120025 = <｜hy_end:opensource｜>), at max_new, or at the context's end.
+//
+// The prompt goes through Model::prefill in chunks of --chunk tokens (the batched path, which also runs the MTP layer
+// over it).  The answer: with the MTP layer, speculative steps - verify [the last token, d0 .. dk-1] in one multi-token
+// step, then for row i draw y_i from the target's own distribution (greedy: its argmax; sampling: the host sampler with
+// the history so far) and keep d_i while y_i == d_i (exact for deterministic drafts), the first y_i that differs is the
+// bonus token; then mtp() over the kept rows drafts d0 and mtp_chain() the rest.  k adapts per request (--spec-k auto:
+// start 2, from the last 16 steps' acceptance of the last draft given the ones before it: k up to 3 when it is mostly
+// kept, down to 1 when rarely); a rejected tail needs no rewind (the next verify writes over it).
 //
 // The conversation in the cache: a prompt that starts with the tokens the cache holds reads only the rest (the last
 // prompt token is always read again: its logits are the answer's first); one that departs from them earlier keeps the
@@ -63,6 +73,7 @@ struct Req {
     int think_end = -1;
     std::vector<std::pair<int, float>> bias;
     std::vector<int32_t> ids;
+    int spec = -1;   // spec=W: verify window (W - 1 drafts); 0 / 1: none; -1: the engine's (--spec-k)
 };
 
 bool parse_gen(const std::string& line, Req& r) {
@@ -89,6 +100,7 @@ bool parse_gen(const std::string& line, Req& r) {
         else if (k == "penalty_present") r.pen_present = std::strtof(v.c_str(), nullptr);
         else if (k == "think_budget") r.think_budget = std::atoll(v.c_str());
         else if (k == "think_end") r.think_end = std::atoi(v.c_str());
+        else if (k == "spec") r.spec = std::atoi(v.c_str());
         else if (k == "logit_bias") {   // id:bias,id:bias
             std::istringstream bs(v);
             for (std::string p; std::getline(bs, p, ',');) {
@@ -211,21 +223,52 @@ struct Sampler {
     }
 };
 
-// The prompt's tokens at positions pos0 .. pos0 + n - 1; the last one's logits to `logits` (when not null).  One step a
-// token today: a batched Model::prefill(ids, n, pos0, logits) (the hy4f branch's next step) drops in here unchanged -
-// the serve loop already calls this per chunk of ServeOptions::chunk tokens and needs only the last row.
-bool prefill(Model& m, const int32_t* ids, int n, int64_t pos0, float* logits, std::string& err) {
-    for (int i = 0; i < n; ++i)
-        if (!m.step(ids[i], pos0 + i, i + 1 == n ? logits : nullptr, err)) return false;
-    return true;
-}
+// The draft count k (1..3) from the last steps: for the last draft offered, how often it was kept when every draft
+// before it was (rate(k - 1)); up when mostly kept, down when rarely.  The cost: a verify of 4 rows is little more than
+// one of 3 on this engine, so a kept draft pays at moderate rates.
+struct KCtl {
+    int k = 2;
+    std::deque<std::pair<int, int>> h;   // (drafts offered, kept) per step
+    double rate(int j, int& n) const {   // P(draft j kept | drafts 0..j-1 kept, j offered)
+        int seen = 0, kept = 0;
+        for (const auto& [off, acc] : h)
+            if (off > j && acc >= j) ++seen, kept += acc > j;
+        n = seen;
+        return seen ? (double) kept / seen : 0.0;
+    }
+    void step(int offered, int kept) {
+        h.push_back({offered, kept});
+        if (h.size() > 16) h.pop_front();
+        int n = 0;
+        const double r = rate(k - 1, n);
+        if (n < 8) return;
+        const int was = k;
+        if (k < 3 && r >= 0.7) ++k;
+        else if (k == 3 && r < 0.45) --k;
+        else if (k == 2 && r < 0.3) --k;
+        if (k != was) h.clear();
+    }
+};
 
 }  // namespace
 
 int serve(Model& m, const ServeOptions& so) {
     const int V = m.vocab();
     const long long C = m.max_context();
-    std::printf("INFO engine=hy4f engine_kind=hy4f model=%s ctx=%lld kv=q8 logit_bias=1\n", so.model_name.c_str(), C);
+    const int CH = std::max(1, so.chunk);
+    const bool mtp = m.has_mtp() && so.spec != 0;
+    std::string err;
+    {   // the prefill arena for --chunk tokens, set up before READY (a card too full for it fails here, not mid-request)
+        const int32_t bos = 120000;
+        if (!m.prefill(&bos, 1, 0, nullptr, CH, err)) {
+            std::fprintf(stderr, "maya-hy4f: the prefill arena (chunk %d): %s\n", CH, err.c_str());
+            return 1;
+        }
+        m.reset();
+    }
+    std::printf("INFO engine=hy4f engine_kind=hy4f model=%s ctx=%lld kv=q8 logit_bias=1 prefill_chunk=%d mtp=%d "
+                "spec_k=%s\n", so.model_name.c_str(), C, CH, mtp ? 1 : 0,
+                !mtp ? "0" : so.spec < 0 ? "auto" : std::to_string(std::min(so.spec, 3)).c_str());
     std::printf("READY %lld stop\n", C);
     std::fflush(stdout);
     std::fprintf(stderr, "maya hy4f serve: GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT\n");
@@ -239,7 +282,8 @@ int serve(Model& m, const ServeOptions& so) {
     Sampler sampler;
     unsigned long long counter = 0;
     bool mark_ok = true;
-    std::string line, err;
+    std::string line;
+    std::vector<float> lgT((size_t) 4 * V);   // verify's rows (sampling, penalties, a bias)
     auto fatal = [&](const std::string& why, long long produced, size_t n_prompt) {
         std::fprintf(stderr, "maya-hy4f: %s\n", why.c_str());
         std::printf("END hy4f: %s\n", why.c_str());
@@ -289,12 +333,11 @@ int serve(Model& m, const ServeOptions& so) {
             std::printf("PP %zu %zu %.1f %.1f %zu\n", done, n, ms, ms > 0 ? 1000.0 * (double) (done - from) / ms : 0.0, from);
             std::fflush(stdout);
         };
-        const int CH = std::max(1, so.chunk);
         for (size_t a = from; a < n;) {
             const int T = (int) std::min<size_t>((size_t) CH, n - a);
             const bool last = a + (size_t) T == n;
-            if (!prefill(m, r.ids.data() + a, T, (int64_t) a, last ? lg.data() : nullptr, err))
-                fatal("prompt step at " + std::to_string(m.position()) + ": " + err, 0, n);
+            if (!m.prefill(r.ids.data() + a, T, (int64_t) a, last ? lg.data() : nullptr, CH, err))
+                fatal("prefill at " + std::to_string(a) + ": " + err, 0, n);
             state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + T);
             a += (size_t) T;
             pp_line(a);
@@ -319,43 +362,105 @@ int serve(Model& m, const ServeOptions& so) {
         long long produced = 0;
         const char* finish = "length";
         bool in_think = r.think_budget > 0 && r.think_end >= 0;
+        long long d_acc = 0, d_off = 0;
+        KCtl kc;
+        if (so.spec > 0) kc.k = std::min(so.spec, 3);
+        const bool adapt = so.spec < 0 && r.spec < 0;
+        if (r.spec >= 0) kc.k = std::min(std::max(r.spec - 1, 0), 3);
+        const bool spec = mtp && kc.k > 0;
         auto stat_line = [&]() {
             const double ms = now_ms() - t1;
-            std::printf("STAT tok_s=%.2f ms_tok=%.2f\n", ms > 0 ? 1000.0 * (double) produced / ms : 0.0,
+            std::printf("STAT tok_s=%.2f ms_tok=%.2f", ms > 0 ? 1000.0 * (double) produced / ms : 0.0,
                         produced > 0 ? ms / (double) produced : 0.0);
+            if (d_off > 0)
+                std::printf(" drafts=%.3f draft_acc=%lld draft_off=%lld k=%d", (double) d_acc / (double) d_off, d_acc, d_off,
+                            kc.k);
+            std::printf("\n");
         };
-        int tok = sampler.next(lg.data(), V, r, state, rng);
-        for (;;) {
+        const bool rows = r.temperature > 0.0f || !r.bias.empty() ||
+                          (r.pen_n != 0 && (r.pen_repeat != 1.0f || r.pen_freq != 0.0f || r.pen_present != 0.0f));
+        // the token for a row: drawn from the target (greedy without a bias / penalty: the verify's argmax), then the
+        // thinking budget or WRAP closing an open reasoning block
+        auto pick = [&](const float* row, int32_t amx) -> int {
+            int t = rows ? sampler.next(row, V, r, state, rng) : amx;
+            if (in_think && (produced >= r.think_budget || in.wrap.load()) && t != r.think_end) t = r.think_end;
+            return t;
+        };
+        // one token out: false when the answer ends with it (an end token, max_new)
+        auto emit = [&](int t) -> bool {
+            std::printf("T %d\n", t);
+            ++produced;
+            if (in_think && t == r.think_end) in_think = false;
+            if (produced % 8 == 0) stat_line();
+            std::fflush(stdout);
+            if (std::find(so.eos.begin(), so.eos.end(), t) != so.eos.end()) {
+                finish = "stop";
+                return false;
+            }
+            return produced < r.max_new;
+        };
+        int32_t amx0 = 0;
+        if (!rows) amx0 = (int32_t) (std::max_element(lg.begin(), lg.end()) - lg.begin());
+        int tok = pick(lg.data(), amx0);   // the next token: drawn, not yet in the cache
+        bool more = !in.stop.load() && emit(tok);
+        if (in.stop.load()) finish = "cancel";
+        int32_t dr[4] = {0, 0, 0, 0}, am[4];
+        // drafts d0 (the MTP over the kept rows, or after the prompt its last state) and d1.. chained
+        auto draft = [&](const int32_t* nt, int T, int64_t mpos) {
+            if (!m.mtp(nt, T, mpos, &dr[0], err)) fatal("mtp at " + std::to_string(mpos) + ": " + err, produced, n);
+            const int64_t next = mpos + T;
+            for (int i = 1; i < kc.k; ++i)
+                if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err))
+                    fatal("mtp_chain at " + std::to_string(next + i - 1) + ": " + err, produced, n);
+        };
+        if (more && spec) draft(&tok, 1, (int64_t) state.size() - 1);
+        while (more) {
             if (in.stop.load()) {
                 finish = "cancel";
                 break;
             }
-            if (in_think && (produced >= r.think_budget || in.wrap.load()) && tok != r.think_end)
-                tok = r.think_end;   // (the thinking budget, or WRAP)
-            std::printf("T %d\n", tok);
-            ++produced;
-            if (in_think && tok == r.think_end) in_think = false;
-            if (produced % 8 == 0) stat_line();
-            std::fflush(stdout);
-            if (std::find(so.eos.begin(), so.eos.end(), tok) != so.eos.end()) {
-                finish = "stop";
+            const int64_t pos = (int64_t) state.size();
+            if (pos >= C) break;   // (the context is full: length)
+            const int kk = spec ? (int) std::min<long long>({(long long) kc.k, C - pos - 1, r.max_new - produced}) : 0;
+            const int32_t vt[4] = {tok, dr[0], dr[1], dr[2]};
+            if (!m.verify(vt, kk + 1, pos, rows ? lgT.data() : nullptr, am, err))
+                fatal("verify at " + std::to_string(pos) + ": " + err, produced, n);
+            state.push_back(tok);
+            int acc = 0;
+            for (int i = 0;; ++i) {
+                const int y = pick(lgT.data() + (size_t) i * V, am[i]);
+                if (i < kk && y == dr[i]) {   // the draft kept: its row is the cache's now
+                    ++acc;
+                    state.push_back(y);
+                    if (!emit(y)) {
+                        more = false;
+                        break;
+                    }
+                    continue;
+                }
+                tok = y;   // the bonus: drawn from row i, not in the cache yet
+                if (!emit(y)) more = false;
                 break;
             }
-            if (produced >= r.max_new || (long long) state.size() >= C) break;
-            if (!m.step(tok, (int64_t) state.size(), lg.data(), err))
-                fatal("decode step at " + std::to_string(state.size()) + ": " + err, produced, n);
-            state.push_back(tok);
-            tok = sampler.next(lg.data(), V, r, state, rng);
+            d_off += kk;
+            d_acc += acc;
+            if (!more || !spec) continue;
+            if (adapt) kc.step(kk, acc);
+            int32_t nt[4];
+            for (int i = 0; i < acc; ++i) nt[i] = dr[i];
+            nt[acc] = tok;
+            draft(nt, acc + 1, pos);   // (the verify's rows 0 .. acc, at pos ..)
         }
         stat_line();
         const double t2 = now_ms();
-        std::printf("DONE %lld %zu %.1f %.1f %s 0 0 %zu 0 0\n", produced, n, t1 - t0, t2 - t1, finish, from);
+        std::printf("DONE %lld %zu %.1f %.1f %s %lld %lld %zu 0 0\n", produced, n, t1 - t0, t2 - t1, finish, d_acc, d_off,
+                    from);
         std::fflush(stdout);
         std::fprintf(stderr,
                      "maya hy4f serve: prompt %zu tokens = %zu reused + %zu read in %.0f ms (%.1f tok/s), %lld generated "
-                     "in %.0f ms (%.2f tok/s), %s\n",
+                     "in %.0f ms (%.2f tok/s), drafts %lld of %lld kept (k %d at the end), %s\n",
                      n, from, n - from, t1 - t0, t1 > t0 ? 1000.0 * (double) (n - from) / (t1 - t0) : 0.0, produced,
-                     t2 - t1, t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0, finish);
+                     t2 - t1, t2 > t1 ? 1000.0 * (double) produced / (t2 - t1) : 0.0, d_acc, d_off, kc.k, finish);
     }
     return 0;
 }

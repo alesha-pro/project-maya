@@ -1580,3 +1580,88 @@ void native_q4_k_mmvq_ids(const void* weights, std::size_t expert_bytes, const i
 }
 
 }  // namespace strata::kernels
+
+// ---------------------------------------------------------------------------------------------------------------
+// hy4f: the routed-expert MMVQ with the slot loop inside the block: one block per ROWS output rows walks all n_ids
+// slots and skips the other shards' experts (id < 0) without a launch.  The per-slot math is native_kq_mmvq_ids_kernel's
+// (bitwise the same rows); the grid is n_out / ROWS blocks instead of n_out / ROWS x n_ids (that launch was mostly
+// blocks that exited at once: with 4 shards 3 slots in 4 are another shard's).  Other shards' columns are NOT written.
+namespace strata::kernels {
+namespace {
+
+template <class Block, float (*Dot)(const Block* __restrict__, const Q81Block* __restrict__, int), int KQS_MUL>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_kq_mmvq_ids_loop_kernel(const Block* __restrict__ w, std::size_t expert_blocks,
+                                               const int* __restrict__ ids, int n_ids, const Q81Block* __restrict__ x,
+                                               std::size_t x_col_blocks, float* __restrict__ y, int n_in, int n_out) {
+    constexpr int ROWS = WARPS;
+    constexpr int BLOCKS_PER_ITER = 8;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / QK;
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    for (int k = 0; k < n_ids; ++k) {
+        const int id = ids[k];
+        if (id < 0) continue;
+        const Block* __restrict__ wk = w + std::size_t(id) * expert_blocks;
+        const Q81Block* __restrict__ xk = x + std::size_t(k) * x_col_blocks;
+        float tmp[ROWS] = {};
+        for (int kbx = tid / 16; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+            const int kby = kbx * (QK / Q8K);
+            const int kqs = KQS_MUL * (tid % 16);
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+                if (row0 + i < n_out) {
+                    const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                    tmp[i] += Dot(wk + block, xk + kby, kqs);
+                }
+            }
+        }
+        if (threadIdx.y > 0) {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+        }
+        __syncthreads();
+        if (threadIdx.y == 0) {
+#pragma unroll
+            for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+                for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+                tmp[i] = warp_sum(tmp[i]);
+                if (threadIdx.x == i && row0 + i < n_out) y[std::size_t(k) * n_out + row0 + i] = tmp[i];
+            }
+        }
+        __syncthreads();
+    }
+}
+
+template <class Block, float (*Dot)(const Block* __restrict__, const Q81Block* __restrict__, int), int KQS_MUL>
+void launch_ids_loop(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids, const void* x_q8_1,
+                     bool x_shared, float* y, int n_in, int n_out, void* stream) {
+    if (n_in <= 0 || n_in % QK != 0 || n_in / QK >= 8) throw std::invalid_argument("native MMVQ ids: n_in");
+    if (n_out <= 0 || n_ids <= 0) throw std::invalid_argument("native MMVQ ids: n_out / n_ids");
+    if (expert_bytes % sizeof(Block) != 0) throw std::invalid_argument("native MMVQ ids: expert_bytes");
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const dim3 threads(WARP, WARPS);
+    const dim3 blocks(unsigned((n_out + WARPS - 1) / WARPS), 1u);
+    native_kq_mmvq_ids_loop_kernel<Block, Dot, KQS_MUL><<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const Block*>(weights), expert_bytes / sizeof(Block), ids, n_ids, static_cast<const Q81Block*>(x_q8_1),
+        x_shared ? 0 : std::size_t(n_in / Q8K), y, n_in, n_out);
+    launch_check();
+}
+
+}  // namespace
+
+void native_q3_k_mmvq_ids_loop(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids,
+                               const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream) {
+    launch_ids_loop<Q3KBlock, q3_q8_dot, 1>(weights, expert_bytes, ids, n_ids, x_q8_1, x_shared, y, n_in, n_out, stream);
+}
+void native_q4_k_mmvq_ids_loop(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids,
+                               const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream) {
+    launch_ids_loop<Q4KBlock, q4_q8_dot, VDR>(weights, expert_bytes, ids, n_ids, x_q8_1, x_shared, y, n_in, n_out, stream);
+}
+
+}  // namespace strata::kernels

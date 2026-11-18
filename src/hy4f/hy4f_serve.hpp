@@ -10,7 +10,8 @@ namespace strata::hy4f {
 
 struct ServeOptions {
     std::vector<int> eos{120025};   // the tokens that end an answer (<｜hy_end:opensource｜>)
-    int chunk = 64;                 // prompt tokens per PP line (and per prefill call, once the engine reads batches)
+    int chunk = 2048;               // prompt tokens per Model::prefill call (and PP line)
+    int spec = -1;                  // MTP drafts per step: -1 adaptive (1..3), 0 none, 1..3 fixed
     std::string model_name = "Hy4-flash";
 };
 

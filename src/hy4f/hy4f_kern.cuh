@@ -192,7 +192,8 @@ __global__ void k_hc_post(float* X, const float* R, const float* y, const float*
 // ------------------------------------------------------------------------------------------------ Q8 latent KV
 // A row: int8 q[576] then half scales[9] (one per 64 values: c 0..511 in 8 groups, k_pe 512..575 in one): 594 bytes,
 // padded to 608 (16-byte aligned rows for vector loads).
-constexpr int KV_ROW = 576, KV_GROUPS = 9, KV_RB = 608;   // 576 int8 + 9 half scales, padded to 16-byte rows
+constexpr int KV_ROW = 576, KV_GROUPS = 9, KV_RB = 608;
+constexpr int RING_PAD = 16;   // SWA ring rows = window + RING_PAD: a multi-token step writes its rows before it reads the window   // 576 int8 + 9 half scales, padded to 16-byte rows
 __device__ __forceinline__ float kv_val(const uint8_t* row, int j) {
     const __half* sc = reinterpret_cast<const __half*>(row + KV_ROW);
     return (float) reinterpret_cast<const int8_t*>(row)[j] * __half2float(sc[j >> 6]);
@@ -296,7 +297,7 @@ __global__ void k_attn_q8(const float* qabs, const float* q, int qs, int nope, c
     float mx = -INFINITY;
     for (int s = wid; s < n; s += nw) {
         int row = -1;
-        if (!cells) row = (lo + s) % win;
+        if (!cells) row = (lo + s) % (win + RING_PAD);
         else {
             const int c = cells[s];
             if (c >= 0 && (n_shards == 1 || c % n_shards == shard)) row = n_shards == 1 ? c : c / n_shards;
@@ -330,7 +331,7 @@ __global__ void k_attn_q8(const float* qabs, const float* q, int qs, int nope, c
             const float e = s_[s];
             if (e == 0.0f) continue;
             int row;
-            if (!cells) row = (lo + s) % win;
+            if (!cells) row = (lo + s) % (win + RING_PAD);
             else {
                 const int c = cells[s];
                 row = n_shards == 1 ? c : c / n_shards;
@@ -389,16 +390,16 @@ __global__ void k_pool(const float* ring, const float* ape, const float* norm, f
     if (d < kd) pooled[(size_t) g * kd + d] = vals[d];
 }
 // score[g] = sum_h relu(iq_h . pooled_g) * w_h over the candidate groups g < pos / kpool (warp per group)
-__global__ void k_score(const float* iq, const float* pooled, const float* w, int kd, int nh, int kpool, int top_k,
+__global__ void k_score(const float* iq, const __half* pooled, const float* w, int kd, int nh, int kpool, int top_k,
                         const Io* io, float* score) {
     const int pos = io->pos;
     if (pos + 1 <= top_k) return;
     const int n_pool = pos / kpool;
     const int warp = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
     if (warp >= n_pool) return;
-    const float* pk = pooled + (size_t) warp * kd;
+    const __half* pk = pooled + (size_t) warp * kd;
     float pv[4];
-    for (int i = 0; i < 4; ++i) pv[i] = lane + 32 * i < kd ? pk[lane + 32 * i] : 0.0f;
+    for (int i = 0; i < 4; ++i) pv[i] = lane + 32 * i < kd ? __half2float(pk[lane + 32 * i]) : 0.0f;
     float s = 0.0f;
     for (int h = 0; h < nh; ++h) {
         float d = 0.0f;
@@ -487,6 +488,19 @@ __global__ void k_moe_sum(float* moe, const float* dn, const float* w, const int
 // recv[parity][src][payload], fences, stores the step into the peer's flag slot for it, waits for every peer's flag,
 // then reads ONLY local memory.  Two receive areas by parity: a peer can be at most one step ahead before it waits on
 // our next flag, so the area we read is never overwritten.
+// a stalled exchange (a peer died or a launch failed) traps after ~10 s instead of spinning forever: the process gets
+// an error the server can restart on
+__device__ __forceinline__ unsigned long long hy4f_now() {
+    unsigned long long t;
+    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+    return t;
+}
+__device__ __forceinline__ void hy4f_spin_guard(unsigned long long t0) {
+    if (hy4f_now() - t0 > 10000000000ull) {
+        printf("hy4f: exchange stalled (block %d thread %d)\n", (int) blockIdx.x, (int) threadIdx.x);
+        __trap();
+    }
+}
 struct Peers {
     float* buf[4][2];   // shard j's receive area of parity p (device pointers, peer-accessible)
     int* flag[4];       // shard j's flag array [4]
@@ -499,8 +513,8 @@ __device__ __forceinline__ void peers_signal_wait(const Peers& P, int me, int n_
         volatile int* f = P.flag[threadIdx.x];
         f[me] = step;
         volatile int* mine = P.flag[me];
-        while (mine[threadIdx.x] < step) {
-        }
+        const unsigned long long t0 = hy4f_now();
+        while (mine[threadIdx.x] < step) hy4f_spin_guard(t0);
     }
     __syncthreads();
     __threadfence_system();
@@ -708,7 +722,7 @@ __global__ void __launch_bounds__(256) k_attn2(const float* qabs, const float* q
     for (int i = 0; i < 16; ++i) acc[i] = 0.0f;
     for (int s = w; s < n; s += NW) {
         int row;
-        if (!cells) row = (lo + s) % win;
+        if (!cells) row = (lo + s) % (win + RING_PAD);
         else {
             const int c = cells[s];
             row = (c >= 0 && (n_shards == 1 || c % n_shards == shard)) ? (n_shards == 1 ? c : c / n_shards) : -1;
@@ -841,7 +855,7 @@ __global__ void k_ar_post(const float* x1, const float* x2, int n, Peers P, int 
     }
 }
 // the indexer's value/gate pair into the ring + pooling when the group completes (k_ring_store + k_pool fused)
-__global__ void k_ring_pool(const float* ivg, float* ring, const float* ape, const float* norm, float* pooled, int kd,
+__global__ void k_ring_pool(const float* ivg, float* ring, const float* ape, const float* norm, __half* pooled, int kd,
                             int kpool, int n_rot, float eps, float theta, const Io* io) {
     const int pos = io->pos, slot = pos % kpool, d = threadIdx.x;
     if (d < kd) {
@@ -875,8 +889,19 @@ __global__ void k_ring_pool(const float* ivg, float* ring, const float* ape, con
         vals[base + 2 * d + 1] = a * s + b * c;
     }
     __syncthreads();
-    if (d < kd) pooled[(size_t) g * kd + d] = vals[d];
+    if (d < kd) pooled[(size_t) g * kd + d] = __float2half_rn(vals[d]);
 }
 
+// SwiGLU (+ clamp) of [rows][gate n_ff | up n_ff] -> Q8_1 of rows * n_ff (row-major h)
+__global__ void k_swiglu_gu_q8(const float* gu, int n_ff, int n, float lim, Q81* q) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    float v = 0.0f;
+    if (i < n) {
+        const int r = i / n_ff, c = i % n_ff;
+        const float g = fminf(gu[(size_t) r * 2 * n_ff + c], lim), u = fminf(fmaxf(gu[(size_t) r * 2 * n_ff + n_ff + c], -lim), lim);
+        v = silu(g) * u;
+    }
+    if ((i & ~31) < n) q81_store(q + i / 32, v);
+}
 }  // namespace kern
 }  // namespace strata::hy4f

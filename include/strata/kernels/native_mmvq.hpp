@@ -118,4 +118,9 @@ void native_q3_k_mmvq_ids(const void* weights, std::size_t expert_bytes, const i
                           const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream);
 void native_q4_k_mmvq_ids(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids,
                           const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream);
+// the slot loop inside the block (one block per rows, all n_ids slots; id < 0 slots skipped and NOT written)
+void native_q3_k_mmvq_ids_loop(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids,
+                               const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream);
+void native_q4_k_mmvq_ids_loop(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids,
+                               const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream);
 } // namespace strata::kernels

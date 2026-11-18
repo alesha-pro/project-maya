@@ -29,6 +29,18 @@ public:
     bool load(const Options& o, std::string& err);
     /// one token at position pos (pos must be the next position); logits (vocab) to the host when `logits` != null
     bool step(int32_t token, int64_t pos, float* logits, std::string& err);
+    /// n tokens at positions pos .. pos + n - 1 in chunks of `chunk` (the batched path); the last token's logits
+    bool prefill(const int32_t* toks, int n, int64_t pos, float* logits, int chunk, std::string& err);
+    /// T (1..4) tokens at positions pos .. pos+T-1 (pos <= the next position: a rejected tail is overwritten), logits
+    /// of every row ([T][vocab], may be null) and their argmax; keeps the rows' final hidden states for mtp()
+    bool verify(const int32_t* toks, int T, int64_t pos, float* logits, int32_t* argmax, std::string& err);
+    /// the MTP draft layer over (the last verify's hidden rows 0..T-1, next_toks[0..T)) at positions mpos ..; the
+    /// draft for the token after next_toks[T-1].  After prefill, row 0 holds the prompt's last state.
+    bool mtp(const int32_t* next_toks, int T, int64_t mpos, int32_t* draft, std::string& err);
+    /// the next draft from the MTP's own last state (after mtp() or a previous mtp_chain()) and the previous draft
+    /// token at position mpos
+    bool mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& err);
+    bool has_mtp() const;
     int vocab() const;
     std::string summary() const;
 
@@ -37,15 +49,17 @@ public:
     int64_t position() const;
     int64_t max_context() const;
     /// keep the cache's first `pos` positions (the next step is at `pos`).  Every cache is indexed by position, so a
-    /// later step finds the rows it reads - except in the two rings: the SWA layers' (the last `window` positions) and
-    /// the indexer's (the current k-pool group).  A shorter prefix is kept where the rings still hold it (nothing was
-    /// written past it that aliases a row it needs) or where mark()'s copy does, else the start of pos's indexer group
-    /// where that is enough, else 0.  Returns the position kept (<= pos), -1 on a CUDA error (err).
+    /// later step finds the rows it reads - except in the rings: the SWA layers' (window + RING_PAD rows) and the
+    /// indexer's (the current k-pool group).  A shorter prefix is kept where the rings still hold it (nothing written
+    /// past it aliases a row it needs) or where mark()'s copy does, else the start of pos's indexer group where that is
+    /// enough, else 0.  The MTP layer's caches follow best effort (a stale row only costs draft acceptance).  Returns
+    /// the position kept (<= pos), -1 on a CUDA error (err).
     int64_t rewind(int64_t pos, std::string& err);
     /// back to position 0 (no copy: the caches are overwritten as the positions come again)
     void reset();
-    /// copy both rings as they are now (the prompt read, before the answer): a later rewind to this position, or to
-    /// the one before it, gets them back - the next turn of a chat whose template drops the answer's reasoning
+    /// copy the rings (trunk and MTP layer) as they are now (the prompt read, before the answer): a later rewind to
+    /// this position, or to the one before it, gets them back - the next turn of a chat whose template drops the
+    /// answer's reasoning
     bool mark(std::string& err);
 
 private:
