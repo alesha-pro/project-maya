@@ -254,12 +254,19 @@ struct Sampler {
         for (int i = 1; i < V; ++i) mx = std::max(mx, lg[i]);
         const bool cut = r.top_k > 0 || r.top_p < 1.0f || r.min_p > 0.0f;
         double sum = 0;
-        if (!cut) {
-            for (int i = 0; i < V; ++i) sum += (P[(size_t) i] = std::exp((lg[i] - mx) * inv));
+        if (!cut) {   // (float expf; tokens more than 20 nats below the best weigh < 2e-9: left at 0)
+            float fs = 0.0f;
+            for (int i = 0; i < V; ++i) {
+                const float z = (lg[i] - mx) * inv;
+                const float e = z > -20.0f ? expf(z) : 0.0f;
+                P[(size_t) i] = e;
+                fs += e;
+            }
+            sum = fs;
         } else {
             cand.clear();
             for (int i = 0; i < V; ++i)
-                if ((lg[i] - mx) * inv > -30.0f) cand.push_back(i);
+                if ((lg[i] - mx) * inv > -20.0f) cand.push_back(i);
             c.resize(cand.size());
             for (size_t j = 0; j < cand.size(); ++j) c[j] = {lg[cand[j]] * inv, cand[j]};
             const size_t k = r.top_k > 0 ? std::min((size_t) r.top_k, c.size()) : c.size();
