@@ -98,7 +98,8 @@ public:
     // Save one chunk-aligned prefix before a long prompt's tail.
     bool mark_prefix(std::string& err, bool cold_aligned = false);
     // Complete, bounded text-prefix snapshots, independent of the current sequence on the GPUs.
-    bool save_host_prefix(int slot, std::string& err);
+    bool preallocate_host_prefixes(int slots, int64_t short_rows, int64_t deep_rows, std::string& err);
+    bool save_host_prefix(int slot, std::string& err, double* d2h_ms = nullptr);
     bool load_host_prefix(int slot, int64_t pos, std::string& err);
 
 private:

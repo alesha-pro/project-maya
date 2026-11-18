@@ -509,6 +509,22 @@ int serve(Model& m, const ServeOptions& so) {
         }
         m.reset();
     }
+    const char* host_setting = std::getenv("HY4F_HOST_PREFIX_SLOTS");
+    const bool host_supported = CH == int(HostPrefixIndex::block);
+    const int host_slots = host_setting && host_supported &&
+        (std::strcmp(host_setting, "2") == 0 || std::strcmp(host_setting, "3") == 0) ? host_setting[0] - '0' : 0;
+    HostPrefixIndex host_keys(host_slots, std::getenv("HY4F_DEEP_HOST_PREFIX") != nullptr);
+    if (host_setting && !host_slots)
+        std::fprintf(stderr, "maya hy4f serve: host prefix cache requires slots 2 or 3 and chunk 2048\n");
+    const char* reserve = std::getenv("HY4F_HOST_PREFIX_PREALLOC");
+    if (host_slots && reserve && std::strcmp(reserve, "1") == 0) {
+        const double started = now_ms();
+        const bool ok = m.preallocate_host_prefixes(host_slots, HostPrefixIndex::checkpoint(C),
+                                                    host_keys.deep_checkpoint(C), err);
+        std::fprintf(stderr, "maya hy4f serve: host prefix prealloc before READY ms=%.1f status=%s\n",
+                     now_ms() - started, ok ? "ready" : "on-demand");
+        if (!ok) std::fprintf(stderr, "maya hy4f serve: host prefix prealloc failed (%s)\n", err.c_str());
+    }
     std::printf("INFO engine=hy4f engine_kind=hy4f model=%s ctx=%lld kv=q8 logit_bias=1 prefill_chunk=%d mtp=%d "
                 "spec_k=%s\n", so.model_name.c_str(), C, CH, mtp ? 1 : 0,
                 !mtp ? "0" : so.spec < 0 ? "auto" : std::to_string(std::min(so.spec, 3)).c_str());
@@ -532,13 +548,6 @@ int serve(Model& m, const ServeOptions& so) {
     bool mark_ok = true;
     const bool turn_mark = std::getenv("HY4F_PREFIX_TURN_MARK") != nullptr;
     size_t saved_prompt = 0;
-    const char* host_setting = std::getenv("HY4F_HOST_PREFIX_SLOTS");
-    const bool host_supported = CH == int(HostPrefixIndex::block);
-    const int host_slots = host_setting && host_supported &&
-        (std::strcmp(host_setting, "2") == 0 || std::strcmp(host_setting, "3") == 0) ? host_setting[0] - '0' : 0;
-    HostPrefixIndex host_keys(host_slots, std::getenv("HY4F_DEEP_HOST_PREFIX") != nullptr);
-    if (host_setting && !host_slots)
-        std::fprintf(stderr, "maya hy4f serve: host prefix cache requires slots 2 or 3 and chunk 2048\n");
     bool prefix_mark = std::getenv("HY4F_PREFIX_CHECKPOINT") != nullptr;
     std::string line;
     std::vector<float> lgT((size_t) 4 * V);   // verify's rows (sampling, penalties, a bias)
@@ -711,10 +720,11 @@ int serve(Model& m, const ServeOptions& so) {
                 if (slot >= 0) {
                     const double started = now_ms();
                     host_keys.clear(slot);
-                    if (m.save_host_prefix(slot, err)) {
+                    double d2h_ms = 0;
+                    if (m.save_host_prefix(slot, err, &d2h_ms)) {
                         host_keys.publish(slot, state);
-                        std::fprintf(stderr, "maya hy4f serve: host prefix saved slot=%d rows=%zu ms=%.1f\n",
-                                     slot, a, now_ms() - started);
+                        std::fprintf(stderr, "maya hy4f serve: host prefix saved slot=%d rows=%zu ms=%.1f d2h_ms=%.1f\n",
+                                     slot, a, now_ms() - started, d2h_ms);
                     } else {
                         std::fprintf(stderr, "maya hy4f serve: host prefix save failed (%s)\n", err.c_str());
                     }

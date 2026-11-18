@@ -1523,15 +1523,13 @@ void Model::transfer_prefix(bool save) {
 
 struct Model::HostPrefix {
     struct Buffer { uint8_t* ptr = nullptr; size_t capacity = 0; };
+    struct Region { void* device; size_t bytes; };
     std::vector<Buffer> buffers;
-    int64_t pos = 0;
+    int64_t pos = 0, capacity_rows = 0;
+    explicit HostPrefix(int shards) : buffers(shards) {}
     ~HostPrefix() { for (auto& b : buffers) if (b.ptr) cudaFreeHost(b.ptr); }
-};
 
-void Model::transfer_host_prefix(HostPrefix& slot, int64_t pos, bool save) {
-    Impl& d = *d_;
-    d.launch_parallel([&](Shard& s) {
-        struct Region { void* device; size_t bytes; };
+    static std::vector<Region> regions(Impl& d, Shard& s, int64_t pos) {
         std::vector<Region> regions;
         for (int il = 0; il < d.L + int(d.has_mtp); ++il) {
             auto ring = serve_ring(s, il, d.swa[il] != 0, d.win, d.kpool, d.IK);
@@ -1548,20 +1546,79 @@ void Model::transfer_host_prefix(HostPrefix& slot, int64_t pos, bool save) {
         }
         regions.push_back({s.hist, size_t(pos) * sizeof(int)});
         if (d.has_mtp) regions.push_back({d.bsh[s.g].hprev, size_t(d.E) * sizeof(float)});
+        return regions;
+    }
 
+    void reserve(Impl& d, int i, int64_t rows) {
+        if (rows <= capacity_rows) return;
+        capacity_rows = 0;  // A failed grow can leave different capacities on different shards.
+        std::vector<double> alloc_ms(d.S);
+        using clock = std::chrono::steady_clock;
+        const auto start = clock::now();
+        auto report = [&](bool ok) {
+            size_t bytes = 0;
+            for (const auto& b : buffers) bytes += b.capacity;
+            std::fprintf(stderr, "maya hy4f serve: host prefix reserve slot=%d rows=%lld bytes=%zu "
+                         "cuda_alloc_max_ms=%.1f grow_wall_ms=%.1f ok=%d\n", i, (long long)rows, bytes,
+                         *std::max_element(alloc_ms.begin(), alloc_ms.end()),
+                         std::chrono::duration<double, std::milli>(clock::now() - start).count(), int(ok));
+        };
+        try {
+            d.launch_parallel([&](Shard& s) {
+                size_t bytes = 0;
+                for (const auto& r : regions(d, s, rows)) bytes += r.bytes;
+                auto& b = buffers[s.g];
+                if (bytes <= b.capacity) return;
+                if (b.ptr) HY_CK(cudaFreeHost(b.ptr));
+                b = {};
+                uint8_t* ptr = nullptr;
+                const auto t = clock::now();
+                const auto rc = cudaHostAlloc(reinterpret_cast<void**>(&ptr), bytes, cudaHostAllocPortable);
+                alloc_ms[s.g] = std::chrono::duration<double, std::milli>(clock::now() - t).count();
+                if (rc != cudaSuccess) {
+                    cudaGetLastError();  // Recoverable reservation failure on this launcher thread.
+                    HY_CK(rc);
+                }
+                b = {ptr, bytes};
+            });
+        } catch (...) { report(false); throw; }
+        capacity_rows = rows;
+        report(true);
+    }
+};
+
+bool Model::preallocate_host_prefixes(int slots, int64_t short_rows, int64_t deep_rows, std::string& err) {
+    try {
+        if (!host_prefixes_.empty() || (slots != 2 && slots != 3) || d_->bsh.empty() ||
+            short_rows < 0 || deep_rows < 0 || short_rows >= max_context() || deep_rows >= max_context())
+            throw std::runtime_error("invalid host prefix reservation");
+        // Publish the whole reservation only when it fits. On failure the temporaries unpin
+        // every successful allocation, including other shards of the incomplete slot.
+        std::vector<std::shared_ptr<HostPrefix>> pending;
+        for (int64_t rows : {short_rows, deep_rows}) {
+            if (!rows) continue;
+            for (int i = 0; i < slots; ++i) {
+                auto slot = std::make_shared<HostPrefix>(d_->S);
+                slot->reserve(*d_, int(pending.size()), rows);
+                pending.push_back(std::move(slot));
+            }
+        }
+        host_prefixes_.swap(pending);
+        return true;
+    } catch (const std::exception& e) { err = e.what(); return false; }
+}
+
+void Model::transfer_host_prefix(HostPrefix& slot, int64_t pos, bool save) {
+    Impl& d = *d_;
+    d.launch_parallel([&](Shard& s) {
+        auto regions = HostPrefix::regions(d, s, pos);
         auto& buffer = slot.buffers[s.g];
         size_t bytes = 0;
-        for (const Region& r : regions) bytes += r.bytes;
-        if (save && bytes > buffer.capacity) {
-            if (buffer.ptr) HY_CK(cudaFreeHost(buffer.ptr));
-            buffer = {};
-            HY_CK(cudaHostAlloc(reinterpret_cast<void**>(&buffer.ptr), bytes, cudaHostAllocPortable));
-            buffer.capacity = bytes;
-        }
+        for (const auto& r : regions) bytes += r.bytes;
         if (!buffer.ptr || buffer.capacity < bytes) throw std::runtime_error("host prefix buffer incomplete");
         size_t offset = 0;
         try {
-            for (const Region& r : regions) {
+            for (const auto& r : regions) {
                 if (save) HY_CK(cudaMemcpyAsync(buffer.ptr + offset, r.device, r.bytes, cudaMemcpyDeviceToHost, s.st));
                 else HY_CK(cudaMemcpyAsync(r.device, buffer.ptr + offset, r.bytes, cudaMemcpyHostToDevice, s.st));
                 offset += r.bytes;
@@ -1576,16 +1633,19 @@ void Model::transfer_host_prefix(HostPrefix& slot, int64_t pos, bool save) {
     });
 }
 
-bool Model::save_host_prefix(int i, std::string& err) {
+bool Model::save_host_prefix(int i, std::string& err, double* d2h_ms) {
     try {
         if (i < 0 || i >= 6 || d_->pos_next < 4096 || d_->pos_next >= d_->o.max_context || d_->pos_next % 2048 || d_->bsh.empty())
             throw std::runtime_error("invalid host prefix checkpoint");
         if (host_prefixes_.size() <= size_t(i)) host_prefixes_.resize(i + 1);
         auto& slot = host_prefixes_[i];
-        if (!slot) slot = std::make_shared<HostPrefix>();
+        if (!slot) slot = std::make_shared<HostPrefix>(d_->S);
         slot->pos = 0;
-        slot->buffers.resize(d_->S);
+        slot->reserve(*d_, i, d_->pos_next);
+        const auto start = std::chrono::steady_clock::now();
         transfer_host_prefix(*slot, d_->pos_next, true);
+        if (d2h_ms)
+            *d2h_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         slot->pos = d_->pos_next;
         return true;
     } catch (const std::exception& e) { err = e.what(); return false; }
