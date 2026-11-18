@@ -14,6 +14,7 @@ static constexpr int DT = 6;   // (the DFly build: the block = bonus + 5 drafts;
 static constexpr int DT = 4;   // (6 costs ~40 MB per GPU and ~3% of prefill / T<=4 decode: the default build stays at 4)
 #endif
 static constexpr int NSP = 16;
+bool fuse_rms_q81 = std::getenv("HY4F_RMS_Q81") && std::atoi(std::getenv("HY4F_RMS_Q81")) != 0;
 bool short_graphs = std::getenv("HY4F_SHORT_GRAPH") != nullptr;
 bool q3_pair_layout = DT == 4 && std::getenv("HY4F_PACK_Q3") && !std::getenv("HY4F_IDS_LOOP")
                       && !std::getenv("HY4F_DEC_EAGER");
@@ -449,9 +450,13 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     const int xpc = rows_of(s,P+"xproj"), qpc = !sw && dense_dsa ? Ha * QH : rows_of(s,P+"qproj");
     const int oq = 0, okv = q_lora, og = q_lora + KV_ROW, oik = og + Hl * vh;
     if (!ready) {
-        if (mtp) kb_rms<<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "attn_norm.weight"), E, eps, d.x, E);
-        else d_norm_in(s, d, P, "hc_attn", P + "attn_norm.weight", 2 * hc, hc_mag, T);
-        k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
+        if (mtp && fuse_rms_q81 && E == 3072) {
+            kd_rms_q81<3><<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "attn_norm.weight"), E, eps, d.x, d.xq);
+        } else {
+            if (mtp) kb_rms<<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "attn_norm.weight"), E, eps, d.x, E);
+            else d_norm_in(s, d, P, "hc_attn", P + "attn_norm.weight", 2 * hc, hc_mag, T);
+            k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
+        }
     }
     if (d.hc_side && !mtp && fuse_ok())
         d_hc_prepare(s,d,hc_next(s,P,"hc_ffn",P+"ffn_norm.weight",2*hc,hc_mag),T);
@@ -482,8 +487,13 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         pp = last_pos;
         T = 1;
     }
-    kb_rms<<<T, 1024, 0, s.st>>>(d.xp + oq, xpc, f32(s, P + "attn_q_a_norm.weight"), q_lora, eps, d.qr, q_lora);
-    k_q8<<<nb(T * q_lora), 256, 0, s.st>>>(d.qr, T * q_lora, d.xq);
+    if (fuse_rms_q81 && q_lora == 1024) {
+        kd_rms_q81<1><<<T, 1024, 0, s.st>>>(d.xp + oq, xpc, f32(s, P + "attn_q_a_norm.weight"),
+                                            q_lora, eps, nullptr, d.xq);
+    } else {
+        kb_rms<<<T, 1024, 0, s.st>>>(d.xp + oq, xpc, f32(s, P + "attn_q_a_norm.weight"), q_lora, eps, d.qr, q_lora);
+        k_q8<<<nb(T * q_lora), 256, 0, s.st>>>(d.qr, T * q_lora, d.xq);
+    }
     if (!sw && dense_dsa) {
         const DW& q = s.w.at(P + "qproj");
         const auto* weights=static_cast<const uint8_t*>(q.d)+(size_t)query_first*QH*q.rb;
@@ -646,16 +656,25 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
 void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, const HcNext* nx_after = nullptr) {
     const std::string P = "blk." + std::to_string(il) + ".";
     if (!ready) {
-        if (mtp) kb_rms<<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "ffn_norm.weight"), E, eps, d.x, E);
-        else d_norm_in(s, d, P, "hc_ffn", P + "ffn_norm.weight", 2 * hc, hc_mag, T);
-        k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
+        if (mtp && fuse_rms_q81 && E == 3072) {
+            kd_rms_q81<3><<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "ffn_norm.weight"), E, eps, d.x, d.xq);
+        } else {
+            if (mtp) kb_rms<<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "ffn_norm.weight"), E, eps, d.x, E);
+            else d_norm_in(s, d, P, "hc_ffn", P + "ffn_norm.weight", 2 * hc, hc_mag, T);
+            k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
+        }
     }
     if (d.hc_side && !mtp && nx_after) d_hc_prepare(s,d,*nx_after,T);
     if (il < dense_lead) {
         const int fl = n_ff / S;
         dec_mmvq(s, P + "dense_gu", d.xq, d.ga, T);
-        kb_swiglu_rows<<<dim3(nb(fl), T), 256, 0, s.st>>>(d.ga, 2 * fl, fl, T, d.shh);
-        k_q8<<<nb(T * fl), 256, 0, s.st>>>(d.shh, T * fl, d.xq);
+        if (fuse_rms_q81 && fl % 32 == 0) {
+            kd_ffn_q8<<<dim3(nb(fl), T), 256, 0, s.st>>>(nullptr, nullptr, nullptr, 0, 0, d.ga,
+                                                         2 * fl, fl, nullptr, d.xq);
+        } else {
+            kb_swiglu_rows<<<dim3(nb(fl), T), 256, 0, s.st>>>(d.ga, 2 * fl, fl, T, d.shh);
+            k_q8<<<nb(T * fl), 256, 0, s.st>>>(d.shh, T * fl, d.xq);
+        }
         dec_mmvq(s, P + "ffn_down.weight", d.xq, d.ffo, T);
         d_ar(s, d, d.ffo, nullptr, P + "post_ffw_norm.weight", T, mtp, nx_after);
         return;
@@ -814,11 +833,17 @@ void mtp_ops(Shard& s, DShard& d, int T, bool chain = false, bool dense_dsa = fa
     if (dense_dsa) kd_dense_cells<<<dim3(nb(n_cap), T), 256, 0, s.st>>>(pp, n_cap, d.cells);
     const std::string P = "blk." + std::to_string(L) + ".";
     const DW& emb = s.w.at("token_embd.weight");
-    kd_embed_rows<<<dim3(nb(E), T), 256, 0, s.st>>>((const uint8_t*) emb.d, emb.rb, d.dio_m->toks, E, d.me);
-    kb_rms<<<T, 1024, 0, s.st>>>(d.me, E, f32(s, P + "nextn.enorm.weight"), E, eps, d.cat, 2 * E);
-    // h: the trunk rows of the last verify, or (a chained draft) the MTP's own last state (llama.cpp t_h_nextn)
-    kb_rms<<<T, 1024, 0, s.st>>>(chain ? d.mh : d.h, E, f32(s, P + "nextn.hnorm.weight"), E, eps, d.cat + E, 2 * E);
-    k_q8<<<nb(T * 2 * E), 256, 0, s.st>>>(d.cat, T * 2 * E, d.xq);
+    if (fuse_rms_q81 && E == 3072) {
+        kd_rms_q81<3,true><<<dim3(T, 2), 1024, 0, s.st>>>(chain ? d.mh : d.h, E,
+            f32(s, P + "nextn.hnorm.weight"), E, eps, nullptr, d.xq, (const uint8_t*)emb.d,
+            emb.rb, d.dio_m->toks, f32(s, P + "nextn.enorm.weight"));
+    } else {
+        kd_embed_rows<<<dim3(nb(E), T), 256, 0, s.st>>>((const uint8_t*) emb.d, emb.rb, d.dio_m->toks, E, d.me);
+        kb_rms<<<T, 1024, 0, s.st>>>(d.me, E, f32(s, P + "nextn.enorm.weight"), E, eps, d.cat, 2 * E);
+        // h: the trunk rows of the last verify, or (a chained draft) the MTP's own last state (llama.cpp t_h_nextn)
+        kb_rms<<<T, 1024, 0, s.st>>>(chain ? d.mh : d.h, E, f32(s, P + "nextn.hnorm.weight"), E, eps, d.cat + E, 2 * E);
+        k_q8<<<nb(T * 2 * E), 256, 0, s.st>>>(d.cat, T * 2 * E, d.xq);
+    }
     dec_mmvq(s, P + "nextn.eh_proj.weight", d.xq, d.mr, T);
     if (T > 1 && std::getenv("HY4F_MTP_LAST")) {
         DShard view = d;  // the final row will rebase the residual and projection pointers in this capture

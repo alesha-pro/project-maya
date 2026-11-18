@@ -242,6 +242,40 @@ __global__ void kd_runner_up(const float* y, int rows, int first, const int* bes
     }
 }
 // token rows (Q8_0 embedding) as floats [T][E] (the MTP's next-token input)
+// Each CTA uses the original 1024-thread RMS reduction. Embedding and hidden
+// rows of the draft input occupy consecutive halves of the quantized row.
+template<int Values, bool DraftPair = false>
+__global__ void kd_rms_q81(const float* input, int ld, const float* w, int n, float eps,
+                           float* output, Q81* quant, const uint8_t* emb = nullptr,
+                           size_t row_bytes = 0, const int* tokens = nullptr, const float* ew = nullptr) {
+    const int t = blockIdx.x;
+    const bool lower = DraftPair && blockIdx.y == 0;
+    const float* weights = lower ? ew : w;
+    const uint8_t* row = lower ? emb + (size_t)tokens[t] * row_bytes : nullptr;
+    float values[Values], sq = 0.0f;
+#pragma unroll
+    for (int k = 0; k < Values; ++k) {
+        const int i = threadIdx.x + 1024*k;
+        if (lower) {
+            const uint8_t* block = row + (i/32)*34;
+            values[k] = __half2float(*reinterpret_cast<const __half*>(block))
+                      * (float)reinterpret_cast<const int8_t*>(block+2)[i%32];
+        } else {
+            values[k] = input[(size_t)t * ld + i];
+        }
+        sq += values[k] * values[k];
+    }
+    const float inv = rsqrtf(block_sum(sq)/n + eps);
+    Q81* dst = quant + (size_t)(DraftPair ? 2*t + blockIdx.y : t)*(n/32);
+#pragma unroll
+    for (int k = 0; k < Values; ++k) {
+        const int i = threadIdx.x + 1024*k;
+        const float value = values[k] * inv * weights[i];
+        if (output) output[(size_t)t * n + i] = value;
+        q81_store(dst + i/32, value);
+    }
+}
+
 __global__ void kd_embed_rows(const uint8_t* emb, size_t rb, const int* toks, int E, float* y) {
     const int t = blockIdx.y;
     const uint8_t* row = emb + (size_t) toks[t] * rb;
