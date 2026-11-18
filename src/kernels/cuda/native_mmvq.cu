@@ -1769,14 +1769,91 @@ __global__ void __launch_bounds__(128) native_hy4_grouped1536(
         }
     }
 }
+// Keep the same expert's activation blocks in registers across neighboring
+// output rows. Each warp loads 12 DP4A operands and scales per slot once.
+template<int Slots, int Rows, int Reuse>
+__device__ __forceinline__ void q3_rows_cache(const Q3KBlock* weights, const Q81Block* x, const int* slots,
+                                             int start_row, float* y) {
+    const int lane = threadIdx.x & 31, iq = lane & 15;
+    const int qoff = 4 * (iq / 8), soff = (iq / 8) * 8 + (iq % 8) / 4;
+    int id[Slots], u[Slots][3][4]; float ds[Slots][3][4];
+#pragma unroll
+    for (int t = 0; t < Slots; ++t) {
+        id[t] = slots[t];
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const Q81Block* a = x + id[t] * 48 + ((lane >> 4) + 2 * k) * 8 + qoff;
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                u[t][k][j] = reinterpret_cast<const int*>(a[j].qs)[iq % 8];
+                ds[t][k][j] = __low2float(a[j].ds);
+            }
+        }
+    }
+#pragma unroll 1
+    for (int row = start_row; row < start_row + 4 * Reuse; row += 4) {
+        float acc[Slots] = {};
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const auto& w = weights[row * 6 + (lane >> 4) + 2 * k];
+            const unsigned l = load_int_b2(w.qs, iq), h = ~unsigned(load_int_b2(w.hmask, iq % 8)) >> qoff;
+            float sub[Slots] = {};
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int si = soff + 2 * j;
+                const int lo = (w.scales[si % 8] >> ((si / 8) * 4)) & 15;
+                const int hi = ((w.scales[8 + si % 4] >> ((si / 4) * 2)) & 3) * 16;
+                const unsigned val = (l >> (2 * j)) & 0x03030303u;
+                const unsigned sign = ((h >> j) << 2) & 0x04040404u;
+                const int vi = int(val | (sign * 63u)); // each byte's high six bits equal the sign
+#pragma unroll
+                for (int t = 0; t < Slots; ++t)
+                    sub[t] += ds[t][k][j] * float(__dp4a(vi, u[t][k][j], 0) * ((lo | hi) - 32));
+            }
+#pragma unroll
+            for (int t = 0; t < Slots; ++t) acc[t] += __half2float(w.d) * sub[t];
+        }
+#pragma unroll
+        for (int t = 0; t < Slots; ++t) {
+            const float v = warp_sum(acc[t]);
+            if (!lane) y[id[t] * Rows + row] = v;
+        }
+    }
+}
+template<int Rows, int Reuse>
+__global__ void __launch_bounds__(128) hy4_q3_cache(const Q3KBlock* w, size_t eb, const int* ng, const int* gexp,
+                                                    const int* goff, const int* gslot, const Q81Block* x, float* y) {
+    const int tiles = Rows / (4 * Reuse), total = *ng * tiles;
+    for (int tile = blockIdx.x; tile < total; tile += gridDim.x) {
+        const int g = tile / tiles, r = (tile % tiles) * (4 * Reuse) + (threadIdx.x >> 5);
+        const Q3KBlock* wg = w + size_t(gexp[g]) * eb;
+        const int off = goff[g], ns = goff[g + 1] - off;
+        const int* slots = gslot + off;
+        if (ns == 1) q3_rows_cache<1, Rows, Reuse>(wg, x, slots, r, y);
+        else if (ns == 2) q3_rows_cache<2, Rows, Reuse>(wg, x, slots, r, y);
+        else {
+            for (int i = r; i < r + 4 * Reuse; i += 4)
+                if (ns == 3) grouped_row1536<Q3KTraits, 3>(wg + i * 6, x, slots, y, i, Rows);
+                else grouped_row1536<Q3KTraits, 4>(wg + i * 6, x, slots, y, i, Rows);
+        }
+    }
+}
 template<class F> bool try_grouped1536(const void* weights, size_t expert_bytes, const int* ng, const int* gexp,
                                        const int* goff, const int* gslot, const void* x, float* y,
                                        int n_in, int n_out, int blocks, void* stream) {
-    if (n_in != 1536 || (n_out != 1536 && n_out != 3072)) return false;
+    if (std::getenv("HY4F_GROUP_REFERENCE") || n_in != 1536 || (n_out != 1536 && n_out != 3072)) return false;
     const auto* w = static_cast<const typename F::Block*>(weights);
     const size_t eb = expert_bytes / sizeof(typename F::Block);
     const auto* q = static_cast<const Q81Block*>(x);
     const auto st = static_cast<cudaStream_t>(stream);
+    if constexpr (std::is_same_v<F, Q3KTraits>) {
+        if (std::getenv("HY4F_Q3_CACHE")) {
+            if (n_out == 3072) hy4_q3_cache<3072, 4><<<blocks * 2, 128, 0, st>>>(w, eb, ng, gexp, goff, gslot, q, y);
+            else hy4_q3_cache<1536, 4><<<blocks * 2, 128, 0, st>>>(w, eb, ng, gexp, goff, gslot, q, y);
+            launch_check();
+            return true;
+        }
+    }
     if (n_out == 3072) native_hy4_grouped1536<F, 3072><<<blocks * 2, 128, 0, st>>>(w, eb, ng, gexp, goff, gslot, q, y);
     else native_hy4_grouped1536<F, 1536><<<blocks * 2, 128, 0, st>>>(w, eb, ng, gexp, goff, gslot, q, y);
     launch_check();
