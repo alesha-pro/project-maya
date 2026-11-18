@@ -594,13 +594,16 @@ int serve(Model& m, const ServeOptions& so) {
         // rejection the token drawn from max(0, p - q) (speculative sampling: the output is distributed exactly as the
         // target's; the acceptance is 1 - TV(p, q) instead of p(d) for an argmax draft)
         const bool ssamp = r.temperature > 0.0f;
+        Req rq = r;   // the drafts' warp: the MTP distribution at a lower temperature (any q keeps the output exact)
+        if (const char* e = std::getenv("HY4F_DRAFT_TEMP_SCALE")) rq.temperature = r.temperature * (float) std::atof(e);
+        (void) 0;   // (default: the same temperature - measured best: 0.6 and 0.8 accepted less)
         std::vector<float> mlg(ssamp ? (size_t) V : 0);
         std::vector<std::vector<float>> Q(ssamp ? 4 : 0);
         auto draft = [&](const int32_t* nt, int T, int64_t mpos) {
             if (!m.mtp(nt, T, mpos, &dr[0], err, ssamp ? mlg.data() : nullptr))
                 fatal("mtp at " + std::to_string(mpos) + ": " + err, produced, n);
             if (ssamp) {
-                sampler.probs(mlg.data(), V, r, state, Q[0]);
+                sampler.probs(mlg.data(), V, rq, state, Q[0]);
                 dr[0] = Sampler::draw(Q[0], rng);
             }
             const int64_t next = mpos + T;
@@ -608,7 +611,7 @@ int serve(Model& m, const ServeOptions& so) {
                 if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err, ssamp ? mlg.data() : nullptr))
                     fatal("mtp_chain at " + std::to_string(next + i - 1) + ": " + err, produced, n);
                 if (ssamp) {
-                    sampler.probs(mlg.data(), V, r, state, Q[i]);
+                    sampler.probs(mlg.data(), V, rq, state, Q[i]);
                     dr[i] = Sampler::draw(Q[i], rng);
                 }
             }
