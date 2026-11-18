@@ -364,6 +364,37 @@ void d_indexer_cache(Shard& s, DShard& d, const std::string& P, int il, const in
     kb_ring_chunk<<<IRING, 256, 0, stream>>>(d.ivg, s.ring[il], T, pp, IK, kpool);
 }
 
+void d_indexer_select(Shard& s, DShard& d, const std::string& P, int il, const int* pp,
+                      int T, int qpc, int QH, float th, cudaStream_t st) {
+    float* iq = d.qp + (size_t) Hd * QH;
+    kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, st>>>(iq, qpc, IH, IK, IK - rope, rope, pp, th);
+    kb_f32_gemv<<<dim3(nb(IH * 32), T), 256, 0, st>>>(f32(s, P + "indexer.proj.weight"), d.x, E, d.iw, IH, E, IH,
+                                                        1.0f / std::sqrt((float) (IK * IH)));
+    const int ld_sc = (int) (o.max_context / kpool + 1);
+    if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))   // (grid for the whole context: the graph is fixed)
+        (T <= 4 ? kb_score_tc : kd_score_tc8)<<<dim3(dec_score_blocks, 1), 256, 0, st>>>(iq, qpc, s.pooled[il], d.iw, IH, kpool,
+                                                                                     top_k, pp, 0, T, ld_sc - 1, d.score, ld_sc);
+    else
+        kb_score<<<dim3(nb(ld_sc * 32), T), 256, 0, st>>>(iq, qpc, s.pooled[il], d.iw, IH, IK, IH, kpool, top_k, pp, 0,
+                                                            d.score, ld_sc);
+    if (std::getenv("HY4F_OLD_SELECT")) {
+        kb_select_kpool<1024><<<T, 1024, 0, st>>>(d.score, ld_sc, pp, 0, 0, kpool, top_k, top_k / kpool - tail, n_cap,
+                                                   d.cells);
+    } else {   // (multi-block: 32 blocks per token)
+        const int tp = top_k / kpool - tail;
+        kd_sel_init<<<T, 256, 0, st>>>(pp, kpool, tp, d.sel_st, d.sel_hist);
+        const int shifts[3] = {21, 10, 0}, widths[3] = {11, 11, 10};
+        for (int p2 = 0; p2 < 3; ++p2) {
+            kd_sel_hist<<<dim3(SEL_NB, T), 256, 0, st>>>(d.score, ld_sc, pp, kpool, top_k, d.sel_st, d.sel_hist,
+                                                           shifts[p2], widths[p2]);
+            kd_sel_resolve<<<T, 1024, 0, st>>>(pp, top_k, d.sel_st, d.sel_hist, shifts[p2], widths[p2]);
+        }
+        kd_sel_count<<<dim3(SEL_NB, T), 256, 0, st>>>(d.score, ld_sc, pp, kpool, top_k, d.sel_st, d.sel_bc);
+        kd_sel_write<<<dim3(SEL_NB, T), 256, 0, st>>>(d.score, ld_sc, pp, kpool, top_k, tp, n_cap, d.sel_st, d.sel_bc,
+                                                        d.cells);
+    }
+}
+
 void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false, bool dense_dsa = false, const int* last_pos = nullptr) {
     const std::string P = "blk." + std::to_string(il) + ".";
     const bool sw = swa[il] != 0;
@@ -411,6 +442,13 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         const DW& q = s.w.at(P + "qproj");
         kn::native_q8_0_mmvq(q.d, d.xq, d.qp, (int) q.ne[0], qpc, T, s.st);
     } else dec_mmvq(s, P + "qproj", d.xq, d.qp, T);
+    const bool async_select = !sw && !dense_dsa && side && std::getenv("HY4F_INDEX_OVERLAP");
+    if (async_select) {
+        HY_CK(cudaEventRecord(d.attention_fork,s.st));
+        HY_CK(cudaStreamWaitEvent(side,d.attention_fork));
+        d_indexer_select(s,d,P,il,pp,T,qpc,QH,th,side);
+        HY_CK(cudaEventRecord(d.attention_join,side));
+    }
     const DW& kb = s.w.at(P + "attn_k_b.weight");
     const DW& vb = s.w.at(P + "attn_v_b.weight");
     const float scale = 1.0f / std::sqrt((float) QH);
@@ -452,35 +490,8 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                                                     0, f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, d.o, nullptr, Hl);
         }
     } else {
-        float* iq = d.qp + (size_t) Hd * QH;
-        if (!dense_dsa) kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, s.st>>>(iq, qpc, IH, IK, IK - rope, rope, pp, th);
-        if (!dense_dsa) {
-            kb_f32_gemv<<<dim3(nb(IH * 32), T), 256, 0, s.st>>>(f32(s, P + "indexer.proj.weight"), d.x, E, d.iw, IH, E, IH,
-                                                                1.0f / std::sqrt((float) (IK * IH)));
-            const int ld_sc = (int) (o.max_context / kpool + 1);
-            if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))   // (grid for the whole context: the graph is fixed)
-                (T <= 4 ? kb_score_tc : kd_score_tc8)<<<dim3(dec_score_blocks, 1), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, kpool,
-                                                                                             top_k, pp, 0, T, ld_sc - 1, d.score, ld_sc);
-            else
-                kb_score<<<dim3(nb(ld_sc * 32), T), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, IK, IH, kpool, top_k, pp, 0,
-                                                                    d.score, ld_sc);
-            if (std::getenv("HY4F_OLD_SELECT")) {
-                kb_select_kpool<1024><<<T, 1024, 0, s.st>>>(d.score, ld_sc, pp, 0, 0, kpool, top_k, top_k / kpool - tail, n_cap,
-                                                           d.cells);
-            } else {   // (multi-block: 32 blocks per token)
-                const int tp = top_k / kpool - tail;
-                kd_sel_init<<<T, 256, 0, s.st>>>(pp, kpool, tp, d.sel_st, d.sel_hist);
-                const int shifts[3] = {21, 10, 0}, widths[3] = {11, 11, 10};
-                for (int p2 = 0; p2 < 3; ++p2) {
-                    kd_sel_hist<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, d.sel_st, d.sel_hist,
-                                                                   shifts[p2], widths[p2]);
-                    kd_sel_resolve<<<T, 1024, 0, s.st>>>(pp, top_k, d.sel_st, d.sel_hist, shifts[p2], widths[p2]);
-                }
-                kd_sel_count<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, d.sel_st, d.sel_bc);
-                kd_sel_write<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, tp, n_cap, d.sel_st, d.sel_bc,
-                                                                d.cells);
-            }
-        }
+        if (!dense_dsa && !async_select)
+            d_indexer_select(s,d,P,il,pp,T,qpc,QH,th,s.st);
         if (!mtp && !dfs.empty() && df_slot[il] >= 0)   // (the DFly drafter reads this layer's top-k of every row)
             HY_CK(cudaMemcpyAsync(dfs[s.g].snap + (size_t) df_slot[il] * DT * n_cap, d.cells, sizeof(int) * T * n_cap,
                                   cudaMemcpyDeviceToDevice, s.st));
