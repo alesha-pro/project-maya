@@ -3,6 +3,7 @@
 #pragma once
 
 #include <cuda_fp16.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -194,7 +195,11 @@ __global__ void k_hc_post(float* X, const float* R, const float* y, const float*
 // padded to 608 (16-byte aligned rows for vector loads).
 constexpr int KV_ROW = 576, KV_GROUPS = 9, KV_RB = 608;
 constexpr int RING_PAD = 16;
-constexpr int IRING = 8;   // indexer ring rows (>= kpool + max step tokens - 1: a rejected draft must not overwrite a row of
+#ifdef HY4F_DT6
+constexpr int IRING = 16;   // (the DFly build: verify steps of up to 6 tokens)
+#else
+constexpr int IRING = 8;
+#endif   // indexer ring rows (>= kpool + max step tokens - 1: a rejected draft must not overwrite a row of
                            // the still-open group), position p in row p % IRING   // SWA ring rows = window + RING_PAD: a multi-token step writes its rows before it reads the window   // 576 int8 + 9 half scales, padded to 16-byte rows
 __device__ __forceinline__ float kv_val(const uint8_t* row, int j) {
     const __half* sc = reinterpret_cast<const __half*>(row + KV_ROW);
@@ -506,6 +511,9 @@ __device__ __forceinline__ void hy4f_spin_guard(unsigned long long t0) {
 struct Peers {
     float* buf[4][2];   // shard j's receive area of parity p (device pointers, peer-accessible)
     int* flag[4];       // shard j's flag array [4]
+};
+struct PeersD : Peers {   // the decode exchanges' (hy4f_dkern.cuh): + the all-reduce wire format
+    int bf = 0;           // 0 F32 + flags, 1 BF16 + flags, 2 LL (2 BF16 + the step per 8-byte store; every shard rounds its own)
 };
 
 __device__ __forceinline__ void peers_signal_wait(const Peers& P, int me, int n_shards, int step) {

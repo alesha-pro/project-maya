@@ -37,7 +37,7 @@ static std::vector<int> csv(const char* s) {
 int main(int argc, char** argv) {
     strata::hy4f::Options o;
     std::vector<int32_t> toks;
-    int gen = 0, pchunk = 0, ptail = 0, repeat = 1, spec = 0, vtail = 0, vbench = 0;
+    int gen = 0, pchunk = 0, ptail = 0, repeat = 1, spec = 0, vtail = 0, vbench = 0, dfk = 0;
     std::vector<int> depths;
     bool vcmp = false;
     std::vector<int> replay;   // --replay a,b,c,..: these tokens after the prompt via verify(T) chunks (T = --replay-t)
@@ -72,6 +72,8 @@ int main(int argc, char** argv) {
         else if (a == "--mmproj") mmproj = next();
         else if (a == "--image") image = next();   // replaces the prompt's image pad token 120120
         else if (a == "--spec") spec = std::atoi(next());   // MTP drafts per step (1)
+        else if (a == "--dfly") o.dfly = next();             // the DFly2 drafter GGUF
+        else if (a == "--dfly-k") dfk = std::atoi(next());   // DFly drafts verified per step (1..5; needs --prefill-tail 1 --verify-tail 1)
         else if (a == "--gen") gen = std::atoi(next());
         else if (a == "--dump") o.dump_dir = next();
         else if (a == "--max-context") o.max_context = std::atoll(next());
@@ -244,8 +246,8 @@ int main(int argc, char** argv) {
         std::printf("prefill: %d tokens in %.3f s, %.1f tok/s (chunk %d, first call includes setup)\n", np, dt, np / dt, pchunk);
         pos = np;
         if (vtail > 0) {
-            std::vector<float> lg((size_t) 4 * m.vocab());
-            int32_t am[4];
+            std::vector<float> lg((size_t) 8 * m.vocab());
+            int32_t am[8];
             for (size_t i = np; i < toks.size();) {
                 const int T = std::min<int>(vtail, (int) (toks.size() - i));
                 if (!m.verify(toks.data() + i, T, pos, lg.data(), am, err)) {
@@ -269,8 +271,9 @@ int main(int argc, char** argv) {
     }
     std::printf("prompt: %zu tokens\n", toks.size());
     if (vbench > 0) {
-        int32_t am[4], vt[4] = {toks[0], toks[1 % toks.size()], toks[2 % toks.size()], toks[3 % toks.size()]};
-        for (int T = 1; T <= 4; ++T) {
+        int32_t am[8], vt[8];
+        for (int i = 0; i < 8; ++i) vt[i] = toks[i % toks.size()];
+        for (int T = 1; T <= 6; ++T) {
             m.verify(vt, T, pos, nullptr, am, err);
             const auto a = std::chrono::steady_clock::now();
             for (int r = 0; r < vbench; ++r)
@@ -280,6 +283,20 @@ int main(int argc, char** argv) {
                 }
             const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count() / vbench;
             std::printf("verify T=%d: %.2f ms\n", T, dt * 1e3);
+        }
+        if (m.has_dfly()) {
+            int32_t dr[8];
+            for (int n = 1; n <= 5; n += 4) {
+                m.dfly(0, vt[0], pos, n, dr, err);
+                const auto a = std::chrono::steady_clock::now();
+                for (int r = 0; r < vbench; ++r)
+                    if (!m.dfly(0, vt[0], pos, n, dr, err)) {
+                        std::fprintf(stderr, "maya-hy4f: dfly failed: %s\n", err.c_str());
+                        return 1;
+                    }
+                std::printf("dfly n=%d: %.2f ms\n", n,
+                            std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count() / vbench * 1e3);
+            }
         }
         if (m.has_mtp())
             for (int T = 1; T <= 2; ++T) {
@@ -293,7 +310,7 @@ int main(int argc, char** argv) {
     if (!replay.empty()) {   // feed the tokens in verify(T) chunks; print the top-3 of the row after the last one
         const int V = m.vocab();
         std::vector<float> l((size_t) 4 * V);
-        int32_t am[4];
+        int32_t am[8];
         size_t i = 0;
         while (i < replay.size()) {
             const int T = std::min<int>(replay_t, (int) (replay.size() - i));
@@ -330,6 +347,62 @@ int main(int argc, char** argv) {
             const int a3 = (int) (std::max_element(l3.begin() + (size_t) i * V, l3.begin() + (size_t) (i + 1) * V) - l3.begin() - (size_t) i * V);
             std::printf("verify-cmp row %d: cos %.6f argmax T1 %d T3 %d\n", i, dot / std::sqrt(na * nb2), a1, a3);
         }
+        return 0;
+    }
+    if (dfk > 0 && gen > 0) {
+        if (!m.has_dfly() || vtail != 1) {
+            std::fprintf(stderr, "maya-hy4f: --dfly-k needs --dfly and --prefill-tail N --verify-tail 1\n");
+            return 1;
+        }
+        // greedy speculative decode with DFly2 drafts: verify [bonus, d0..dk-1] -> accept the matching prefix + the new
+        // bonus -> DFly block from the last accepted row
+        const int k = std::min(dfk, 5);
+        using clk = std::chrono::steady_clock;
+        std::vector<int32_t> out;
+        int32_t last = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin()), dr[8], am[8];
+        out.push_back(last);
+        int row = 0, steps2 = 0;
+        std::vector<int> acc_hist(k + 1, 0);
+        double t_dr = 0, t_vf = 0;
+        const auto a = clk::now();
+        while ((int) out.size() < gen) {
+            auto b = clk::now();
+            if (!m.dfly(row, last, pos, k, dr, err)) {
+                std::fprintf(stderr, "maya-hy4f: dfly failed: %s\n", err.c_str());
+                return 1;
+            }
+            t_dr += std::chrono::duration<double>(clk::now() - b).count();
+            int32_t vt[8];
+            vt[0] = last;
+            for (int i = 0; i < k; ++i) vt[i + 1] = dr[i];
+            b = clk::now();
+            if (!m.verify(vt, k + 1, pos, nullptr, am, err)) {
+                std::fprintf(stderr, "maya-hy4f: verify failed: %s\n", err.c_str());
+                return 1;
+            }
+            t_vf += std::chrono::duration<double>(clk::now() - b).count();
+            ++steps2;
+            int n = 0;
+            while (n < k && am[n] == dr[n]) ++n;
+            ++acc_hist[n];
+            for (int i = 0; i < n; ++i) out.push_back(dr[i]);
+            out.push_back(am[n]);
+            last = am[n];
+            row = n;
+            pos += n + 1;
+        }
+        int acc = 0;
+        for (int i = 0; i <= k; ++i) acc += i * acc_hist[i];
+        std::printf("accepted per step:");
+        for (int i = 0; i <= k; ++i) std::printf(" %d:%d", i, acc_hist[i]);
+        std::printf("\n");
+        const double dt = std::chrono::duration<double>(clk::now() - a).count();
+        std::printf("gen:");
+        for (int32_t t : out) std::printf(" %d", t);
+        std::printf("\ndfly k=%d: %zu tokens in %d steps, %.2f tokens/step, draft accept %.1f%%, %.2f tok/s, %.2f ms/step "
+                    "(drafter %.2f ms, verify %.2f ms)\n", k, out.size() - 1, steps2,
+                    (double) (out.size() - 1) / std::max(1, steps2), 100.0 * acc / std::max(1, steps2 * k), (out.size() - 1) / dt,
+                    1000.0 * dt / std::max(1, steps2), 1000.0 * t_dr / std::max(1, steps2), 1000.0 * t_vf / std::max(1, steps2));
         return 0;
     }
     if (spec > 0 && gen > 0) {

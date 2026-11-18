@@ -494,5 +494,79 @@ __global__ void __launch_bounds__(256) kb_score_tc(const float* __restrict__ iq,
     }
 }
 
+// (the few-token form of kb_score_tc: every warp a group sub-range for ALL the NT >= tt_n tokens, each key tile read once)
+template <int NT>
+__device__ __forceinline__ void score_few(const __half* __restrict__ pooled, int kpool, int top_k, int pos0, int t0, int tt_n,
+                                          int n_pool_max, float* __restrict__ score, int ld_score, int gs, int ngs, int warp,
+                                          int lane, const __half (*Qs)[16][136], float (*Ss)[16][20], const float (*Ws)[16]) {
+    using namespace nvcuda;
+    constexpr int KD = 128, NH = 16, QLD = KD + 8;
+   // few tokens (decode): every warp a group sub-range for ALL the tokens, each key tile read once
+        const int per_b = ((n_pool_max + ngs - 1) / ngs + 15) / 16 * 16, per = (per_b / 8 + 15) / 16 * 16;
+        const int g0 = gs * per_b + warp * per;
+        int npool_max_t = 0;
+        for (int t = 0; t < tt_n; ++t) {
+            const int p = pos0 + t0 + t;
+            if (p + 1 > top_k) npool_max_t = max(npool_max_t, p / kpool);
+        }
+        const int g1 = min(min(npool_max_t, gs * per_b + per_b), g0 + per);
+        for (int g = g0; g < g1; g += 16) {
+            wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc[NT];
+#pragma unroll
+            for (int t = 0; t < NT; ++t) wmma::fill_fragment(acc[t], 0.0f);
+#pragma unroll
+            for (int k = 0; k < KD / 16; ++k) {
+                wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+                wmma::load_matrix_sync(fb, pooled + (size_t) g * KD + k * 16, KD);
+#pragma unroll
+                for (int t = 0; t < NT; ++t)
+                    if (t < tt_n) {
+                        wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa1;
+                        wmma::load_matrix_sync(fa1, &Qs[t][0][k * 16], QLD);
+                        wmma::mma_sync(acc[t], fa1, fb, acc[t]);
+                    }
+            }
+#pragma unroll
+            for (int t = 0; t < NT; ++t)
+                if (t < tt_n) {
+                    const int p = pos0 + t0 + t, np = p / kpool;
+                    wmma::store_matrix_sync(&Ss[warp][0][0], acc[t], 20, wmma::mem_row_major);
+                    __syncwarp();
+                    if (lane < 16 && g + lane < min(g1, np) && p + 1 > top_k) {
+                        float s2 = 0.0f;
+#pragma unroll
+                        for (int h = 0; h < NH; ++h) s2 += fmaxf(Ss[warp][h][lane], 0.0f) * Ws[t][h];
+                        score[(size_t) t * ld_score + g + lane] = s2;
+                    }
+                    __syncwarp();
+                }
+        }
+        }
+
+// the decode form of kb_score_tc for 5..8 tokens (a kernel of its own: its 8 accumulators would raise the registers of
+// kb_score_tc, whose many-token form the prefill runs)
+__global__ void __launch_bounds__(256) kd_score_tc8(const float* __restrict__ iq, int ldq, const __half* __restrict__ pooled,
+                                                    const float* __restrict__ w, int ldw, int kpool, int top_k,
+                                                    const int* pos0p, int t0, int tt_n, int n_pool_max,
+                                                    float* __restrict__ score, int ld_score) {
+    constexpr int KD = 128, NH = 16, QLD = KD + 8;
+    __shared__ __align__(32) __half Qs[8][NH][QLD];
+    __shared__ __align__(32) float Ss[8][16][20];
+    __shared__ float Ws[8][NH];
+    const int gs = blockIdx.x, ngs = gridDim.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int pos0 = *pos0p;
+    for (int i = threadIdx.x; i < 8 * NH * KD; i += blockDim.x) {
+        const int tk = i / (NH * KD), rem = i % (NH * KD), h = rem / KD, d = rem % KD;
+        Qs[tk][h][d] = __float2half_rn(tk < tt_n ? iq[(size_t) (t0 + tk) * ldq + h * KD + d] : 0.0f);
+    }
+    if (threadIdx.x < 8 * NH) {
+        const int tk = threadIdx.x / NH, h = threadIdx.x % NH;
+        Ws[tk][h] = tk < tt_n ? w[(size_t) (t0 + tk) * ldw + h] : 0.0f;
+    }
+    __syncthreads();
+    score_few<8>(pooled, kpool, top_k, pos0, t0, tt_n, n_pool_max, score, ld_score, gs, ngs, warp, lane, Qs, Ss, Ws);
+}
+
+
 }  // namespace kern
 }  // namespace strata::hy4f

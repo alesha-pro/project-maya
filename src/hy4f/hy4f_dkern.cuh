@@ -9,9 +9,31 @@
 namespace strata::hy4f {
 namespace kern {
 
+__device__ __forceinline__ float ar_own(const PeersD& P, float v) { return P.bf ? __bfloat162float(__float2bfloat16_rn(v)) : v; }
+// P.bf == 2: the LL form (NCCL's low-latency protocol): every 8-byte word = 2 BF16 values + the step, stored by the
+// sender in one 8-byte store with no fence and no flag; the receiver polls the word until it carries its step
+__device__ __forceinline__ float ar_peer(const PeersD& P, int step, const float* rv, size_t idx) {
+    if (P.bf == 2) {
+        const volatile uint2* w = reinterpret_cast<const volatile uint2*>(rv) + idx / 2;
+        uint2 u;
+        unsigned long long t0 = 0;
+        for (;;) {
+            asm volatile("ld.volatile.global.v2.u32 {%0, %1}, [%2];" : "=r"(u.x), "=r"(u.y) : "l"(w));
+            if ((int) u.y == step) break;
+            if (!t0) t0 = hy4f_now();
+            hy4f_spin_guard(t0);
+        }
+        const unsigned short h = (idx & 1) ? (unsigned short) (u.x >> 16) : (unsigned short) (u.x & 0xffffu);
+        return __bfloat162float(__ushort_as_bfloat16(h));
+    }
+    if (P.bf) return __bfloat162float(__ushort_as_bfloat16(__ldcv(reinterpret_cast<const unsigned short*>(rv) + idx)));
+    return __ldcv(rv + idx);
+}
+
+
 // all-reduce of T rows (x1 + x2) [T][n], then per row y = RMS(sum) * w and X[t][s] += post[t][s] * y (X = R + post y
 // with R = X; hc = 1 and post = 1 for the MTP's plain residual).  One block of 1024 threads, dynamic smem T*n floats.
-__global__ void kd_ar_post(const float* x1, const float* x2, int T, int n, Peers P, int me, int n_shards, int* counter,
+__global__ void kd_ar_post(const float* x1, const float* x2, int T, int n, PeersD P, int me, int n_shards, int* counter,
                            const float* nw, float eps, float* X, const float* post, int hc) {
     extern __shared__ __align__(16) float ys[];
     const int tn = T * n;
@@ -51,7 +73,7 @@ __global__ void kd_ar_post(const float* x1, const float* x2, int T, int n, Peers
 // the context-parallel combine of T rows: part [T][H][W] (all heads, this shard's cells); shard j gets the head slice
 // j of every shard and combines its heads with the sink into o [T][Hl][kvl].  One block of 1024 threads.
 __global__ void kd_combine(const float* part, int T, int H, int kvl, int W, int h0, int Hl, const float* sinks_all,
-                           Peers P, int me, int n_shards, int* counter, float* o) {
+                           PeersD P, int me, int n_shards, int* counter, float* o) {
     __shared__ int step;
     if (threadIdx.x == 0) step = ++counter[0];
     __syncthreads();
@@ -177,7 +199,7 @@ __global__ void kd_embed_rows(const uint8_t* emb, size_t rb, const int* toks, in
 // all-reduce of T rows (x1 + x2) [T][n] + post: NB blocks push their slice to the peers (ring order), the last block to
 // arrive signals; blocks t < T then wait and do row t: the sum in shard order (the same on every shard), y = RMS * w,
 // X[t][s] += post[t][s] y.  counter: the step (read by all, bumped by the last block); arrive: the block count.
-__global__ void kd_ar2(const float* __restrict__ x1, const float* __restrict__ x2, int T, int n, Peers P, int me,
+__global__ void kd_ar2(const float* __restrict__ x1, const float* __restrict__ x2, int T, int n, PeersD P, int me,
                        int n_shards, int* counter, int* arrive, const float* __restrict__ nw, float eps, float* X,
                        const float* __restrict__ post, int hc) {
     const int step = counter[0] + 1, tn = T * n, par = step & 1, n4 = tn / 4;
@@ -223,8 +245,8 @@ __global__ void kd_ar2(const float* __restrict__ x1, const float* __restrict__ x
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         float v = 0.0f;
         for (int j = 0; j < n_shards; ++j)
-            v += j == me ? x1[(size_t) t * n + i] + (x2 ? x2[(size_t) t * n + i] : 0.0f)
-                         : __ldcv(rv + (size_t) j * tn + (size_t) t * n + i);
+            v += j == me ? ar_own(P, x1[(size_t) t * n + i] + (x2 ? x2[(size_t) t * n + i] : 0.0f))
+                         : ar_peer(P, step, rv, (size_t) j * tn + (size_t) t * n + i);
         ys[i] = v;
         sq += v * v;
     }
@@ -237,7 +259,7 @@ __global__ void kd_ar2(const float* __restrict__ x1, const float* __restrict__ x
 }
 // the combine of T rows over NB blocks: slices pushed in ring order; blocks b < T*Hl combine (t, hl) = (b / Hl, b % Hl)
 __global__ void kd_combine2(const float* __restrict__ part, int T, int H, int kvl, int W, int h0, int Hl,
-                            const float* __restrict__ sinks_all, Peers P, int me, int n_shards, int* counter, int* arrive,
+                            const float* __restrict__ sinks_all, PeersD P, int me, int n_shards, int* counter, int* arrive,
                             float* __restrict__ o) {
     const int step = counter[0] + 1, par = step & 1, slice = Hl * W, per = T * slice;
     const int pb = (per + gridDim.x - 1) / gridDim.x, i0 = blockIdx.x * pb, i1 = min(per, i0 + pb);
@@ -343,7 +365,7 @@ __global__ void kd_absorb(const uint8_t* __restrict__ kb, const float* __restric
 // arrive[4] the post blocks.
 // push of x1 (+ x2) [tn] (mode 0) or of the head slice j of part [T][H][W] (mode 1: slice [T][Hl][W]) to peer j
 __global__ void kd_push1(const float* __restrict__ x1, const float* __restrict__ x2, int tn, int mode, int T, int H, int W,
-                         int Hl, Peers P, int me, int j, const int* counter, int* arrive) {
+                         int Hl, PeersD P, int me, int j, const int* counter, int* arrive) {
     const int step = counter[0] + 1, par = step & 1;
     float* dst = P.buf[j][par] + (size_t) me * tn;
     if (mode == 0) {
@@ -396,33 +418,33 @@ __device__ __forceinline__ void kd_post_done(int* counter, int* arrive, int step
     }
 }
 // all-reduce tail: block t = row t: the sum in shard order (local partial at me), y = RMS * w, X[t][s] += post y
-__global__ void kd_ar_tail(const float* __restrict__ x1, const float* __restrict__ x2, int T, int n, Peers P, int me,
+__global__ void kd_ar_tail(const float* __restrict__ x1, const float* __restrict__ x2, int T, int n, PeersD P, int me,
                            int n_shards, int* counter, int* arrive, const float* __restrict__ nw, float eps, float* X,
                            const float* __restrict__ post, int hc) {
     const int step = counter[0] + 1, tn = T * n, t = blockIdx.x;
-    kd_wait_peers(P, me, n_shards, step);
+    if (P.bf != 2) kd_wait_peers(P, me, n_shards, step);
     const float* rv = P.buf[me][step & 1];
     __shared__ float ys[4096];
     float sq = 0.0f;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
         float v = 0.0f;
         for (int j = 0; j < n_shards; ++j)
-            v += j == me ? x1[(size_t) t * n + i] + (x2 ? x2[(size_t) t * n + i] : 0.0f)
-                         : __ldcv(rv + (size_t) j * tn + (size_t) t * n + i);
+            v += j == me ? ar_own(P, x1[(size_t) t * n + i] + (x2 ? x2[(size_t) t * n + i] : 0.0f))
+                         : ar_peer(P, step, rv, (size_t) j * tn + (size_t) t * n + i);
         ys[i] = v;
         sq += v * v;
     }
-    const float r = rsqrtf(block_sum(sq) / n + eps);
+    const float r = nw ? rsqrtf(block_sum(sq) / n + eps) : 1.0f;   // (nw null: a plain residual add)
     float* Xt = X + (size_t) t * hc * n;
     for (int i = threadIdx.x; i < n; i += blockDim.x) {
-        const float y = ys[i] * r * nw[i];
+        const float y = nw ? ys[i] * r * nw[i] : ys[i];
         for (int s = 0; s < hc; ++s) Xt[(size_t) s * n + i] += post[t * 8 + s] * y;
     }
     kd_post_done(counter, arrive, step);
 }
 // combine tail: block b = (t, hl)
 __global__ void kd_cb_tail(const float* __restrict__ part, int T, int H, int kvl, int W, int h0, int Hl,
-                           const float* __restrict__ sinks_all, Peers P, int me, int n_shards, int* counter, int* arrive,
+                           const float* __restrict__ sinks_all, PeersD P, int me, int n_shards, int* counter, int* arrive,
                            float* __restrict__ o) {
     const int step = counter[0] + 1, slice = Hl * W, per = T * slice;
     kd_wait_peers(P, me, n_shards, step);
@@ -579,7 +601,7 @@ __global__ void kd_sel_write(const float* __restrict__ score, int ld, const int*
 // the distinct local experts of a step and their slots (eloc [n]: local id or -1; n <= 64): groups in the order of
 // their first slot, a group's slots in slot order.  One block of 64 threads.  ng[0] = group count.
 __global__ void kd_moe_groups(const int* __restrict__ eloc, int n, int* ng, int* gexp, int* goff, int* gslot) {
-    __shared__ int id[64], leader[64], cnt[64], gidx[64];
+    __shared__ int id[128], leader[128], cnt[128], gidx[128];
     const int i = threadIdx.x;
     id[i] = i < n ? eloc[i] : -1;
     __syncthreads();
@@ -608,9 +630,9 @@ __global__ void kd_moe_groups(const int* __restrict__ eloc, int n, int* ng, int*
         gexp[g] = id[i];
         goff[g] = off;
     }
-    if (i == 63) {
+    if (i == blockDim.x - 1) {
         int tot = 0, ngr = 0;
-        for (int j = 0; j < 64; ++j) tot += cnt[j], ngr += leader[j];
+        for (int j = 0; j < (int) blockDim.x; ++j) tot += cnt[j], ngr += leader[j];
         ng[0] = ngr;
         goff[ngr] = tot;
     }
@@ -626,7 +648,7 @@ __global__ void kd_moe_groups(const int* __restrict__ eloc, int n, int* ng, int*
 // all peers in one launch: blocks [r*nbp, (r+1)*nbp) push x1 (+ x2) [tn] to peer (me + 1 + r) % n_shards (each peer its
 // own blocks, written concurrently); the last block per peer signals it.  mode 1: the head slice like kd_push1.
 __global__ void kd_push_all(const float* __restrict__ x1, const float* __restrict__ x2, int tn, int mode, int T, int H,
-                            int W, int Hl, Peers P, int me, int n_shards, int nbp, const int* counter, int* arrive) {
+                            int W, int Hl, PeersD P, int me, int n_shards, int nbp, const int* counter, int* arrive) {
     const int r = blockIdx.x / nbp, bb = blockIdx.x % nbp, j = (me + 1 + r) % n_shards;
     const int step = counter[0] + 1, par = step & 1;
     float* dst = P.buf[j][par] + (size_t) me * tn;
@@ -665,12 +687,36 @@ __global__ void kd_push_all(const float* __restrict__ x1, const float* __restric
 // the peers one after another inside one launch (a single launch per exchange instead of one per peer; still one peer
 // at a time per block): each block writes its slice to peer me+1, fences, counts in; then me+2, ...
 __global__ void kd_push_seq(const float* __restrict__ x1, const float* __restrict__ x2, int tn, int mode, int T, int H,
-                            int W, int Hl, Peers P, int me, int n_shards, const int* counter, int* arrive) {
+                            int W, int Hl, PeersD P, int me, int n_shards, const int* counter, int* arrive) {
     const int step = counter[0] + 1, par = step & 1;
     for (int r = 1; r < n_shards; ++r) {
         const int j = (me + r) % n_shards;
         float* dst = P.buf[j][par] + (size_t) me * tn;
-        if (mode == 0) {
+        if (mode == 0 && P.bf == 2) {   // (LL: no fence, no flag)
+            uint2* d8 = reinterpret_cast<uint2*>(P.buf[j][par]) + (size_t) me * (tn / 2);
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tn / 2; i += gridDim.x * blockDim.x) {
+                float a = x1[2 * i], b = x1[2 * i + 1];
+                if (x2) a += x2[2 * i], b += x2[2 * i + 1];
+                const __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
+                const unsigned bits = *reinterpret_cast<const unsigned*>(&v);
+                asm volatile("st.volatile.global.v2.u32 [%0], {%1, %2};" :: "l"(d8 + i), "r"(bits), "r"((unsigned) step) : "memory");
+            }
+            continue;
+        }
+        if (mode == 0 && P.bf) {
+            const float4* a4 = reinterpret_cast<const float4*>(x1);
+            const float4* c4 = reinterpret_cast<const float4*>(x2);
+            uint2* d8 = reinterpret_cast<uint2*>(reinterpret_cast<__nv_bfloat16*>(P.buf[j][par]) + (size_t) me * tn);
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tn / 4; i += gridDim.x * blockDim.x) {
+                float4 v = a4[i];
+                if (x2) {
+                    const float4 w = c4[i];
+                    v.x += w.x, v.y += w.y, v.z += w.z, v.w += w.w;
+                }
+                const __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y), hi = __floats2bfloat162_rn(v.z, v.w);
+                d8[i] = make_uint2(*reinterpret_cast<const unsigned*>(&lo), *reinterpret_cast<const unsigned*>(&hi));
+            }
+        } else if (mode == 0) {
             const float4* a4 = reinterpret_cast<const float4*>(x1);
             const float4* c4 = reinterpret_cast<const float4*>(x2);
             float4* d4 = reinterpret_cast<float4*>(dst);
@@ -702,6 +748,45 @@ __global__ void kd_push_seq(const float* __restrict__ x1, const float* __restric
     }
 }
 
+// kd_push_seq with one system fence: the data to every peer, one fence, then the flags (fewer PCIe round trips)
+__global__ void kd_push_seq1(const float* __restrict__ x1, const float* __restrict__ x2, int tn, int mode, int T, int H,
+                             int W, int Hl, PeersD P, int me, int n_shards, const int* counter, int* arrive) {
+    const int step = counter[0] + 1, par = step & 1;
+    for (int r = 1; r < n_shards; ++r) {
+        const int j = (me + r) % n_shards;
+        float* dst = P.buf[j][par] + (size_t) me * tn;
+        if (mode == 0) {
+            const float4* a4 = reinterpret_cast<const float4*>(x1);
+            const float4* c4 = reinterpret_cast<const float4*>(x2);
+            float4* d4 = reinterpret_cast<float4*>(dst);
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tn / 4; i += gridDim.x * blockDim.x) {
+                float4 v = a4[i];
+                if (x2) {
+                    const float4 w = c4[i];
+                    v.x += w.x, v.y += w.y, v.z += w.z, v.w += w.w;
+                }
+                d4[i] = v;
+            }
+        } else {
+            const int slice = Hl * W;
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tn; i += gridDim.x * blockDim.x) {
+                const int t = i / slice, rem = i % slice;
+                dst[i] = x1[(size_t) t * H * W + (size_t) j * slice + rem];
+            }
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int v = atomicAdd(arrive, 1);
+        if (v == (int) gridDim.x - 1) {
+            __threadfence_system();
+            for (int r = 1; r < n_shards; ++r) reinterpret_cast<volatile int*>(P.flag[(me + r) % n_shards])[me] = step;
+            arrive[0] = 0;
+        }
+    }
+}
+
 
 // the all-reduce tail fused with the next sublayer's input (HC pre-mix + RMS norm + Q8_1): block t = row t.  After
 // X[t][s] += post[t][s] * RMS(sum) * w (the tail), the next mix m_r = fn[r] . X[t] / rms(X[t]) gives pre / post (post is
@@ -713,12 +798,12 @@ struct HcNext {
     float mag = 0.0f;
 };
 __global__ void __launch_bounds__(1024) kd_ar_tail_hc(const float* __restrict__ x1, const float* __restrict__ x2, int T,
-                                                      int n, Peers P, int me, int n_shards, int* counter, int* arrive,
+                                                      int n, PeersD P, int me, int n_shards, int* counter, int* arrive,
                                                       const float* __restrict__ nw, float eps, float* X, float* post, int hc,
                                                       HcNext nx, float hc_eps, float* __restrict__ xo, Q81* __restrict__ xq) {
     constexpr int PER = 3;
     const int step = counter[0] + 1, tn = T * n, t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
-    kd_wait_peers(P, me, n_shards, step);
+    if (P.bf != 2) kd_wait_peers(P, me, n_shards, step);
     const float* rv = P.buf[me][step & 1];
     float ysum[PER], sq = 0.0f;
 #pragma unroll
@@ -726,8 +811,8 @@ __global__ void __launch_bounds__(1024) kd_ar_tail_hc(const float* __restrict__ 
         const int i = tid + k * 1024;
         float v = 0.0f;
         for (int j = 0; j < n_shards; ++j)
-            v += j == me ? x1[(size_t) t * n + i] + (x2 ? x2[(size_t) t * n + i] : 0.0f)
-                         : __ldcv(rv + (size_t) j * tn + (size_t) t * n + i);
+            v += j == me ? ar_own(P, x1[(size_t) t * n + i] + (x2 ? x2[(size_t) t * n + i] : 0.0f))
+                         : ar_peer(P, step, rv, (size_t) j * tn + (size_t) t * n + i);
         ysum[k] = v;
         sq += v * v;
     }
@@ -847,6 +932,175 @@ __global__ void __launch_bounds__(NE) kd_router(const float* __restrict__ logits
         const float inv = (float) (1.0 / fmax(sum, 6.103515625e-5));
         for (int r = 0; r < k; ++r) weights[(size_t) t * k + r] = (float) ((double) sp[idx[r]] * inv * w_scale);
     }
+}
+
+
+// ---- DFly2 drafter (hy4f_dfly.inc).  io = the step's IoT {pos = anchor, n = source row, toks}.
+// the draft block's cell lists: row t = the target's top-k cells of the source row (positions < anchor, -1 unused) +
+// the block's own positions anchor .. anchor + t (causal inside the block).  blockIdx.x = t.
+__global__ void kd_df_cells(const int* __restrict__ snap, int n_cap, const int* __restrict__ io, int* __restrict__ dc, int ncd) {
+    const int anchor = io[0], row = io[1], t = blockIdx.x;
+    const int* src = snap + (size_t) row * n_cap;
+    for (int i = threadIdx.x; i < ncd; i += blockDim.x) {
+        int v;
+        if (i < n_cap) {
+            v = src[i];
+            if (v >= anchor) v = -1;
+        } else {
+            v = i - n_cap <= t ? anchor + (i - n_cap) : -1;
+        }
+        dc[(size_t) t * ncd + i] = v;
+    }
+}
+// cat = [RMS(a) * wa, RMS(b) * wb] (one block of 1024 threads); b = b0 + io[1] * n when io (the source row's hidden)
+__global__ void kd_df_rms2(const float* __restrict__ a, const float* __restrict__ wa, const float* __restrict__ b0,
+                           const int* __restrict__ io, const float* __restrict__ wb, int n, float eps, float* __restrict__ cat) {
+    const float* b = b0 + (io ? (size_t) io[1] * n : 0);
+    float sa = 0.0f, sb = 0.0f;
+    for (int i = threadIdx.x; i < n; i += blockDim.x) sa += a[i] * a[i], sb += b[i] * b[i];
+    const float ra = rsqrtf(block_sum(sa) / n + eps);
+    __syncthreads();
+    const float rb = rsqrtf(block_sum(sb) / n + eps);
+    for (int i = threadIdx.x; i < n; i += blockDim.x) cat[i] = a[i] * ra * wa[i], cat[n + i] = b[i] * rb * wb[i];
+}
+// the block's input rows: mr[0] = emb(bonus) + gate * eh_proj(...), mr[t >= 1] = emb(mask)
+__global__ void kd_df_init(const float* __restrict__ me, const float* __restrict__ fz, const float* __restrict__ gate, int n,
+                           int T, float* __restrict__ mr) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < T * n; i += gridDim.x * blockDim.x)
+        mr[i] = me[i] + (i < n ? gate[i] * fz[i] : 0.0f);
+}
+__global__ void kd_add(const float* __restrict__ a, const float* __restrict__ b, int n, float* __restrict__ y) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) y[i] = a[i] + b[i];
+}
+
+
+// ---- the fused all-reduce tail in two wide kernels (kd_ar_tail_hc's math over 12 x T blocks instead of T blocks).
+// Every reduction the tail needs is a sum over the row of terms known before the norm r is: with y' = ysum * nw,
+// X_s the old streams, p_s = post_s:  r = rsqrt(sum ysum^2 / n + eps);  fn_q . X_new = A_q + r B_q (A_q = fn_q . X,
+// B_q = sum_s p_s fn_qs . y');  |X_new|^2 = sum_s G_ss + 2 r p_s H_s + r^2 p_s^2 K (G = X_s . X_s', H_s = X_s . y',
+// K = y' . y');  cur = sum_s pre_s X_new_s = sum_s pre_s X_s + r c y' (c = sum_s pre_s p_s) so |cur|^2 = sum pre pre' G +
+// 2 r c sum pre_s H_s + r^2 c^2 K.  kd_art_a: wait for the peers, ysum (scratch Y), the 32 partial sums per block;
+// kd_art_b: the totals (fixed order), the scalars, X_new, cur, x and its Q8_1.  hc <= 4, n = gridDim.x * 256.
+__device__ __forceinline__ int art_g(int s, int s2) {   // index of G[s][s2] (s <= s2) among the 10
+    return s == 0 ? s2 : s == 1 ? 3 + s2 : s == 2 ? 5 + s2 : 9;
+}
+__global__ void __launch_bounds__(256) kd_art_a(const float* __restrict__ x1, const float* __restrict__ x2, int T, int n,
+                                                PeersD P, int me, int n_shards, int* counter, int* arrive,
+                                                const float* __restrict__ nw, const float* __restrict__ X,
+                                                const float* __restrict__ post, int hc, HcNext nx, float* __restrict__ Y,
+                                                float* __restrict__ part, float* __restrict__ ppost) {
+    const int step = counter[0] + 1, tn = T * n, t = blockIdx.y, b = blockIdx.x, nbk = gridDim.x;
+    const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5, i = b * blockDim.x + tid;
+    if (P.bf != 2) kd_wait_peers(P, me, n_shards, step);
+    const float* rv = P.buf[me][step & 1];
+    float v = 0.0f;
+    for (int j = 0; j < n_shards; ++j)
+        v += j == me ? ar_own(P, x1[(size_t) t * n + i] + (x2 ? x2[(size_t) t * n + i] : 0.0f))
+                     : ar_peer(P, step, rv, (size_t) j * tn + (size_t) t * n + i);
+    Y[(size_t) t * n + i] = v;
+    const float yp = v * nw[i];
+    float xs[4], pp[4];
+#pragma unroll
+    for (int s2 = 0; s2 < 4; ++s2) {
+        xs[s2] = s2 < hc ? X[((size_t) t * hc + s2) * n + i] : 0.0f;
+        pp[s2] = s2 < hc ? post[t * 8 + s2] : 0.0f;
+    }
+    float a[32];
+    a[0] = v * v;
+#pragma unroll
+    for (int q = 0; q < 8; ++q) {
+        float A = 0.0f, B = 0.0f;
+        if (q < nx.n_mix)
+#pragma unroll
+            for (int s2 = 0; s2 < 4; ++s2)
+                if (s2 < hc) {
+                    const float f = nx.fn[(size_t) q * hc * n + (size_t) s2 * n + i];
+                    A += f * xs[s2];
+                    B += pp[s2] * (f * yp);
+                }
+        a[1 + q] = A;
+        a[9 + q] = B;
+    }
+#pragma unroll
+    for (int s2 = 0; s2 < 4; ++s2)
+#pragma unroll
+        for (int s3 = s2; s3 < 4; ++s3) a[17 + art_g(s2, s3)] = xs[s2] * xs[s3];
+#pragma unroll
+    for (int s2 = 0; s2 < 4; ++s2) a[27 + s2] = xs[s2] * yp;
+    a[31] = yp * yp;
+    __shared__ float red[8][33];
+#pragma unroll
+    for (int q = 0; q < 32; ++q) {
+        const float w = warp_sum(a[q]);
+        if (lane == 0) red[wid][q] = w;
+    }
+    __syncthreads();
+    if (tid < 32) {
+        float w = 0.0f;
+        for (int k = 0; k < (int) (blockDim.x >> 5); ++k) w += red[k][tid];
+        part[((size_t) t * nbk + b) * 32 + tid] = w;
+    }
+    if (b == 0 && tid < 4) ppost[t * 4 + tid] = pp[tid];
+    __syncthreads();
+    if (tid == 0) {
+        const int c = atomicAdd(arrive, 1);
+        if (c == (int) (gridDim.x * gridDim.y) - 1) {
+            arrive[0] = 0;
+            counter[0] = step;
+        }
+    }
+}
+__global__ void __launch_bounds__(256) kd_art_b(int n, const float* __restrict__ nw, float eps, float* X, float* post, int hc,
+                                                HcNext nx, float hc_eps, const float* __restrict__ Y,
+                                                const float* __restrict__ part, const float* __restrict__ ppost,
+                                                float* __restrict__ xo, Q81* __restrict__ xq) {
+    const int t = blockIdx.y, nbk = gridDim.x, tid = threadIdx.x, i = blockIdx.x * blockDim.x + tid;
+    __shared__ float tot[32], sc[12];   // sc: r, pre[4], c, r2, p[4]
+    if (tid < 32) {
+        float w = 0.0f;
+        for (int k = 0; k < nbk; ++k) w += part[((size_t) t * nbk + k) * 32 + tid];
+        tot[tid] = w;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const float r = rsqrtf(tot[0] / n + eps);
+        float p[4], pre[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int s2 = 0; s2 < 4; ++s2) p[s2] = s2 < hc ? ppost[t * 4 + s2] : 0.0f;
+        const float K = tot[31];
+        float ss = 0.0f;
+        for (int s2 = 0; s2 < hc; ++s2) ss += tot[17 + art_g(s2, s2)] + 2.0f * r * p[s2] * tot[27 + s2] + r * r * p[s2] * p[s2] * K;
+        const float inv = rsqrtf(ss / (float) (n * hc) + eps);
+        for (int q = 0; q < nx.n_mix; ++q) {
+            const float m = (tot[1 + q] + r * tot[9 + q]) * inv;
+            if (q < hc) pre[q] = sigm(m * nx.scale[0] + nx.base[q]) + hc_eps;
+            else if (blockIdx.x == 0) post[t * 8 + q - hc] = sigm(m * nx.scale[1] + nx.base[q]) * nx.mag + hc_eps;
+        }
+        float c = 0.0f, gh = 0.0f, gg = 0.0f;
+        for (int s2 = 0; s2 < hc; ++s2) {
+            c += pre[s2] * p[s2];
+            gh += pre[s2] * tot[27 + s2];
+            for (int s3 = 0; s3 < hc; ++s3) gg += pre[s2] * pre[s3] * tot[17 + (s2 <= s3 ? art_g(s2, s3) : art_g(s3, s2))];
+        }
+        const float cc = fmaxf(gg + 2.0f * r * c * gh + r * r * c * c * K, 0.0f);
+        sc[0] = r;
+        for (int s2 = 0; s2 < 4; ++s2) sc[1 + s2] = pre[s2], sc[8 + s2] = p[s2];
+        sc[5] = c;
+        sc[6] = rsqrtf(cc / n + eps);
+    }
+    __syncthreads();
+    const float r = sc[0], yp = Y[(size_t) t * n + i] * nw[i];
+    float cur = 0.0f;
+#pragma unroll
+    for (int s2 = 0; s2 < 4; ++s2)
+        if (s2 < hc) {
+            float* xp = X + ((size_t) t * hc + s2) * n + i;
+            const float xn = *xp + sc[8 + s2] * r * yp;
+            *xp = xn;
+            cur += sc[1 + s2] * xn;
+        }
+    const float v = cur * sc[6] * nx.nw[i];
+    xo[(size_t) t * n + i] = v;
+    q81_store(xq + ((size_t) t * n + i) / 32, v);
 }
 
 }  // namespace kern

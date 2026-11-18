@@ -8,13 +8,20 @@
 // argmax of the head over the last row.  llama.cpp hy-v4-flash.cpp graph_mtp: concat(RMS(emb) enorm, RMS(h) hnorm) ->
 // eh_proj -> an ordinary sparse layer with a plain residual -> shared_head_norm -> the trunk's output head.
 
-static constexpr int DT = 4;
+#ifdef HY4F_DT6
+static constexpr int DT = 6;   // (the DFly build: the block = bonus + 5 drafts; -DHY4F_DT6)
+#else
+static constexpr int DT = 4;   // (6 costs ~40 MB per GPU and ~3% of prefill / T<=4 decode: the default build stays at 4)
+#endif
 static constexpr int NSP = 16;
 int moe_blocks = std::getenv("HY4F_MOE_BLOCKS") ? std::atoi(std::getenv("HY4F_MOE_BLOCKS")) : 328;
 int dec_score_blocks = std::getenv("HY4F_DEC_SCORE_BLOCKS") ? std::atoi(std::getenv("HY4F_DEC_SCORE_BLOCKS")) : 256;   // split-K blocks per token of the decode attention
 bool push_all = std::getenv("HY4F_PUSH_ALL") != nullptr;
 bool push_seq = std::getenv("HY4F_PUSH_PER_PEER") == nullptr;
+bool push_one = std::getenv("HY4F_PUSH_ONEFENCE") != nullptr;
+bool tail_old = std::getenv("HY4F_TAIL_OLD") != nullptr;
 int ar_push_blocks = std::getenv("HY4F_PUSH_BLOCKS") ? std::atoi(std::getenv("HY4F_PUSH_BLOCKS")) : 1;
+int ar_push_threads = std::getenv("HY4F_PUSH_THREADS") ? std::atoi(std::getenv("HY4F_PUSH_THREADS")) : 256;
 
 struct IoT {   // a multi-token step's inputs (pinned host -> device at the head of each graph)
     int pos;
@@ -39,13 +46,23 @@ struct DShard {
     float *me = nullptr, *cat = nullptr, *mr = nullptr, *mh = nullptr;
     float *spm = nullptr, *spl = nullptr, *spacc = nullptr;   // the split-K attention partials [DT][NSP][Hmax][..]
     Q81 *xq = nullptr, *xlq = nullptr, *q16 = nullptr;
+    float *ysc = nullptr, *tpart = nullptr, *tppost = nullptr;   // the two-kernel all-reduce tail's scratch
     float* ar_buf[2] = {nullptr, nullptr};
     float* cb_buf[2] = {nullptr, nullptr};
     int *ar_flag = nullptr, *cb_flag = nullptr, *ar_ctr = nullptr, *cb_ctr = nullptr, *arrive = nullptr;
-    Peers ar{}, cb{};
+    PeersD ar{}, cb{};
     cudaGraphExec_t gv[DT + 1] = {}, gm[DT + 1] = {}, gc = nullptr;   // verify(T), mtp(T), the chained draft
 };
 std::vector<DShard> dsh;
+struct DFShard {   // the DFly drafter's per-shard state (hy4f_dfly.inc)
+    IoT *dio = nullptr, *cio = nullptr;
+    int *snap = nullptr, *dc = nullptr, *argi = nullptr;   // snap: [draft layer][DT][n_cap] the verify rows' top-k cells
+    float *cat = nullptr, *fz = nullptr, *z = nullptr, *ga = nullptr, *sh = nullptr, *pe = nullptr, *cc = nullptr,
+          *cgu = nullptr, *ch = nullptr, *cd = nullptr, *corr = nullptr, *argv = nullptr;
+    cudaGraphExec_t gb = nullptr, gk[8] = {};
+};
+std::vector<DFShard> dfs;
+std::vector<int> df_slot;   // per target layer: the draft layer reading it, -1
 bool has_mtp = false;
 IoT *hio_v = nullptr, *hio_m = nullptr;
 float* hlogT = nullptr;    // [DT][V] pinned
@@ -107,9 +124,9 @@ void dec_alloc(Shard& s, DShard& d) {
     d.sel_hist = (unsigned*) ia((size_t) DT * 2048);
     d.sel_bc = ia((size_t) DT * SEL_NB * 2);
     d.mg_n = ia(4);
-    d.mg_exp = ia(64);
-    d.mg_off = ia(65);
-    d.mg_slot = ia(64);
+    d.mg_exp = ia(128);
+    d.mg_off = ia(129);
+    d.mg_slot = ia(128);
     d.lg = dalloc((size_t) DT * n_exp);
     d.ew = dalloc((size_t) DT * K);
     d.eids = ia((size_t) DT * K);
@@ -144,6 +161,9 @@ void dec_alloc(Shard& s, DShard& d) {
         d.cb_buf[p] = dalloc((size_t) S * DT * (Hd / S) * CBW());
     }
     d.ar_flag = ia(4);
+    d.ysc = dalloc((size_t) DT * E);
+    d.tpart = dalloc((size_t) DT * 16 * 32);
+    d.tppost = dalloc((size_t) DT * 4);
     d.cb_flag = ia(4);
     d.ar_ctr = ia(1);
     d.cb_ctr = ia(1);
@@ -183,18 +203,25 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
     }
     const int tn = T * E;
     if (push_seq)
-        kd_push_seq<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, S, d.ar_ctr, d.arrive);
+        (push_one ? kd_push_seq1 : kd_push_seq)<<<ar_push_blocks, ar_push_threads, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, S, d.ar_ctr,
+                                                                          d.arrive);
     else if (push_all)
         kd_push_all<<<ar_push_blocks * (S - 1), 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, S, ar_push_blocks,
                                                                 d.ar_ctr, d.arrive);
     else
         for (int r = 1; r < S; ++r)
             kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, (s.g + r) % S, d.ar_ctr, d.arrive);
-    if (nx && !mtp)
+    if (nx && !mtp && E % 256 == 0 && E / 256 <= 16 && !tail_old) {   // (two wide kernels)
+        kd_art_a<<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), d.X, d.post,
+                                                     hc, *nx, d.ysc, d.tpart, d.tppost);
+        kd_art_b<<<dim3(E / 256, T), 256, 0, s.st>>>(E, f32(s, norm), eps, d.X, d.post, hc, *nx, hc_eps, d.ysc, d.tpart, d.tppost,
+                                                     d.x, d.xq);
+    } else if (nx && !mtp)
         kd_ar_tail_hc<<<T, 1024, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), eps, d.X, d.post,
                                             hc, *nx, hc_eps, d.x, d.xq);
     else
-        kd_ar_tail<<<T, 1024, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), eps, X, post, hcn);
+        kd_ar_tail<<<T, 1024, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, norm.empty() ? nullptr : f32(s, norm),
+                                          eps, X, post, hcn);
 }
 void d_norm_in(Shard& s, DShard& d, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
                float mag, int T) {
@@ -246,7 +273,9 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         case 1: kd_absorb<1><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
         case 2: kd_absorb<2><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
         case 3: kd_absorb<3><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
-        default: kd_absorb<4><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
+        case 4: kd_absorb<4><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
+        case 5: kd_absorb<5><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
+        default: kd_absorb<6><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
         }
     }
     else
@@ -276,8 +305,8 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                                                             1.0f / std::sqrt((float) (IK * IH)));
         const int ld_sc = (int) (o.max_context / kpool + 1);
         if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))   // (grid for the whole context: the graph is fixed)
-            kb_score_tc<<<dim3(dec_score_blocks, 1), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, kpool, top_k, pp, 0, T, ld_sc - 1,
-                                                       d.score, ld_sc);
+            (T <= 4 ? kb_score_tc : kd_score_tc8)<<<dim3(dec_score_blocks, 1), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, kpool,
+                                                                                         top_k, pp, 0, T, ld_sc - 1, d.score, ld_sc);
         else
             kb_score<<<dim3(nb(ld_sc * 32), T), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, IK, IH, kpool, top_k, pp, 0,
                                                                 d.score, ld_sc);
@@ -297,6 +326,9 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
             kd_sel_write<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, tp, n_cap, d.sel_st, d.sel_bc,
                                                             d.cells);
         }
+        if (!mtp && !dfs.empty() && df_slot[il] >= 0)   // (the DFly drafter reads this layer's top-k of every row)
+            HY_CK(cudaMemcpyAsync(dfs[s.g].snap + (size_t) df_slot[il] * DT * n_cap, d.cells, sizeof(int) * T * n_cap,
+                                  cudaMemcpyDeviceToDevice, s.st));
         if (S > 1) {
             if (split && Hd == 32) {
                 kd_mqa_dec<32><<<dim3(NSP, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
@@ -308,8 +340,8 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                                                         win, S, s.g, nullptr, scale, nullptr, d.part, Hd);
             }
             if (push_seq)
-                kd_push_seq<<<ar_push_blocks, 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd, CBW(), Hl, d.cb, s.g, S,
-                                                              d.cb_ctr, d.arrive + 8);
+                (push_one ? kd_push_seq1 : kd_push_seq)<<<ar_push_blocks, 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd,
+                                                                                    CBW(), Hl, d.cb, s.g, S, d.cb_ctr, d.arrive + 8);
             else if (push_all)
                 kd_push_all<<<ar_push_blocks * (S - 1), 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd, CBW(), Hl,
                                                                         d.cb, s.g, S, ar_push_blocks, d.cb_ctr, d.arrive + 8);
@@ -331,7 +363,9 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         case 1: kd_vb_gate<1><<<g, 256, 0, s.st>>>(vw, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl); break;
         case 2: kd_vb_gate<2><<<g, 256, 0, s.st>>>(vw, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl); break;
         case 3: kd_vb_gate<3><<<g, 256, 0, s.st>>>(vw, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl); break;
-        default: kd_vb_gate<4><<<g, 256, 0, s.st>>>(vw, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl); break;
+        case 4: kd_vb_gate<4><<<g, 256, 0, s.st>>>(vw, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl); break;
+        case 5: kd_vb_gate<5><<<g, 256, 0, s.st>>>(vw, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl); break;
+        default: kd_vb_gate<6><<<g, 256, 0, s.st>>>(vw, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl); break;
         }
     }
     else
@@ -372,14 +406,17 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     dec_mmvq(s, P + "xmoe", d.xq, d.xm, T);
     kd_q8_slots<<<dim3(nb(latent), T * K), 256, 0, s.st>>>(d.xm, xmc, latent, K, d.xlq);
     const bool grouped = !std::getenv("HY4F_IDS_LOOP");
-    if (grouped) kd_moe_groups<<<1, 64, 0, s.st>>>(d.eloc, T * K, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
+    const bool mp = T > 4;   // (more than 4 slots per expert possible: the multi-pass copy of the grouped kernel)
+    if (grouped) kd_moe_groups<<<1, T * K <= 64 ? 64 : 128, 0, s.st>>>(d.eloc, T * K, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
     auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out) {
         const size_t eb = w.rb * (size_t) w.ne[1];
         if (grouped) {
             if (w.type == T_Q3_K)
-                kn::native_q3_k_mmvq_grouped(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, xq, y, n_in, n_out, moe_blocks, s.st);
+                (mp ? kn::native_q3_k_mmvq_grouped_mp : kn::native_q3_k_mmvq_grouped)(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot,
+                                                                                    xq, y, n_in, n_out, moe_blocks, s.st);
             else if (w.type == T_Q4_K)
-                kn::native_q4_k_mmvq_grouped(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, xq, y, n_in, n_out, moe_blocks, s.st);
+                (mp ? kn::native_q4_k_mmvq_grouped_mp : kn::native_q4_k_mmvq_grouped)(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot,
+                                                                                    xq, y, n_in, n_out, moe_blocks, s.st);
             else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
             return;
         }
@@ -408,7 +445,9 @@ void head_rows(Shard& s, DShard& d, const float* x, int T, float* argv, int* arg
     case 1: kd_bf16_gemv<1><<<nb(rows * 32), 256, 0, s.st>>>(W, x, E, rows, d.logits); break;
     case 2: kd_bf16_gemv<2><<<nb(rows * 32), 256, 0, s.st>>>(W, x, E, rows, d.logits); break;
     case 3: kd_bf16_gemv<3><<<nb(rows * 32), 256, 0, s.st>>>(W, x, E, rows, d.logits); break;
-    default: kd_bf16_gemv<4><<<nb(rows * 32), 256, 0, s.st>>>(W, x, E, rows, d.logits); break;
+    case 4: kd_bf16_gemv<4><<<nb(rows * 32), 256, 0, s.st>>>(W, x, E, rows, d.logits); break;
+    case 5: kd_bf16_gemv<5><<<nb(rows * 32), 256, 0, s.st>>>(W, x, E, rows, d.logits); break;
+    default: kd_bf16_gemv<6><<<nb(rows * 32), 256, 0, s.st>>>(W, x, E, rows, d.logits); break;
     }
     kd_argmax<<<T, 1024, 0, s.st>>>(d.logits, rows, s.g * rows, argv, argi);
 }
@@ -485,7 +524,7 @@ void dec_setup() {
     std::memset(hio_m, 0, sizeof(IoT));
     dsh.resize(sh.size());
     for (size_t i = 0; i < sh.size(); ++i) dec_alloc(sh[i], dsh[i]);
-    Peers ar{}, cb{};
+    PeersD ar{}, cb{};
     for (int j = 0; j < S; ++j) {
         ar.buf[j][0] = dsh[j].ar_buf[0];
         ar.buf[j][1] = dsh[j].ar_buf[1];
@@ -494,7 +533,11 @@ void dec_setup() {
         cb.buf[j][1] = dsh[j].cb_buf[1];
         cb.flag[j] = dsh[j].cb_flag;
     }
+    // (decode all-reduce partials in BF16 like the prefill's reduce-scatter: half the PCIe bytes; HY4F_AR_F32 = F32)
+    ar.bf = push_seq && !push_all && !push_one && !std::getenv("HY4F_AR1") && !std::getenv("HY4F_AR_F32") ? 1 : 0;
+    if (ar.bf && !std::getenv("HY4F_AR_FLAGS")) ar.bf = 2;   // (LL: 2 BF16 + the step per 8-byte store, no fence/flag)
     for (auto& d : dsh) d.ar = ar, d.cb = cb;
+    if (df_nl) df_setup();
     kn::native_mmvq_set_multi_exact(false);   // (one weight read for the T columns; set before the captures)
     for (auto& s : sh) {
         HY_CK(cudaSetDevice(s.dev));
@@ -512,9 +555,13 @@ void dec_setup() {
         DShard& d = dsh[s.g];
         for (int T = 1; T <= DT; ++T) {
             cudaGraph_t gr = nullptr;
+            // (MMVQ with 5..8 columns: the upstream layout's 2-warp reduction is not bitwise equal to one column; the
+            // verify rows must equal plain steps (spec == greedy), so T >= 5 takes the exact layout)
+            kn::native_mmvq_set_multi_exact(T >= 5 && !std::getenv("HY4F_FAST_T56"));
             HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
             verify_ops(s, d, T);
             HY_CK(cudaStreamEndCapture(s.st, &gr));
+            kn::native_mmvq_set_multi_exact(false);
             HY_CK(cudaGraphInstantiate(&d.gv[T], gr, 0));
             HY_CK(cudaGraphDestroy(gr));
             if (has_mtp) {
@@ -532,6 +579,7 @@ void dec_setup() {
                 }
             }
         }
+        if (df_nl) df_capture(s);
         HY_CK(cudaDeviceSynchronize());
     }
 }

@@ -131,4 +131,11 @@ void native_q3_k_mmvq_grouped(const void* weights, std::size_t expert_bytes, con
 void native_q4_k_mmvq_grouped(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp,
                               const int* goff, const int* gslot, const void* x_q8_1, float* y, int n_in, int n_out,
                               int blocks, void* stream);
+// (the same with any number of slots per expert, in passes of 4: hy4f's verify steps of more than 4 tokens)
+void native_q3_k_mmvq_grouped_mp(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp,
+                              const int* goff, const int* gslot, const void* x_q8_1, float* y, int n_in, int n_out,
+                              int blocks, void* stream);
+void native_q4_k_mmvq_grouped_mp(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp,
+                              const int* goff, const int* gslot, const void* x_q8_1, float* y, int n_in, int n_out,
+                              int blocks, void* stream);
 } // namespace strata::kernels

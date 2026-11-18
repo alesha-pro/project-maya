@@ -860,6 +860,7 @@ struct Model::Impl {
 
 #include "hy4f_batch.inc"
 #include "hy4f_dec.inc"
+#include "hy4f_dfly.inc"
 
     void capture() {
         for (auto& s : sh) {
@@ -881,7 +882,8 @@ int Model::vocab() const { return d_->V; }
 std::string Model::summary() const {
     return "hy4f v3: " + std::to_string(d_->L) + " layers, tensor parallel over " + std::to_string(d_->S) +
            " GPUs, Q8 KV (DSA context parallel, SWA ring), " + (d_->graphs ? "CUDA graphs" : "no graphs") +
-           ", max context " + std::to_string(d_->o.max_context) + (d_->has_mtp ? ", MTP" : "");
+           ", max context " + std::to_string(d_->o.max_context) + (d_->has_mtp ? ", MTP" : "") +
+           (d_->df_nl ? ", DFly2 (" + std::to_string(d_->df_nl) + " layers)" : "");
 }
 
 bool Model::load(const Options& o, std::string& err) {
@@ -907,7 +909,11 @@ bool Model::load(const Options& o, std::string& err) {
             const strata::TensorInfo* t = d.find("blk." + std::to_string(d.L) + ".nextn.eh_proj.weight", &f);
             const strata::TensorInfo* te = d.find("blk." + std::to_string(d.L) + ".ffn_gate_exps.weight", &f);
             d.has_mtp = t && te && (int) te->type != 30 /*BF16 experts: requantize first (scripts/requant_mtp_q3k.py)*/ &&
-                        (int) t->type == 8 && !std::getenv("HY4F_NO_MTP");
+                        (int) t->type == 8 && !std::getenv("HY4F_NO_MTP") && (o.dfly.empty() || std::getenv("HY4F_KEEP_MTP"));
+        }
+        if (!o.dfly.empty()) {
+            d.files.emplace_back(new strata::GgufFile(o.dfly));
+            d.load_dfly_meta();
         }
         d.split_experts(devs);
         d.sh.resize(d.S);
@@ -915,6 +921,7 @@ bool Model::load(const Options& o, std::string& err) {
             d.sh[g].g = g;
             d.sh[g].dev = devs[g];
             d.load_shard(d.sh[g]);
+            if (d.df_nl) d.load_dfly_shard(d.sh[g]);
         }
         if (d.S > 1) d.setup_peers();
         for (auto& s : d.sh) {
@@ -1087,6 +1094,23 @@ bool Model::mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& er
     }
 }
 bool Model::has_mtp() const { return d_->has_mtp; }
+bool Model::has_dfly() const { return d_->df_nl > 0 && !d_->dfs.empty(); }
+bool Model::dfly(int src_row, int32_t bonus, int64_t anchor, int n, int32_t* drafts, std::string& err, float* logits) {
+    try {
+        Impl& d = *d_;
+        if (!has_dfly()) throw std::runtime_error("hy4f: no DFly drafter (or no CUDA graphs)");
+        if (n < 1 || n > Impl::DF_N) throw std::runtime_error("hy4f: dfly drafts 1..5");
+        if (src_row < 0 || src_row >= Impl::DT) throw std::runtime_error("hy4f: dfly source row");
+        if (anchor + Impl::DF_B > d.o.max_context) throw std::runtime_error("hy4f: context full");
+        if (logits && !d.df_logits) throw std::runtime_error("hy4f: dfly logits need HY4F_DFLY_LOGITS at load");
+        d.df_run(src_row, bonus, anchor, n, drafts);
+        if (logits) std::memcpy(logits, d.df_hlog, sizeof(float) * n * d.V);
+        return true;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
 
 bool Model::load_vision(const std::string& mmproj, std::string& err) {
 #ifdef HY4F_VISION

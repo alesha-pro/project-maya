@@ -19,6 +19,8 @@ struct Options {
     std::vector<int> split;            // first layer of each later part (empty: by weight bytes)
     int64_t max_context = 8192;
     std::string dump_dir;              // seams per position: <dir>/<name>.f32 (appended token by token)
+    std::string dfly;                  // the DFly2 drafter GGUF (scripts/dfly_to_gguf.py); empty: none.  Drops the MTP layer
+                                       // (VRAM) unless HY4F_KEEP_MTP
     bool verbose = false;
 };
 
@@ -57,6 +59,12 @@ public:
     /// token at position mpos
     bool mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& err, float* logits = nullptr);
     bool has_mtp() const;
+    /// DFly2 drafts: n (1..5) draft tokens after `bonus` (the token at position `anchor`, not yet in the cache), from the
+    /// last verify's row `src_row` (the last accepted token: its final hidden state and its top-k cells at the drafter's
+    /// target layers).  After prefill, verify the prompt's last token alone (row 0) first.  Writes the block's latent
+    /// rows at anchor .. anchor+5 of the target's DSA caches (the next verify overwrites them).
+    bool dfly(int src_row, int32_t bonus, int64_t anchor, int n, int32_t* drafts, std::string& err, float* logits = nullptr);
+    bool has_dfly() const;
     int vocab() const;
     std::string summary() const;
 
