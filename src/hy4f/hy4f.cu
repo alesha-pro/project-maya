@@ -1064,6 +1064,7 @@ bool Model::mtp(const int32_t* next_toks, int T, int64_t mpos, int32_t* draft, s
         if (mpos + T > d.o.max_context) throw std::runtime_error("hy4f: context full");
         d.hio_m->pos = (int) mpos;
         d.hio_m->n = T;
+        d.hio_m->last_pos = (int) mpos + T - 1;
         for (int t = 0; t < T; ++t) d.hio_m->toks[t] = next_toks[t];
         d.dec_launch(true, T);
         d.m_next = mpos + T;

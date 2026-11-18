@@ -29,6 +29,7 @@ struct IoT {   // a multi-token step's inputs (pinned host -> device at the head
     int pos;
     int n;
     int toks[8];
+    int last_pos;  // final row of a teacher-forced MTP update
 };
 
 // Hold both captured topologies on the host. Only the active one needs executable
@@ -299,7 +300,18 @@ void d_engram(Shard& s, DShard& d, int e, int il, const int* pp, int T) {
                                         1.1920929e-07f, nullptr);
 }
 
-void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false, bool dense_dsa = false) {
+void d_indexer_cache(Shard& s, DShard& d, const std::string& P, int il, const int* pp, int T,
+                     int xpc, int oik, float th) {
+    kb_rms<<<T, 128, 0, s.st>>>(d.xp + oik, xpc, f32(s, P + "indexer.k_norm.weight"), IK, eps, d.ikn, IK);
+    const DW& ivw = s.w.at(P + "ivg");
+    kb_q8_gemv<<<dim3(nb(2 * IK * 32), T), 256, 0, s.st>>>((const uint8_t*) ivw.d, d.ikn, IK, d.ivg, 2 * IK, IK, 2 * IK);
+    kb_pool_groups<<<T / kpool + 1, 128, 0, s.st>>>(d.ivg, s.ring[il], pp, T, f32(s, P + "indexer_compressor_ape.weight"),
+                                                    f32(s, P + "indexer_compressor_norm.weight"), s.pooled[il], IK,
+                                                    kpool, rope, eps, th);
+    kb_ring_chunk<<<IRING, 256, 0, s.st>>>(d.ivg, s.ring[il], T, pp, IK, kpool);
+}
+
+void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false, bool dense_dsa = false, const int* last_pos = nullptr) {
     const std::string P = "blk." + std::to_string(il) + ".";
     const bool sw = swa[il] != 0;
     const int Hl = sw ? Hs / S : Hd / S, QH = nope + rope;
@@ -312,9 +324,20 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
     }
     dec_mmvq(s, P + "xproj", d.xq, d.xp, T);
-    kb_rms<<<T, 1024, 0, s.st>>>(d.xp + oq, xpc, f32(s, P + "attn_q_a_norm.weight"), q_lora, eps, d.qr, q_lora);
     kb_kv_prep<<<T, 576, 0, s.st>>>(d.xp + okv, xpc, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th, s.kv[il], pp,
                                     sw ? 3 : 2, S, s.g, win + RING_PAD);
+    if (last_pos) {
+        // All accepted rows contribute keys and indexer state. Only the final
+        // row contributes a query, residual, FFN output and draft logits.
+        d_indexer_cache(s, d, P, il, pp, T, xpc, oik, th);
+        d.mr += (size_t) (T - 1) * E;
+        d.x += (size_t) (T - 1) * E;
+        d.xp += (size_t) (T - 1) * xpc;
+        if (dense_dsa) d.cells += (size_t) (T - 1) * n_cap;
+        pp = last_pos;
+        T = 1;
+    }
+    kb_rms<<<T, 1024, 0, s.st>>>(d.xp + oq, xpc, f32(s, P + "attn_q_a_norm.weight"), q_lora, eps, d.qr, q_lora);
     k_q8<<<nb(T * q_lora), 256, 0, s.st>>>(d.qr, T * q_lora, d.xq);
     if (!sw && dense_dsa) {
         const DW& q = s.w.at(P + "qproj");
@@ -352,13 +375,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     } else {
         float* iq = d.qp + (size_t) Hd * QH;
         if (!dense_dsa) kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, s.st>>>(iq, qpc, IH, IK, IK - rope, rope, pp, th);
-        kb_rms<<<T, 128, 0, s.st>>>(d.xp + oik, xpc, f32(s, P + "indexer.k_norm.weight"), IK, eps, d.ikn, IK);
-        const DW& ivw = s.w.at(P + "ivg");
-        kb_q8_gemv<<<dim3(nb(2 * IK * 32), T), 256, 0, s.st>>>((const uint8_t*) ivw.d, d.ikn, IK, d.ivg, 2 * IK, IK, 2 * IK);
-        kb_pool_groups<<<T / kpool + 1, 128, 0, s.st>>>(d.ivg, s.ring[il], pp, T, f32(s, P + "indexer_compressor_ape.weight"),
-                                                        f32(s, P + "indexer_compressor_norm.weight"), s.pooled[il], IK,
-                                                        kpool, rope, eps, th);
-        kb_ring_chunk<<<IRING, 256, 0, s.st>>>(d.ivg, s.ring[il], T, pp, IK, kpool);
+        if (!last_pos) d_indexer_cache(s, d, P, il, pp, T, xpc, oik, th);
         if (!dense_dsa) {
             kb_f32_gemv<<<dim3(nb(IH * 32), T), 256, 0, s.st>>>(f32(s, P + "indexer.proj.weight"), d.x, E, d.iw, IH, E, IH,
                                                                 1.0f / std::sqrt((float) (IK * IH)));
@@ -586,8 +603,14 @@ void mtp_ops(Shard& s, DShard& d, int T, bool chain = false, bool dense_dsa = fa
     kb_rms<<<T, 1024, 0, s.st>>>(chain ? d.mh : d.h, E, f32(s, P + "nextn.hnorm.weight"), E, eps, d.cat + E, 2 * E);
     k_q8<<<nb(T * 2 * E), 256, 0, s.st>>>(d.cat, T * 2 * E, d.xq);
     dec_mmvq(s, P + "nextn.eh_proj.weight", d.xq, d.mr, T);
-    d_attention(s, d, L, pp, T, true, false, dense_dsa);
-    d_ffn(s, d, L, T, true);
+    if (T > 1 && std::getenv("HY4F_MTP_LAST")) {
+        DShard view = d;  // the final row will rebase the residual and projection pointers in this capture
+        d_attention(s, view, L, pp, T, true, false, dense_dsa, &d.dio_m->last_pos);
+        d_ffn(s, view, L, 1, true);
+    } else {
+        d_attention(s, d, L, pp, T, true, false, dense_dsa);
+        d_ffn(s, d, L, T, true);
+    }
     kb_rms<<<1, 1024, 0, s.st>>>(d.mr + (size_t) (T - 1) * E, E, f32(s, P + "nextn.shared_head_norm.weight"), E, eps, d.mh, E);
     head_rows(s, d, d.mh, 1, d.argv + DT - 1, d.argi + DT - 1);
     HY_CK(cudaMemcpyAsync(hmargv + s.g, d.argv + DT - 1, sizeof(float), cudaMemcpyDeviceToHost, s.st));
