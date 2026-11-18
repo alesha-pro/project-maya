@@ -35,6 +35,9 @@ struct BShard {
     __half* dsa_half = nullptr;
     __half* yn = nullptr;                    // this shard's normalized slice [ts][E] fp16
     const __half* pending_ag = nullptr;
+    cudaStream_t ag_compute = nullptr;
+    cudaEvent_t ag_slice[4]{}, ag_complete = nullptr;
+    int overlap_rows = 0;
     int* ag_flag = nullptr;
     Peers ag{};
     float* cb_buf[2] = {nullptr, nullptr};
@@ -96,6 +99,11 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     if (std::any_of(s.w.begin(), s.w.end(), [](const auto& e) { return e.second.type == T_ROUTER_PACKED; }))
         b.unpacked_router = dalloc(size_t(n_exp) * E);
     if (!b.st) b.st = s.st;
+    if (S == 4 && paired && std::getenv("HY4F_PF_AG_OVERLAP") && (dma_mask & 2)) {
+        HY_CK(cudaStreamCreateWithFlags(&b.ag_compute, cudaStreamNonBlocking));
+        for (auto& e : b.ag_slice) HY_CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
+        HY_CK(cudaEventCreateWithFlags(&b.ag_complete, cudaEventDisableTiming));
+    }
     if (S == 1) attn_tile = Tmax;   // (the single-GPU attention falls back to kb_attn2 over the whole chunk)
     const int T = Tmax, K = n_used, QH = nope + rope, Hmax = std::max(Hd, Hs);
     const int64_t C = o.max_context;
@@ -372,10 +380,24 @@ void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int
     kb_wait_k<<<1, 32, 0, b.st>>>(b.ar, s.g, S, b.step);
     kb_rs_post<<<ts, 1024, 0, b.st>>>(T, E, ts, b.ar, s.g, S, b.step, f32(s, norm), eps, b.yn);
     ++b.step;
+    const bool overlap = b.ag_compute && mbs.empty() && !b.mtp && E == 3072 && hc == 4 && T >= 128;
+    b.overlap_rows = overlap ? T : 0;
     if (dma_mask & 2) {
         const int row = std::min(T, s.g * ts), nr = std::min(ts, T - row);
-        for (int r = 0; r < S; ++r)
-            b_copy(s, b, b.ag, peer_of(s.g, r), b.yn, (size_t)row * E * 2, (size_t)nr * E * 2);
+        for (int r = 0; r < S; ++r) {
+            const int j = peer_of(s.g, r);
+            b_copy(s, b, b.ag, j, b.yn, (size_t)row * E * 2, (size_t)nr * E * 2);
+            if (!overlap) continue;
+            // In an XOR phase the peer's ACK orders its slice on this device.
+            HY_CK(cudaEventRecord(b.ag_slice[j], b.st));
+            if (!fuse_hc) {
+                const int start = std::min(T, j * ts), len = std::min(ts, T - start);
+                const __half* yn = reinterpret_cast<const __half*>(b.ag.buf[s.g][b.step & 1]);
+                HY_CK(cudaStreamWaitEvent(b.ag_compute, b.ag_slice[j]));
+                if (len) kb_ag_residual<<<dim3(nb(E / 4), len, hc), 256, 0, b.ag_compute>>>(
+                    yn + (size_t)start * E, X + (size_t)start * hc * E, post + (size_t)start * 8, E, hcn);
+            }
+        }
     } else {
         kb_ag_push<<<blocks, 512, 0, b.st>>>(b.yn, T, E, ts, b.ag, s.g, b.step, b.ctr + 8, s.g);
         for (int r = 1; r < S; ++r) {
@@ -385,6 +407,11 @@ void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int
         }
     }
     kb_wait_k<<<1, 32, 0, b.st>>>(b.ag, s.g, S, b.step);
+    if (overlap && !fuse_hc) {
+        HY_CK(cudaEventRecord(b.ag_complete, b.ag_compute));
+        HY_CK(cudaStreamWaitEvent(b.st, b.ag_complete));
+        return;
+    }
     if (fuse_hc && !b.mtp && hc == 4 && E == 3072 && HC_SPLIT == 16 && mbs.empty()) {
         b.pending_ag = reinterpret_cast<const __half*>(b.ag.buf[s.g][b.step & 1]);
         return;
@@ -404,8 +431,21 @@ void b_norm_in(Shard& s, BShard& b, const std::string& P, const std::string& k, 
         const float* scale = f32(s, P + k + "_scale.weight");
         const float* base = f32(s, P + k + "_base.weight");
         const float* nw = f32(s, norm);
-        kb_hc_norm_fused<true><<<T, 1024, 0, b.st>>>(X, b.pending_ag + t0 * E, b.post + t0 * 8,
-            fn, scale, base, nw, n_mix, eps, hc_eps, mag, b.x, b.post);
+        if (T == b.overlap_rows && t0 == 0 && T > 0) {
+            const int ts = (T + S - 1) / S;
+            for (int r = 0; r < S; ++r) {
+                const int j = peer_of(s.g, r), row = std::min(T, j * ts), len = std::min(ts, T - row);
+                HY_CK(cudaStreamWaitEvent(b.ag_compute, b.ag_slice[j]));
+                if (len) kb_hc_norm_fused<true><<<len, 1024, 0, b.ag_compute>>>(
+                    X + (size_t)row * hc * E, b.pending_ag + (size_t)row * E, b.post + (size_t)row * 8,
+                    fn, scale, base, nw, n_mix, eps, hc_eps, mag, b.x + (size_t)row * E, b.post + (size_t)row * 8);
+            }
+            HY_CK(cudaEventRecord(b.ag_complete, b.ag_compute));
+            HY_CK(cudaStreamWaitEvent(b.st, b.ag_complete));
+        } else {
+            kb_hc_norm_fused<true><<<T, 1024, 0, b.st>>>(X, b.pending_ag + t0 * E, b.post + t0 * 8,
+                fn, scale, base, nw, n_mix, eps, hc_eps, mag, b.x, b.post);
+        }
         b.pending_ag = nullptr;
         return;
     }

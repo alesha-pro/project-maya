@@ -973,6 +973,14 @@ struct Model::Impl {
             for (auto& graph : d.gm) graph.clear();
             d.gc.clear();
         }
+        for (size_t g = 0; g < bsh.size(); ++g) {
+            auto& b = bsh[g];
+            if (!b.ag_compute) continue;
+            cudaSetDevice(sh[g].dev);
+            for (auto event : b.ag_slice) if (event) cudaEventDestroy(event);
+            if (b.ag_complete) cudaEventDestroy(b.ag_complete);
+            cudaStreamDestroy(b.ag_compute);
+        }
     }
 
 #include "hy4f_batch.inc"
