@@ -1471,8 +1471,19 @@ template<int T> void q8_tiled(int tile, const Q80Block* w, const Q81Block* x, fl
 }
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
+    const bool automatic = std::getenv("HY4F_Q8_AUTO") != nullptr;
     const char* requested = std::getenv("HY4F_Q8_TILE");
-    if (requested && ncols >= 1 && ncols <= 4 && n_in > 0 && n_in % 32 == 0 && n_out > 0) {
+    if (!requested && automatic && n_in == 3072 && (n_out == 2304 || n_out == 5696) && (ncols == 2 || ncols == 3))
+        requested = "1";
+    const bool single_warp = std::getenv("HY4F_Q80_ROWS") || (automatic && n_in == 384 && n_out == 3072);
+    const bool eligible = ncols >= 1 && ncols <= 4 && n_in > 0 && n_in % 32 == 0 && n_out > 0;
+    if (eligible && (requested || single_warp)) {
+        validate_pointer(weights);
+        validate_pointer(x_q8_1);
+        validate_pointer(y);
+        validate_stream(stream);
+    }
+    if (requested && eligible) {
         int tile = std::atoi(requested);
         if (tile == 1 || tile == 2 || tile == 4 || tile == 8) {
             const auto* w = static_cast<const Q80Block*>(weights);
@@ -1488,7 +1499,7 @@ void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
             return;
         }
     }
-    if (std::getenv("HY4F_Q80_ROWS") && n_in > 0 && n_in % 32 == 0 && n_out > 0 && ncols >= 1 && ncols <= 4) {
+    if (single_warp && eligible) {
         const unsigned blocks = (n_out + 3) / 4;
         auto st = static_cast<cudaStream_t>(stream);
         auto w = static_cast<const Q80Block*>(weights);
@@ -1943,6 +1954,7 @@ template<class F> bool try_grouped1536(const void* weights, size_t expert_bytes,
                                        const int* goff, const int* gslot, const void* x, float* y,
                                        int n_in, int n_out, int blocks, void* stream) {
     if (std::getenv("HY4F_GROUP_REFERENCE") || n_in != 1536 || (n_out != 1536 && n_out != 3072)) return false;
+    if (expert_bytes % sizeof(typename F::Block) != 0) throw std::invalid_argument("native MMVQ grouped: expert_bytes");
     const auto* w = static_cast<const typename F::Block*>(weights);
     const size_t eb = expert_bytes / sizeof(typename F::Block);
     const auto* q = static_cast<const Q81Block*>(x);
