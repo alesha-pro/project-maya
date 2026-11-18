@@ -594,6 +594,7 @@ int serve(Model& m, const ServeOptions& so) {
         // the request must be in both, the same pixels at the same start (its rows have no token ids to compare)
         size_t from = 0;
         while (from < state.size() && from < n && state[from] == r.ids[from]) ++from;
+        const size_t shared_tokens = from;
         for (const Held& q : held)
             if (q.start < (long long) from && std::none_of(pics.begin(), pics.end(), [&](const Pic& x) {
                     return x.start == q.start && x.hash == q.hash; }))
@@ -602,6 +603,9 @@ int serve(Model& m, const ServeOptions& so) {
             if (x.start < (long long) from && std::none_of(held.begin(), held.end(), [&](const Held& q) {
                     return x.start == q.start && x.hash == q.hash; }))
                 from = (size_t) x.start;
+        // Changing pixels can leave a common text prefix ending in the middle
+        // of a prefill chunk. Replay that chunk with the new image's rows.
+        if (turn_mark && from < shared_tokens) from -= from % CH;
         const bool full_hit = turn_mark && saved_prompt == n && from == n;
         if (!full_hit) {
             saved_prompt = 0;
