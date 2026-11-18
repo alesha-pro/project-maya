@@ -481,7 +481,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     }
     if (!sw && sparse_limit && (dense_dsa || sparse_dsa))
         kb_kv_prep<true,true><<<T,576,0,keys>>>(d.xp+okv,xpc,f32(s,P+"attn_kv_a_norm.weight"),kvl,
-            rope,eps,th,s.kv[il],pp,2,S,s.g,0,s.prefix_kv.at(il),top_k,sparse_base,sparse_limit/S);
+            rope,eps,th,s.kv[il],pp,2,S,s.g,0,s.prefix_kv.at(il),top_k,sparse_base,sparse_pitch,sparse_skip);
     else if (!sw && !s.prefix_kv.empty())
         kb_kv_prep<true><<<T,576,0,keys>>>(d.xp+okv,xpc,f32(s,P+"attn_kv_a_norm.weight"),kvl,
             rope,eps,th,s.kv[il],pp,2,S,s.g,0,s.prefix_kv.at(il),top_k);
@@ -567,7 +567,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     if (sw) {
         if (split && Hl == 16) {
             (value_groups==4 ? kd_mqa_dec<16,false,4> : kd_mqa_dec<16>)<<<dim3(NSP*value_groups, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
-                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh, false, 0, 0);
+                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh, false, 0, 0, nullptr, 0);
             if (std::getenv("HY4F_MQA_FOLD"))
                 kd_mqa_fold<false><<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hl,
                     f32(s,P+"attn_sinks.weight")+s.g*Hl,d.o,nullptr,0,d.cb,s.g,S,nullptr);
@@ -587,7 +587,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
             if (sparse_dsa)
                 kd_mqa_dec<16,false,1,true><<<dim3(NSP,T,4),256,mqd_smem<16>(),s.st>>>(
                     d.qabs,d.qp,qpc,QH,nope,th,s.kv[il],d.cells,n_cap,pp,win,S,s.g,
-                    scale,d.spm,d.spl,d.spacc,top_k,top_k/kpool-tail,qh,local_queries,sparse_base,sparse_limit/S);
+                    scale,d.spm,d.spl,d.spacc,top_k,top_k/kpool-tail,qh,local_queries,sparse_base,sparse_pitch,s.prefix_kv.at(il),sparse_skip);
             else
                 kd_mqa_dec<16,true,1,true><<<dim3(NSP,T,4),256,mqd_smem<16>(),s.st>>>(
                     d.qabs,d.qp,qpc,QH,nope,th,s.prefix_kv.at(il),nullptr,0,pp,win,S,s.g,
@@ -599,7 +599,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
             if (split && Hd == 32) {
                 (value_groups==4 ? (dense_dsa ? kd_mqa_dec<32,true,4> : kd_mqa_dec<32,false,4>) : (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>))<<<dim3(NSP*value_groups, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
                                                                            n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
-                                                                           d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail, qh, false, 0, 0);
+                                                                           d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail, qh, false, 0, 0, nullptr, 0);
                 if (contiguous_cb) {
                     kd_mqa_fold<false,true><<<dim3(Hd,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hd,nullptr,nullptr,
                                                                       d.part,CBW(),d.cb,s.g,S,nullptr);
@@ -1017,10 +1017,11 @@ void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
                 const int il = layer.first;
                 for (int owner = 0; owner < S; ++owner) if (owner != s.g) {
                     const int count = (sparse_high + S - 1 - owner)/S;
-                    if (!count) continue;
-                    const int base = replica_row_base(owner,s.g,sparse_base,sparse_limit/S);
-                    HY_CK(cudaMemcpyPeerAsync(s.kv[il]+(size_t)base*KV_RB,s.dev,sh[owner].kv[il],sh[owner].dev,
-                                              (size_t)count*KV_RB,s.st));
+                    if (count <= sparse_skip) continue;
+                    const int base = replica_row_base(owner,s.g,sparse_base,sparse_pitch);
+                    HY_CK(cudaMemcpyPeerAsync(s.kv[il]+(size_t)(base+sparse_skip)*KV_RB,s.dev,
+                                              sh[owner].kv[il]+(size_t)sparse_skip*KV_RB,sh[owner].dev,
+                                              (size_t)(count-sparse_skip)*KV_RB,s.st));
                 }
             }
             HY_CK(cudaStreamSynchronize(s.st));

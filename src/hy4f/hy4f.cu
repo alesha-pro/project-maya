@@ -194,16 +194,22 @@ struct Model::Impl {
                std::getenv("HY4F_REPLICATE_PREFIX") && !std::getenv("HY4F_OLD_DECODE") &&
                !std::getenv("HY4F_DEC_ATTN2");
     }
-    int sparse_limit = 0, sparse_base = 0, sparse_high = 0;
+    int sparse_limit = 0, sparse_base = 0, sparse_pitch = 0, sparse_skip = 0, sparse_high = 0;
     bool sparse_valid = true;
     void setup_sparse_replica() {
         const char* limit = std::getenv("HY4F_SPARSE_REPLICA");
         if (!limit || !replicate_prefix() || !direct_dsa || kpool != 4) return;
         const int capacity = (int)(o.max_context / S);
-        const int rows = std::min(capacity, std::atoi(limit)) & ~3;
+        const int requested = std::atoi(limit);
+        // Beyond the ordinary capacity, use the existing dense prefix for the
+        // earliest nonowner rows. Each of the three foreign stripes shrinks.
+        const int skip = requested > capacity && top_k % S == 0 ? top_k / S : 0;
+        const int rows = std::min(capacity + (S-1) * skip, requested) & ~3;
         if (rows <= top_k) return;
         sparse_limit = rows;
-        sparse_base = capacity + 1 - (S-1) * (rows/S);
+        sparse_skip = skip;
+        sparse_pitch = rows/S - skip;
+        sparse_base = capacity + 1 - (S-1) * sparse_pitch - skip;
     }
     void load_draft_experts(const char* path, bool down_only) {
         if (!path || !*path) return;
