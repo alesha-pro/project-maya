@@ -156,44 +156,60 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "maya-hy4f: --spec needs the MTP layer\n");
             return 1;
         }
-        // greedy speculative decode, one MTP draft per step: verify [last, draft] -> accept -> MTP over the new rows
+        // greedy speculative decode with k = spec MTP drafts per step: verify [last, d0..dk-1] -> accept the matching
+        // prefix + the bonus token -> MTP over the accepted rows (draft d0) -> chain d1.. from the MTP's own state
+        const int k = std::min(spec, 3);
         std::vector<int32_t> out;
-        int32_t last = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin()), draft = 0, am[4];
+        int32_t last = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin()), dr[4], am[4];
         out.push_back(last);
-        if (!m.mtp(&last, 1, pos - 1, &draft, err)) {
+        auto draft_chain = [&](int64_t mpos_next) {
+            for (int i = 1; i < k; ++i)
+                if (!m.mtp_chain(dr[i - 1], mpos_next + i - 1, &dr[i], err)) {
+                    std::fprintf(stderr, "maya-hy4f: mtp_chain failed: %s\n", err.c_str());
+                    std::exit(1);
+                }
+        };
+        if (!m.mtp(&last, 1, pos - 1, &dr[0], err)) {
             std::fprintf(stderr, "maya-hy4f: mtp failed: %s\n", err.c_str());
             return 1;
         }
-        int steps2 = 0, acc = 0;
+        draft_chain(pos);
+        int steps2 = 0;
+        std::vector<int> acc_hist(k + 1, 0);
         const auto a = std::chrono::steady_clock::now();
         while ((int) out.size() < gen) {
-            const int32_t vt[2] = {last, draft};
-            if (!m.verify(vt, 2, pos, nullptr, am, err)) {
+            int32_t vt[4] = {last, dr[0], dr[1], dr[2]};
+            if (!m.verify(vt, k + 1, pos, nullptr, am, err)) {
                 std::fprintf(stderr, "maya-hy4f: verify failed: %s\n", err.c_str());
                 return 1;
             }
             ++steps2;
-            int32_t nt[2];
-            int nn;
-            if (am[0] == draft) {
-                ++acc;
-                nt[0] = draft, nt[1] = am[1], nn = 2;
-            } else {
-                nt[0] = am[0], nn = 1;
-            }
-            for (int i = 0; i < nn; ++i) out.push_back(nt[i]);
-            if (!m.mtp(nt, nn, pos, &draft, err)) {
+            int n = 0;
+            while (n < k && am[n] == dr[n]) ++n;
+            ++acc_hist[n];
+            int32_t nt[4];
+            for (int i = 0; i < n; ++i) nt[i] = dr[i];
+            nt[n] = am[n];
+            for (int i = 0; i <= n; ++i) out.push_back(nt[i]);
+            if (!m.mtp(nt, n + 1, pos, &dr[0], err)) {
                 std::fprintf(stderr, "maya-hy4f: mtp failed: %s\n", err.c_str());
                 return 1;
             }
-            last = nt[nn - 1];
-            pos += nn;
+            last = nt[n];
+            pos += n + 1;
+            draft_chain(pos);
         }
+        int acc = 0;
+        for (int i = 0; i <= k; ++i) acc += i * acc_hist[i];
+        std::printf("accepted per step:");
+        for (int i = 0; i <= k; ++i) std::printf(" %d:%d", i, acc_hist[i]);
+        std::printf("\n");
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
         std::printf("gen:");
         for (int32_t t : out) std::printf(" %d", t);
-        std::printf("\nspec: %zu tokens in %d steps, accept %.1f%%, %.2f tok/s, %.2f ms/step\n", out.size() - 1, steps2,
-                    100.0 * acc / std::max(1, steps2), (out.size() - 1) / dt, 1000.0 * dt / std::max(1, steps2));
+        std::printf("\nspec k=%d: %zu tokens in %d steps, %.2f tokens/step, draft accept %.1f%%, %.2f tok/s, %.2f ms/step\n", k,
+                    out.size() - 1, steps2, (double) (out.size() - 1) / std::max(1, steps2),
+                    100.0 * acc / std::max(1, steps2 * k), (out.size() - 1) / dt, 1000.0 * dt / std::max(1, steps2));
         return 0;
     }
     std::vector<int32_t> out;

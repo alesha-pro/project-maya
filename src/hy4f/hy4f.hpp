@@ -37,6 +37,9 @@ public:
     /// the MTP draft layer over (the last verify's hidden rows 0..T-1, next_toks[0..T)) at positions mpos ..; the
     /// draft for the token after next_toks[T-1].  After prefill, row 0 holds the prompt's last state.
     bool mtp(const int32_t* next_toks, int T, int64_t mpos, int32_t* draft, std::string& err);
+    /// the next draft from the MTP's own last state (after mtp() or a previous mtp_chain()) and the previous draft
+    /// token at position mpos
+    bool mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& err);
     bool has_mtp() const;
     int vocab() const;
     std::string summary() const;

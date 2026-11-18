@@ -389,7 +389,7 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
     }
     const int K = n_used, e0 = ebound[s.g], nl = ebound[s.g + 1] - ebound[s.g], fl = n_ffx / S;
     blin(s, b, P + "ffn_gate_inp.weight", b.x, E, b.lg, n_exp, T);
-    kn::router_sigmoid(b.lg, f32(s, P + "exp_probs_b.bias"), T, n_exp, K, w_scale, true, b.eids, b.ew, s.st);
+    router(s, b.lg, f32(s, P + "exp_probs_b.bias"), T, b.eids, b.ew);
     kb_moe_count<<<nl, 256, 0, s.st>>>(b.eids, T * K, e0, b.mcnt);
     kb_moe_scan<<<1, std::max(nl, 32), 0, s.st>>>(b.mcnt, nl, b.mb);
     kb_moe_place<<<nl, 256, 0, s.st>>>(b.eids, T * K, K, e0, nl, b.mb, b.rows_tok, b.row_of);

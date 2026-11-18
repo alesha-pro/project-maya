@@ -9,6 +9,7 @@
 // eh_proj -> an ordinary sparse layer with a plain residual -> shared_head_norm -> the trunk's output head.
 
 static constexpr int DT = 4;
+int ar_push_blocks = std::getenv("HY4F_PUSH_BLOCKS") ? std::atoi(std::getenv("HY4F_PUSH_BLOCKS")) : 2;
 
 struct IoT {   // a multi-token step's inputs (pinned host -> device at the head of each graph)
     int pos;
@@ -31,9 +32,9 @@ struct DShard {
     Q81 *xq = nullptr, *xlq = nullptr, *q16 = nullptr;
     float* ar_buf[2] = {nullptr, nullptr};
     float* cb_buf[2] = {nullptr, nullptr};
-    int *ar_flag = nullptr, *cb_flag = nullptr, *ar_ctr = nullptr, *cb_ctr = nullptr;
+    int *ar_flag = nullptr, *cb_flag = nullptr, *ar_ctr = nullptr, *cb_ctr = nullptr, *arrive = nullptr;
     Peers ar{}, cb{};
-    cudaGraphExec_t gv[DT + 1] = {}, gm[DT + 1] = {};
+    cudaGraphExec_t gv[DT + 1] = {}, gm[DT + 1] = {}, gc = nullptr;   // verify(T), mtp(T), the chained draft
 };
 std::vector<DShard> dsh;
 bool has_mtp = false;
@@ -126,6 +127,7 @@ void dec_alloc(Shard& s, DShard& d) {
     d.cb_flag = ia(4);
     d.ar_ctr = ia(1);
     d.cb_ctr = ia(1);
+    d.arrive = ia(16);   // [0..4] all-reduce pushes / tail, [8..12] combine
 }
 
 void dec_mmvq(Shard& s, const std::string& n, const Q81* xq, float* y, int T) {
@@ -139,8 +141,18 @@ int rows_of(Shard& s, const std::string& n) {
 }
 
 void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::string& norm, int T, bool mtp) {
-    kd_ar_post<<<1, 1024, sizeof(float) * T * E, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, f32(s, norm), eps,
-                                                          mtp ? d.mr : d.X, mtp ? d.ones : d.post, mtp ? 1 : hc);
+    float* X = mtp ? d.mr : d.X;
+    const float* post = mtp ? d.ones : d.post;
+    const int hcn = mtp ? 1 : hc;
+    if (std::getenv("HY4F_AR1")) {
+        kd_ar_post<<<1, 1024, sizeof(float) * T * E, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, f32(s, norm), eps, X, post,
+                                                              hcn);
+        return;
+    }
+    const int tn = T * E;
+    for (int r = 1; r < S; ++r)
+        kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, (s.g + r) % S, d.ar_ctr, d.arrive);
+    kd_ar_tail<<<T, 1024, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), eps, X, post, hcn);
 }
 void d_norm_in(Shard& s, DShard& d, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
                float mag, int T) {
@@ -183,8 +195,16 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp) {
     const DW& vb = s.w.at(P + "attn_v_b.weight");
     const float scale = 1.0f / std::sqrt((float) QH);
     const int Ha = sw ? Hl : Hd;
-    if (kb.type == T_Q8_0)
-        kb_absorb_q8<<<dim3(nb(Ha * kvl), T), 256, 0, s.st>>>((const uint8_t*) kb.d, d.qp, qpc, QH, d.qabs, nope, kvl, Ha);
+    if (kb.type == T_Q8_0) {
+        const uint8_t* kw = (const uint8_t*) kb.d;
+        const int g = nb(Ha * kvl * 32);
+        switch (T) {
+        case 1: kd_absorb<1><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
+        case 2: kd_absorb<2><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
+        case 3: kd_absorb<3><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
+        default: kd_absorb<4><<<g, 256, 0, s.st>>>(kw, d.qp, qpc, QH, d.qabs, nope, kvl, Ha); break;
+        }
+    }
     else
         kb_absorb_bf16<<<dim3(nb(Ha * kvl), T), 256, 0, s.st>>>((const uint16_t*) kb.d, d.qp, qpc, QH, d.qabs, nope, kvl, Ha);
     if (sw) {
@@ -209,15 +229,26 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp) {
         if (S > 1) {
             kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp, win,
                                                     S, s.g, nullptr, scale, nullptr, d.part, Hd);
-            kd_combine<<<1, 1024, 0, s.st>>>(d.part, T, Hd, kvl, CBW(), s.g * Hl, Hl, f32(s, P + "attn_sinks.weight"), d.cb,
-                                             s.g, S, d.cb_ctr, d.o);
+            for (int r = 1; r < S; ++r)
+                kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd, CBW(), Hl, d.cb, s.g,
+                                                           (s.g + r) % S, d.cb_ctr, d.arrive + 8);
+            kd_cb_tail<<<T * Hl, 256, 0, s.st>>>(d.part, T, Hd, kvl, CBW(), s.g * Hl, Hl, f32(s, P + "attn_sinks.weight"),
+                                                 d.cb, s.g, S, d.cb_ctr, d.arrive + 12, d.o);
         } else {
             kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp, win,
                                                     1, 0, f32(s, P + "attn_sinks.weight"), scale, d.o, nullptr, Hd);
         }
     }
-    if (vb.type == T_Q8_0)
-        kb_vb_gate_q8<<<dim3(nb(Hl * vh * 32), T), 256, 0, s.st>>>((const uint8_t*) vb.d, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl);
+    if (vb.type == T_Q8_0) {
+        const uint8_t* vw = (const uint8_t*) vb.d;
+        const int g = nb(Hl * vh * 32);
+        switch (T) {
+        case 1: kd_vb_gate<1><<<g, 256, 0, s.st>>>(vw, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl); break;
+        case 2: kd_vb_gate<2><<<g, 256, 0, s.st>>>(vw, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl); break;
+        case 3: kd_vb_gate<3><<<g, 256, 0, s.st>>>(vw, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl); break;
+        default: kd_vb_gate<4><<<g, 256, 0, s.st>>>(vw, d.o, d.xp + og, xpc, d.a, kvl, vh, Hl); break;
+        }
+    }
     else
         kb_vb_gate_bf16<<<dim3(nb(Hl * vh * 32), T), 256, 0, s.st>>>((const uint16_t*) vb.d, d.o, d.xp + og, xpc, d.a, kvl, vh,
                                                                      Hl);
@@ -244,14 +275,14 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp) {
     const int xmc = rows_of(s, P + "xmoe");
     kb_f32_gemv<<<dim3(nb(n_exp * 32), T), 256, 0, s.st>>>(f32(s, P + "ffn_gate_inp.weight"), d.x, E, d.lg, n_exp, E, n_exp,
                                                            1.0f);
-    kn::router_sigmoid(d.lg, f32(s, P + "exp_probs_b.bias"), T, n_exp, K, w_scale, true, d.eids, d.ew, s.st);
+    router(s, d.lg, f32(s, P + "exp_probs_b.bias"), T, d.eids, d.ew);
     kd_local_ids<<<1, 128, 0, s.st>>>(d.eids, d.eloc, T * K, e0, e1);
     dec_mmvq(s, P + "xmoe", d.xq, d.xm, T);
     kd_q8_slots<<<dim3(nb(latent), T * K), 256, 0, s.st>>>(d.xm, xmc, latent, K, d.xlq);
     auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out) {
         const size_t eb = w.rb * (size_t) w.ne[1];
-        if (w.type == T_Q3_K) kn::native_q3_k_mmvq_ids(w.d, eb, d.eloc, T * K, xq, false, y, n_in, n_out, s.st);
-        else if (w.type == T_Q4_K) kn::native_q4_k_mmvq_ids(w.d, eb, d.eloc, T * K, xq, false, y, n_in, n_out, s.st);
+        if (w.type == T_Q3_K) kn::native_q3_k_mmvq_ids_loop(w.d, eb, d.eloc, T * K, xq, false, y, n_in, n_out, s.st);
+        else if (w.type == T_Q4_K) kn::native_q4_k_mmvq_ids_loop(w.d, eb, d.eloc, T * K, xq, false, y, n_in, n_out, s.st);
         else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
     };
     ids_mmvq(s.w.at(P + "ffn_gu_exps"), d.xlq, d.ga16, latent, 2 * n_ffx);
@@ -301,14 +332,15 @@ void verify_ops(Shard& s, DShard& d, int T) {
     HY_CK(cudaMemcpyAsync(hargi + (size_t) s.g * DT, d.argi, sizeof(int) * T, cudaMemcpyDeviceToHost, s.st));
 }
 
-void mtp_ops(Shard& s, DShard& d, int T) {
+void mtp_ops(Shard& s, DShard& d, int T, bool chain = false) {
     HY_CK(cudaMemcpyAsync(d.dio_m, hio_m, sizeof(IoT), cudaMemcpyHostToDevice, s.st));
     const int* pp = &d.dio_m->pos;
     const std::string P = "blk." + std::to_string(L) + ".";
     const DW& emb = s.w.at("token_embd.weight");
     kd_embed_rows<<<dim3(nb(E), T), 256, 0, s.st>>>((const uint8_t*) emb.d, emb.rb, d.dio_m->toks, E, d.me);
     kb_rms<<<T, 1024, 0, s.st>>>(d.me, E, f32(s, P + "nextn.enorm.weight"), E, eps, d.cat, 2 * E);
-    kb_rms<<<T, 1024, 0, s.st>>>(d.h, E, f32(s, P + "nextn.hnorm.weight"), E, eps, d.cat + E, 2 * E);
+    // h: the trunk rows of the last verify, or (a chained draft) the MTP's own last state (llama.cpp t_h_nextn)
+    kb_rms<<<T, 1024, 0, s.st>>>(chain ? d.mh : d.h, E, f32(s, P + "nextn.hnorm.weight"), E, eps, d.cat + E, 2 * E);
     k_q8<<<nb(T * 2 * E), 256, 0, s.st>>>(d.cat, T * 2 * E, d.xq);
     dec_mmvq(s, P + "nextn.eh_proj.weight", d.xq, d.mr, T);
     d_attention(s, d, L, pp, T, true);
@@ -367,14 +399,23 @@ void dec_setup() {
                 HY_CK(cudaStreamEndCapture(s.st, &gr));
                 HY_CK(cudaGraphInstantiate(&d.gm[T], gr, 0));
                 HY_CK(cudaGraphDestroy(gr));
+                if (T == 1) {
+                    HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
+                    mtp_ops(s, d, 1, true);
+                    HY_CK(cudaStreamEndCapture(s.st, &gr));
+                    HY_CK(cudaGraphInstantiate(&d.gc, gr, 0));
+                    HY_CK(cudaGraphDestroy(gr));
+                }
             }
         }
         HY_CK(cudaDeviceSynchronize());
     }
 }
 
-void dec_launch(bool mtp, int T) {
-    launch_parallel([&](Shard& s) { HY_CK(cudaGraphLaunch(mtp ? dsh[s.g].gm[T] : dsh[s.g].gv[T], s.st)); });
+void dec_launch(bool mtp, int T, bool chain = false) {
+    launch_parallel([&](Shard& s) {
+        HY_CK(cudaGraphLaunch(chain ? dsh[s.g].gc : mtp ? dsh[s.g].gm[T] : dsh[s.g].gv[T], s.st));
+    });
     for (auto& s : sh) {
         HY_CK(cudaSetDevice(s.dev));
         HY_CK(cudaStreamSynchronize(s.st));

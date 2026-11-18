@@ -630,6 +630,13 @@ struct Model::Impl {
                                            hc, 1.1920929e-07f);
     }
 
+    // the sigmoid router (kd_router for 512 experts, else Maya's router_sigmoid)
+    void router(Shard& s, const float* lg, const float* bias, int T, int* ids, float* w) {
+        if (n_exp == 512 && !std::getenv("HY4F_OLD_ROUTER"))
+            kd_router<512><<<T, 512, 0, s.st>>>(lg, bias, n_used, w_scale, ids, w);
+        else
+            kn::router_sigmoid(lg, bias, T, n_exp, n_used, w_scale, true, ids, w, s.st);
+    }
     void mmvq(Shard& s, const std::string& n, const Q81* xq, float* y) {
         const DW& w = s.w.at(n);
         if (w.type != T_Q8_0) throw std::runtime_error("hy4f: merged weight " + n + " is not Q8_0");
@@ -713,15 +720,15 @@ struct Model::Impl {
             return;
         }
         gemv(s, P + "ffn_gate_inp.weight", s.x, s.lg);
-        kn::router_sigmoid(s.lg, f32(s, P + "exp_probs_b.bias"), 1, n_exp, n_used, w_scale, true, s.eids, s.ew, s.st);
+        router(s, s.lg, f32(s, P + "exp_probs_b.bias"), 1, s.eids, s.ew);
         const int e0 = ebound[s.g], e1 = ebound[s.g + 1], fl = n_ffx / S;
         k_local_ids<<<1, 32, 0, s.st>>>(s.eids, s.eloc, n_used, e0, e1);
         mmvq(s, P + "xmoe", s.xq, s.xm);
         k_q8<<<nb(latent), 256, 0, s.st>>>(s.xm, latent, s.xlq);
         auto ids_mmvq = [&](const DW& w, const void* xq, bool shared, float* y, int n_in, int n_out) {
             const size_t eb = w.rb * (size_t) w.ne[1];
-            if (w.type == T_Q3_K) kn::native_q3_k_mmvq_ids(w.d, eb, s.eloc, n_used, xq, shared, y, n_in, n_out, s.st);
-            else if (w.type == T_Q4_K) kn::native_q4_k_mmvq_ids(w.d, eb, s.eloc, n_used, xq, shared, y, n_in, n_out, s.st);
+            if (w.type == T_Q3_K) kn::native_q3_k_mmvq_ids_loop(w.d, eb, s.eloc, n_used, xq, shared, y, n_in, n_out, s.st);
+            else if (w.type == T_Q4_K) kn::native_q4_k_mmvq_ids_loop(w.d, eb, s.eloc, n_used, xq, shared, y, n_in, n_out, s.st);
             else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
         };
         ids_mmvq(s.w.at(P + "ffn_gu_exps"), s.xlq, true, s.ga16, latent, 2 * n_ffx);   // [n_used][gate | up]
@@ -906,7 +913,7 @@ bool Model::load(const Options& o, std::string& err) {
             HY_CK(cudaSetDevice(s.dev));
             HY_CK(cudaDeviceSynchronize());
         }
-        if (d.graphs) d.capture();
+        if (d.graphs && std::getenv("HY4F_OLD_DECODE")) d.capture();
         if (d.graphs) d.dec_setup();
         if (o.verbose)
             for (auto& s : d.sh) {
@@ -1019,9 +1026,37 @@ bool Model::mtp(const int32_t* next_toks, int T, int64_t mpos, int32_t* draft, s
         return false;
     }
 }
+bool Model::mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& err) {
+    try {
+        Impl& d = *d_;
+        if (!d.has_mtp || d.dsh.empty()) throw std::runtime_error("hy4f: no MTP layer (or no CUDA graphs)");
+        if (mpos + 1 > d.o.max_context) throw std::runtime_error("hy4f: context full");
+        d.hio_m->pos = (int) mpos;
+        d.hio_m->n = 1;
+        d.hio_m->toks[0] = tok;
+        d.dec_launch(true, 1, true);
+        float bv = -INFINITY;
+        int bi = 0;
+        for (int g = 0; g < d.S; ++g)
+            if (d.hmargv[g] > bv) bv = d.hmargv[g], bi = d.hmargi[g];
+        if (draft) *draft = bi;
+        return true;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+}
 bool Model::has_mtp() const { return d_->has_mtp; }
 
 bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
+    if (!d_->dsh.empty() && !std::getenv("HY4F_OLD_DECODE")) {
+        if (!verify(&token, 1, pos, logits, nullptr, err)) return false;
+        if (logits && !d_->o.dump_dir.empty()) {
+            std::FILE* f = std::fopen((d_->o.dump_dir + "/logits.f32").c_str(), "ab");
+            if (f) std::fwrite(logits, 4, d_->V, f), std::fclose(f);
+        }
+        return true;
+    }
     try {
         Impl& d = *d_;
         if (pos > d.pos_next) throw std::runtime_error("hy4f: step out of order");
