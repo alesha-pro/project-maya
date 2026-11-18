@@ -613,8 +613,12 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     else
         kb_f32_gemv<<<dim3(nb(n_exp * 32), T), 256, 0, s.st>>>(f32(s, P + "ffn_gate_inp.weight"), d.x, E, d.lg, n_exp,
                                                                 E, n_exp, 1.0f);
-    if (n_exp == 512 && K == 16 && !std::getenv("HY4F_OLD_ROUTER"))
-        kd_router16<<<T, 512, 0, s.st>>>(d.lg, f32(s, P + "exp_probs_b.bias"), w_scale, e0, e1, d.eloc, d.ew);
+    const bool grouped = !std::getenv("HY4F_IDS_LOOP");
+    const bool use_router16 = n_exp == 512 && K == 16 && !std::getenv("HY4F_OLD_ROUTER");
+    const bool fuse_groups = use_router16 && T == 1 && grouped && std::getenv("HY4F_GROUP_MATCH");
+    if (use_router16)
+        kd_router16<<<T, 512, 0, s.st>>>(d.lg, f32(s, P + "exp_probs_b.bias"), w_scale, e0, e1, d.eloc, d.ew,
+                                         fuse_groups ? d.mg_n : nullptr, d.mg_exp, d.mg_off, d.mg_slot);
     else {
         router(s, d.lg, f32(s, P + "exp_probs_b.bias"), T, d.eids, d.ew);
         kd_local_ids<<<1, 128, 0, s.st>>>(d.eids, d.eloc, T * K, e0, e1);
@@ -623,9 +627,8 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         dec_mmvq(s, P + "xmoe", d.xq, d.xm, T);
         kd_q8_slots<<<dim3(nb(latent), T * K), 256, 0, s.st>>>(d.xm, xmc, latent, K, d.xlq);
     }
-    const bool grouped = !std::getenv("HY4F_IDS_LOOP");
     const bool mp = T > 4;   // (more than 4 slots per expert possible: the multi-pass copy of the grouped kernel)
-    if (grouped) {
+    if (grouped && !fuse_groups) {
         const int slots = T * K, threads = slots <= 64 ? 64 : 128;
         if (!std::getenv("HY4F_GROUP_MATCH"))
             kd_moe_groups<<<1, threads, 0, s.st>>>(d.eloc, slots, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);

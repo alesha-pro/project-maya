@@ -5,8 +5,7 @@
 namespace strata::hy4f::kern {
 
 // A router emits each expert at most once for one token.
-__global__ void kd_groups_one(const int* local, int n, int* ng, int* experts, int* off, int* slots) {
-    const int lane = threadIdx.x, e = lane < n ? local[lane] : -1;
+__device__ __forceinline__ void store_unique_group(int lane, int e, int* ng, int* experts, int* off, int* slots) {
     const unsigned valid = __ballot_sync(0xffffffffu, e >= 0);
     if (e >= 0) {
         const int group = __popc(valid & ((1u << lane) - 1));
@@ -19,6 +18,11 @@ __global__ void kd_groups_one(const int* local, int n, int* ng, int* experts, in
         *ng = groups;
         off[groups] = groups;
     }
+}
+
+__global__ void kd_groups_one(const int* local, int n, int* ng, int* experts, int* off, int* slots) {
+    const int lane = threadIdx.x;
+    store_unique_group(lane, lane < n ? local[lane] : -1, ng, experts, off, slots);
 }
 
 // One mask per (warp, local expert) identifies a group's first slot and the

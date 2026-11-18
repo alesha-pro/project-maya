@@ -3,6 +3,7 @@
 #pragma once
 
 #include "hy4f_kern.cuh"
+#include "hy4f_groups.cuh"
 
 #include <climits>
 
@@ -1007,7 +1008,7 @@ __device__ __forceinline__ unsigned long long router_winner(unsigned long long v
     return (other > v) == want_max ? other : v;
 }
 __global__ void kd_router16(const float* logits, const float* bias, float scale, int e0, int e1,
-                            int* local, float* weights) {
+                            int* local, float* weights, int* ng, int* gexp, int* goff, int* gslot) {
     __shared__ float prob[512];
     __shared__ unsigned long long run[2][256];
     const int i = threadIdx.x, warp = i >> 5, lane = i & 31, t = blockIdx.x;
@@ -1040,10 +1041,12 @@ __global__ void kd_router16(const float* logits, const float* bias, float scale,
         double sum = 0.0;
 #pragma unroll
         for (int k = 0; k < 16; ++k) sum += (double)__shfl_sync(0xffffffffu, selected, k);
+        const int e = lane < 16 && id >= e0 && id < e1 ? id - e0 : -1;
+        if (ng) store_unique_group(lane, e, ng, gexp, goff, gslot);
         if (lane < 16) {
             const float norm = (float)(1.0 / fmax(sum, 6.103515625e-5));
             weights[t * 16 + lane] = (float)((double)selected * norm * scale);
-            local[t * 16 + lane] = id >= e0 && id < e1 ? id - e0 : -1;
+            local[t * 16 + lane] = e;
         }
     }
 }
