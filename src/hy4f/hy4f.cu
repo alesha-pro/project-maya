@@ -972,6 +972,7 @@ struct Model::Impl {
             for (auto& graph : d.gv) graph.clear();
             for (auto& graph : d.gm) graph.clear();
             d.gc.clear();
+            if (d.packed_query) cudaFree(d.packed_query);
         }
         for (size_t g = 0; g < bsh.size(); ++g) {
             auto& b = bsh[g];

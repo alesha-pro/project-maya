@@ -97,7 +97,7 @@ struct Bump {
 void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_CK(cudaSetDevice(s.dev));
     b.Tmax = Tmax;
-    if (std::getenv("HY4F_PF_ROUTE_EVENT"))
+    if (mbs.empty() && std::getenv("HY4F_PF_ROUTE_EVENT"))
         HY_CK(cudaEventCreateWithFlags(&b.routing_ready, cudaEventDisableTiming));
     if (std::any_of(s.w.begin(), s.w.end(), [](const auto& e) { return e.second.type == T_ROUTER_PACKED; }))
         b.unpacked_router = dalloc(size_t(n_exp) * E);
