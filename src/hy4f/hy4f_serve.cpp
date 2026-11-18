@@ -41,6 +41,7 @@
 // exit 1): the server starts a new one.
 #include "hy4f_serve.hpp"
 #include "hy4f_draft_width.hpp"
+#include "hy4f_prompt_lookup.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -666,7 +667,10 @@ int serve(Model& m, const ServeOptions& so) {
             return t;
         };
         // one token out: false when the answer ends with it (an end token, max_new)
+        PromptLookup lookup(r.ids, spec && !rows);
+        bool borrowed = false;
         auto emit = [&](int t) -> bool {
+            lookup.append(t);
             std::printf("T %d\n", t);
             ++produced;
             if (in_think && t == r.think_end) in_think = false;
@@ -712,6 +716,9 @@ int serve(Model& m, const ServeOptions& so) {
             offered = 1;
             width.offer(0, dr[0]);
             const int room = width.enabled() ? (int) std::min<long long>({(long long) kc.k, C - next - 1, r.max_new - produced}) : kc.k;
+            const int copied = lookup.extend(dr[0], room-1, dr+1);
+            borrowed = copied > 0;
+            if (borrowed) { offered += copied; return; }
             for (int i = 1; i < room && width.extend(i - 1); ++i) {
                 if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err, ssamp ? mlg.data() : width.logits()))
                     fatal("mtp_chain at " + std::to_string(next + i - 1) + ": " + err, produced, n);
@@ -796,7 +803,7 @@ int serve(Model& m, const ServeOptions& so) {
             d_off += kk;
             d_acc += acc;
             if (!more || !spec) continue;
-            if (width.enabled()) width.observe(kk, acc);
+            if (width.enabled()) width.observe(borrowed ? std::min(1, kk) : kk, acc);
             else if (adapt) kc.step(kk, acc);
             int32_t nt[4];
             for (int i = 0; i < acc; ++i) nt[i] = dr[i];

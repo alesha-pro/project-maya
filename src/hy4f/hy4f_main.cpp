@@ -15,6 +15,7 @@
 #include <cuda_profiler_api.h>
 #include "hy4f_serve.hpp"
 #include "hy4f_draft_width.hpp"
+#include "hy4f_prompt_lookup.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -418,11 +419,17 @@ int main(int argc, char** argv) {
         int32_t last = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin()), dr[4] = {}, am[4];
         out.push_back(last);
         strata::hy4f::DraftWidth width(m.vocab(), true);
-        int offered = 0, total_offered = 0;
+        strata::hy4f::PromptLookup lookup(toks, true);
+        lookup.append(last);
+        int offered = 0, total_offered = 0, lookup_steps = 0, lookup_kept = 0, lookup_candidates = 0;
+        bool borrowed = false;
         auto draft_chain = [&](int64_t mpos_next) {
             width.begin();
             offered = 1;
             width.offer(0, dr[0]);
+            const int copied = lookup.extend(dr[0], k-1, dr+1);
+            borrowed = copied > 0;
+            if (borrowed) { offered += copied; return; }
             for (int i = 1; i < k && width.extend(i - 1); ++i) {
                 if (!m.mtp_chain(dr[i - 1], mpos_next + i - 1, &dr[i], err, width.logits())) {
                     std::fprintf(stderr, "maya-hy4f: mtp_chain failed: %s\n", err.c_str());
@@ -451,11 +458,15 @@ int main(int argc, char** argv) {
             while (n < offered && am[n] == dr[n]) ++n;
             ++acc_hist[n];
             total_offered += offered;
-            width.observe(offered, n);
+            if (borrowed) {
+                ++lookup_steps; lookup_candidates += offered - 1;
+                lookup_kept += std::max(0, n - 1);
+            }
+            width.observe(borrowed ? 1 : offered, n);
             int32_t nt[4];
             for (int i = 0; i < n; ++i) nt[i] = dr[i];
             nt[n] = am[n];
-            for (int i = 0; i <= n; ++i) out.push_back(nt[i]);
+            for (int i = 0; i <= n; ++i) { out.push_back(nt[i]); lookup.append(nt[i]); }
             if (!m.mtp(nt, n + 1, pos, &dr[0], err, width.logits())) {
                 std::fprintf(stderr, "maya-hy4f: mtp failed: %s\n", err.c_str());
                 return 1;
@@ -464,6 +475,7 @@ int main(int argc, char** argv) {
             pos += n + 1;
             draft_chain(pos);
         }
+        if (lookup_steps) std::printf("lookup: %d steps, %d/%d suffix tokens accepted\n", lookup_steps, lookup_kept, lookup_candidates);
         int acc = 0;
         for (int i = 0; i <= k; ++i) acc += i * acc_hist[i];
         std::printf("accepted per step:");
