@@ -1418,8 +1418,58 @@ void native_q5_0_f32(const void* weights, const float* x, void* scratch_q8_1,
     small_f32<Q50Block, 4>(weights, x, scratch_q8_1, y, n_in, n_out, ncols, stream);
 }
 
+// A physical warp holds the four partial sums of the canonical four-warp
+// Q8_0 reduction. Each lane walks the same blocks as before. Adding the
+// partials locally avoids the shared-memory exchange for every output row.
+namespace {
+template<int T>
+__global__ void __launch_bounds__(128) hy4_q80_rows(const Q80Block* __restrict__ w,
+                                                   const Q81Block* __restrict__ x, float* __restrict__ y,
+                                                   int nb, int rows) {
+    const int row = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+    if (row >= rows) return;
+    const Q80Block* wr = w + size_t(row) * nb;
+    float acc[T][4] = {};
+    const int q = (lane & 3) * 2;
+    for (int i = lane / 4; i < nb; i += 32) {
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int b = i + j * 8;
+            if (b >= nb) continue;
+            const int v0 = load_int_b2(wr[b].qs, q), v1 = load_int_b2(wr[b].qs, q + 1);
+            const float dw = wr[b].d;
+#pragma unroll
+            for (int t = 0; t < T; ++t) {
+                const auto& a = x[t * nb + b];
+                const int* in = reinterpret_cast<const int*>(a.qs) + q;
+                int si = __dp4a(v1, in[1], __dp4a(v0, in[0], 0));
+                acc[t][j] += dw * __low2float(a.ds) * float(si);
+            }
+        }
+    }
+#pragma unroll
+    for (int t = 0; t < T; ++t) {
+        float v = ((acc[t][0] + acc[t][1]) + acc[t][2]) + acc[t][3];
+        v = warp_sum(v);
+        if (lane == 0) y[t * rows + row] = v;
+    }
+}
+} // namespace
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
+    if (std::getenv("HY4F_Q80_ROWS") && n_in > 0 && n_in % 32 == 0 && n_out > 0 && ncols >= 1 && ncols <= 4) {
+        const unsigned blocks = (n_out + 3) / 4;
+        auto st = static_cast<cudaStream_t>(stream);
+        auto w = static_cast<const Q80Block*>(weights);
+        auto x = static_cast<const Q81Block*>(x_q8_1);
+        switch (ncols) {
+        case 1: hy4_q80_rows<1><<<blocks, 128, 0, st>>>(w, x, y, n_in / 32, n_out); break;
+        case 2: hy4_q80_rows<2><<<blocks, 128, 0, st>>>(w, x, y, n_in / 32, n_out); break;
+        case 3: hy4_q80_rows<3><<<blocks, 128, 0, st>>>(w, x, y, n_in / 32, n_out); break;
+        case 4: hy4_q80_rows<4><<<blocks, 128, 0, st>>>(w, x, y, n_in / 32, n_out); break;
+        }
+        launch_check(); return;
+    }
     small_mmvq<Q80Block, 8>(weights, x_q8_1, y, n_in, n_out, ncols, stream);
 }
 
