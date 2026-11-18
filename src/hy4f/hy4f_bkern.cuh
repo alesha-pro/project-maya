@@ -735,6 +735,16 @@ __global__ void kb_combine(int kvl, int W, int h0, int Hl, const float* sinks_al
 // owns tokens [j*ts, min(T, (j+1)*ts)).  ~1/8 of the fp32 push-to-everyone traffic.
 // Stage contiguous local payloads for the PCIe copy engines. All numeric conversions
 // have the same order and rounding as the direct-to-peer push kernels.
+// The reduce-scatter wire format rounds the F32 branch sum once to BF16.
+__global__ void kb_rs_pack_add(const float4* __restrict__ routed, const float4* __restrict__ shared,
+                               __nv_bfloat162* __restrict__ dst, int quads) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= quads) return;
+    const float4 a = routed[i], b = shared[i];
+    dst[2 * i] = __floats2bfloat162_rn(a.x + b.x, a.y + b.y);
+    dst[2 * i + 1] = __floats2bfloat162_rn(a.z + b.z, a.w + b.w);
+}
+
 __global__ void kb_rs_pack(const float* __restrict__ y, __nv_bfloat162* __restrict__ dst, int pairs) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < pairs) {

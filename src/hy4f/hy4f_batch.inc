@@ -59,6 +59,7 @@ std::vector<BShard> bsh;
 int score_tile = 64;
 const bool fuse_hc = std::getenv("HY4F_PF_HC_FUSE") != nullptr;
 bool mtp_kv_only = std::getenv("HY4F_PF_MTP_KV_ONLY") != nullptr;
+const bool fuse_pack_add = std::getenv("HY4F_PF_PACK_ADD") != nullptr;
 int dma_mask = std::getenv("HY4F_PF_DMA") ? std::atoi(std::getenv("HY4F_PF_DMA")) : 0;   // RS=1, AG=2, DSA=4, residual=8
 bool paired = !std::getenv("HY4F_RING_PUSH");   // exchanges in XOR-paired phases (S a power of two)
 int peer_of(int g, int r) const { return paired && (S & (S - 1)) == 0 ? (g ^ r) : (g + r) % S; }
@@ -338,7 +339,7 @@ void b_copy(Shard& s, BShard& b, Peers& P, int j, const void* src, size_t offset
 }
 
 // all-reduce of y [T][E] then RMS * w, X = R + post * y: reduce-scatter (bf16) by token slices, all-gather (fp16)
-void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int T) {
+void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int T, const float* addend = nullptr) {
     float* X = b.mtp ? b.mr : b.X;
     const float* post = b.mtp ? b.ones : b.post;
     const int hcn = b.mtp ? 1 : hc;
@@ -350,7 +351,10 @@ void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int
     ++b.step;
     if (dma_mask & 1) {
         auto pack = reinterpret_cast<__nv_bfloat162*>(b.xq);
-        kb_rs_pack<<<nb(T * E / 2), 256, 0, b.st>>>(y, pack, T * E / 2);
+        if (addend)
+            kb_rs_pack_add<<<nb(T * E / 4), 256, 0, b.st>>>(reinterpret_cast<const float4*>(y),
+                    reinterpret_cast<const float4*>(addend), pack, T * E / 4);
+        else kb_rs_pack<<<nb(T * E / 2), 256, 0, b.st>>>(y, pack, T * E / 2);
         for (int r = 0; r < S; ++r) {
             const int j = peer_of(s.g, r), row = std::min(T, j * ts);
             const int nr = std::min(ts, T - row);
@@ -725,6 +729,10 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
     blin(s, b, P + "ffn_routed_up.weight", b.moe, latent, b.mu, E, T);
     kb_swiglu_rows<<<dim3(nb(fl), T), 256, 0, b.st>>>(b.xm + latent, (int) xm_ld, fl, T, b.shh);
     blin(s, b, P + "ffn_down_shexp.weight", b.shh, fl, b.shd, E, T);
+    if (fuse_pack_add && S > 1 && (dma_mask & 1) && E % 4 == 0) {
+        b_ar_post(s, b, b.mu, P + "post_ffw_norm.weight", T, b.shd);
+        return;
+    }
     kb_add<<<nb(T * E), 256, 0, b.st>>>(b.mu, b.shd, b.ffo, (size_t) T * E);
     b_ar_post(s, b, b.ffo, P + "post_ffw_norm.weight", T);
 }
