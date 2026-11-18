@@ -46,6 +46,7 @@
 #include <functional>
 #include <mutex>
 #include <thread>
+#include <atomic>
 
 namespace strata::hy4f {
 
@@ -637,11 +638,12 @@ struct Model::Impl {
     }
 
     // the sigmoid router (kd_router for 512 experts, else Maya's router_sigmoid)
-    void router(Shard& s, const float* lg, const float* bias, int T, int* ids, float* w) {
+    void router(Shard& s, const float* lg, const float* bias, int T, int* ids, float* w, cudaStream_t st = nullptr) {
+        if (!st) st = s.st;
         if (n_exp == 512 && !std::getenv("HY4F_OLD_ROUTER"))
-            kd_router<512><<<T, 512, 0, s.st>>>(lg, bias, n_used, w_scale, ids, w);
+            kd_router<512><<<T, 512, 0, st>>>(lg, bias, n_used, w_scale, ids, w);
         else
-            kn::router_sigmoid(lg, bias, T, n_exp, n_used, w_scale, true, ids, w, s.st);
+            kn::router_sigmoid(lg, bias, T, n_exp, n_used, w_scale, true, ids, w, st);
     }
     void mmvq(Shard& s, const std::string& n, const Q81* xq, float* y) {
         const DW& w = s.w.at(n);
@@ -942,9 +944,16 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
         if (pos > d.pos_next) throw std::runtime_error("hy4f: prefill out of order");
         if (pos + n > d.o.max_context) throw std::runtime_error("hy4f: context full");
         if (chunk <= 0) chunk = 1024;
-        if (d.bsh.empty() || d.bsh[0].Tmax < chunk) {
+        // two micro-batches (overlap one half's exchanges with the other's compute) unless HY4F_MB=1
+        // (experimental, off by default: measured slower - MMQ / attention fill the SMs, the SM-based exchanges cannot run
+        // beside them; a real overlap needs DMA transfers)
+        const bool mb = d.S > 1 && chunk >= 512 && std::getenv("HY4F_MB") && std::atoi(std::getenv("HY4F_MB")) == 2;
+        const int tmax = mb ? chunk / 2 : chunk;
+        if (d.bsh.empty() || d.bsh[0].Tmax < tmax) {
             if (!d.bsh.empty()) throw std::runtime_error("hy4f: prefill chunk grew");
-            d.batch_setup(chunk);
+            if (mb) d.attn_tile = 256, d.score_tile = 32, d.cap_num = 5, d.cap_den = 4;   // (two halves' buffers in the VRAM of one)
+            d.batch_setup(tmax);
+            if (mb) d.mb_setup(tmax);
         }
         const auto t_start = std::chrono::steady_clock::now();
         for (int c0 = 0; c0 < n; c0 += chunk) {
@@ -959,8 +968,24 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
                 }
             d.launch_parallel([&](Shard& s) {
                 Impl::BShard& b = d.bsh[s.g];
-                HY_CK(cudaMemcpyAsync(b.toks, toks + c0, sizeof(int) * T, cudaMemcpyHostToDevice, s.st));
-                d.b_chunk(s, b, p0, T, last && logits, cs);
+                if (!d.mbs.empty() && T > b.Tmax) {
+                    Impl::MbState& M = d.mbs[s.g];
+                    const int TA = T / 2;
+                    HY_CK(cudaMemcpyAsync(b.toks, toks + c0, sizeof(int) * TA, cudaMemcpyHostToDevice, b.st));
+                    HY_CK(cudaMemcpyAsync(M.B.toks, toks + c0 + TA, sizeof(int) * (T - TA), cudaMemcpyHostToDevice, M.B.st));
+                    std::vector<Impl::Span> sa, sb;
+                    for (const auto& x : cs) {
+                        if (x.t0 < TA) sa.push_back({x.t0, std::min(x.n, TA - x.t0), x.rows});
+                        if (x.t0 + x.n > TA) {
+                            const int a0 = std::max(x.t0, TA);
+                            sb.push_back({a0 - TA, x.t0 + x.n - a0, x.rows + (size_t) (a0 - x.t0) * d.E});
+                        }
+                    }
+                    d.b_chunk2(s, b, M, p0, T, last && logits, sa, sb);
+                } else {
+                    HY_CK(cudaMemcpyAsync(b.toks, toks + c0, sizeof(int) * T, cudaMemcpyHostToDevice, s.st));
+                    d.b_chunk(s, b, p0, T, last && logits, cs);
+                }
             });
         }
         for (auto& s : d.sh) {

@@ -645,6 +645,15 @@ __device__ __forceinline__ void kb_wait(const Peers& P, int me, int n_shards, in
     __threadfence_system();
 }
 __global__ void kb_wait_k(Peers P, int me, int n_shards, int step) { kb_wait(P, me, n_shards, step); }
+// wait for one peer's flag (a paired phase: both partners finish phase r before either starts r + 1)
+__global__ void kb_wait_one(Peers P, int me, int src, int step) {
+    if (threadIdx.x == 0) {
+        volatile int* mine = P.flag[me];
+        const unsigned long long t0 = hy4f_now();
+        while (mine[src] < step) hy4f_spin_guard(t0);
+        __threadfence_system();
+    }
+}
 // all-reduce tail per token (blockIdx.x = token, 1024 threads): y = RMS(sum over shards [+ x2 local... folded in the
 // payload]) * w, X = R + post * y, R = X
 __global__ void kb_ar_post(const float* local, int n, Peers P, int me, int n_shards, int step, const float* nw, float eps,
