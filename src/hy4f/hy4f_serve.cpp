@@ -3,6 +3,7 @@
 //
 //   engine -> server   NOTE <text>, INFO key=value ..., then `READY <context> stop`
 //   server -> engine   GEN <max_new> [key=value ...] <id,id,...>      one request (one conversation at a time)
+//                      GENI <max_new> [key=value ...] <file> <ids>     ... with pictures (--mmproj; INFO vision=hy4)
 //   engine -> server   PP <read> <total> <ms> <tok/s> <reused>         after each prefill chunk (--chunk, 2048)
 //                      T <id>                                          each answer token
 //                      STAT tok_s=F ms_tok=F [drafts=F draft_acc=N draft_off=N k=N]   every 8 tokens, and at the end
@@ -25,6 +26,12 @@
 // bonus token; then mtp() over the kept rows drafts d0 and mtp_chain() the rest.  k adapts per request (--spec-k auto:
 // start 2, from the last 16 steps' acceptance of the last draft given the ones before it: k up to 3 when it is mostly
 // kept, down to 1 when rarely); a rejected tail needs no rewind (the next verify writes over it).
+//
+// Pictures (serve/hy4_vision.py): the file is MMI1 (int32 'MMI1', int32 count, per picture int64 start, int32 width,
+// int32 height, RGB bytes - the picture as decoded, not resized: the encoder resizes it itself, Lanczos as llama.cpp);
+// in the ids each picture is 120118, n x 120120 (placeholders at start ..), 120119 with n = the encoder's rows, which
+// are checked here.  The rows go to prefill as embedding spans; a cached picture counts as shared only where the same
+// pixels sit at the same start.
 //
 // The conversation in the cache: a prompt that starts with the tokens the cache holds reads only the rest (the last
 // prompt token is always read again: its logits are the answer's first); one that departs from them earlier keeps the
@@ -63,6 +70,7 @@ double now_ms() {
 }
 
 struct Req {
+    std::string file;   // GENI: the pictures
     long long max_new = 0;
     float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
     int top_k = 64;
@@ -77,10 +85,15 @@ struct Req {
 };
 
 bool parse_gen(const std::string& line, Req& r) {
-    std::istringstream is(line.substr(4));
+    const bool geni = line.rfind("GENI ", 0) == 0;
+    std::istringstream is(line.substr(geni ? 5 : 4));
     if (!(is >> r.max_new)) return false;
     for (std::string tok; is >> tok;) {
         const size_t eq = tok.find('=');
+        if (eq == std::string::npos && geni && r.file.empty()) {
+            r.file = tok;
+            continue;
+        }
         if (eq == std::string::npos) {   // the ids: comma-separated, last on the line
             for (char& c : tok)
                 if (c == ',') c = ' ';
@@ -109,7 +122,54 @@ bool parse_gen(const std::string& line, Req& r) {
             }
         }
     }
-    return !r.ids.empty();
+    return !r.ids.empty() && (!geni || !r.file.empty());
+}
+
+// GENI's pictures (MMI1, as serve/mm3_vision.py writes it)
+struct Pic {
+    long long start = 0;
+    int width = 0, height = 0;
+    std::vector<uint8_t> rgb;
+    uint64_t hash = 0;   // (FNV-1a over its size and pixels)
+};
+
+bool read_pics(const std::string& path, std::vector<Pic>& v, std::string& err) {
+    v.clear();
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) {
+        err = path + ": cannot open";
+        return false;
+    }
+    auto rd = [&](void* p, size_t n) { return std::fread(p, 1, n, f) == n; };
+    char magic[4];
+    int32_t n = 0;
+    bool ok = rd(magic, 4) && std::memcmp(magic, "MMI1", 4) == 0 && rd(&n, 4) && n >= 0 && n <= 256;
+    if (!ok) err = path + ": not a pictures file (MMI1)";
+    for (int i = 0; ok && i < n; ++i) {
+        Pic q;
+        int64_t st = 0;
+        int32_t wh[2] = {0, 0};
+        ok = rd(&st, 8) && rd(wh, 8) && wh[0] > 0 && wh[1] > 0 && (long long) wh[0] * wh[1] <= (1LL << 27);
+        if (ok) {
+            q.start = st, q.width = wh[0], q.height = wh[1];
+            q.rgb.resize((size_t) wh[0] * wh[1] * 3);
+            ok = rd(q.rgb.data(), q.rgb.size());
+        }
+        if (!ok) {
+            err = path + ": picture " + std::to_string(i) + " is cut short";
+            break;
+        }
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](const uint8_t* b, size_t k) {
+            for (size_t j = 0; j < k; ++j) h = (h ^ b[j]) * 1099511628211ull;
+        };
+        mix((const uint8_t*) wh, 8);
+        mix(q.rgb.data(), q.rgb.size());
+        q.hash = h;
+        v.push_back(std::move(q));
+    }
+    std::fclose(f);
+    return ok;
 }
 
 // stdin's lines on a thread of their own: STOP and WRAP are seen while a request runs
@@ -269,6 +329,11 @@ int serve(Model& m, const ServeOptions& so) {
     std::printf("INFO engine=hy4f engine_kind=hy4f model=%s ctx=%lld kv=q8 logit_bias=1 prefill_chunk=%d mtp=%d "
                 "spec_k=%s\n", so.model_name.c_str(), C, CH, mtp ? 1 : 0,
                 !mtp ? "0" : so.spec < 0 ? "auto" : std::to_string(std::min(so.spec, 3)).c_str());
+    if (m.has_vision())   // (serve/hy4_vision.py's Geometry.from_info; the mmproj's limits, hy4f_vision.hpp)
+        std::printf("INFO vision=hy4 image_token=120120 image_start=120118 image_end=120119 vision_patch=16 "
+                    "vision_merge=2 vision_min_pixels=4096 vision_max_pixels=4194304\n");
+    else
+        std::printf("INFO vision=off\n");
     std::printf("READY %lld stop\n", C);
     std::fflush(stdout);
     std::fprintf(stderr, "maya hy4f serve: GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT\n");
@@ -284,6 +349,11 @@ int serve(Model& m, const ServeOptions& so) {
     bool mark_ok = true;
     std::string line;
     std::vector<float> lgT((size_t) 4 * V);   // verify's rows (sampling, penalties, a bias)
+    struct Held {
+        long long start, n;
+        uint64_t hash;
+    };
+    std::vector<Held> held;   // the pictures in the cache
     auto fatal = [&](const std::string& why, long long produced, size_t n_prompt) {
         std::fprintf(stderr, "maya-hy4f: %s\n", why.c_str());
         std::printf("END hy4f: %s\n", why.c_str());
@@ -293,15 +363,16 @@ int serve(Model& m, const ServeOptions& so) {
     };
     while (in.next(line)) {
         if (line == "QUIT") break;
-        if (line.rfind("GEN ", 0) != 0) {
-            std::printf("ERR unsupported command '%s' (GEN, STOP, WRAP and QUIT)\n", line.substr(0, line.find(' ')).c_str());
+        if (line.rfind("GEN ", 0) != 0 && line.rfind("GENI ", 0) != 0) {
+            std::printf("ERR unsupported command '%s' (GEN, GENI, STOP, WRAP and QUIT)\n",
+                        line.substr(0, line.find(' ')).c_str());
             std::fflush(stdout);
             continue;
         }
         in.stop.store(false);
         Req r;
         if (!parse_gen(line, r)) {
-            std::printf("ERR expected: GEN <max_new> [keys] <id,id,...>\n");
+            std::printf("ERR expected: GEN <max_new> [keys] <id,id,...> (GENI: the pictures' file before the ids)\n");
             std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", r.ids.size());
             std::fflush(stdout);
             continue;
@@ -317,9 +388,35 @@ int serve(Model& m, const ServeOptions& so) {
             continue;
         }
         const double t0 = now_ms();
-        // the cache's shared start (the last prompt token is always read again)
+        std::vector<Pic> pics;
+        if (!r.file.empty()) {
+            std::string perr;
+            if (!m.has_vision()) perr = "this engine was started without --mmproj: no pictures";
+            else if (!read_pics(r.file, pics, perr)) {}
+            else
+                for (const Pic& q : pics)
+                    if (q.start < 1 || q.start >= (long long) n || r.ids[(size_t) q.start - 1] != 120118 ||
+                        r.ids[(size_t) q.start] != 120120)
+                        perr = "a picture's start " + std::to_string(q.start) + " is not after 120118 at a 120120";
+            if (!perr.empty()) {
+                std::printf("ERR %s\n", perr.c_str());
+                std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 0 0 0\n", n);
+                std::fflush(stdout);
+                continue;
+            }
+        }
+        // the cache's shared start (the last prompt token is always read again); a picture before it in the cache or
+        // the request must be in both, the same pixels at the same start (its rows have no token ids to compare)
         size_t from = 0;
         while (from < state.size() && from + 1 < n && state[from] == r.ids[from]) ++from;
+        for (const Held& q : held)
+            if (q.start < (long long) from && std::none_of(pics.begin(), pics.end(), [&](const Pic& x) {
+                    return x.start == q.start && x.hash == q.hash; }))
+                from = (size_t) q.start;
+        for (const Pic& x : pics)
+            if (x.start < (long long) from && std::none_of(held.begin(), held.end(), [&](const Held& q) {
+                    return x.start == q.start && x.hash == q.hash; }))
+                from = (size_t) x.start;
         const int64_t kept = m.rewind((int64_t) from, err);
         if (kept < 0) fatal("rewind: " + err, 0, n);
         if ((size_t) kept != from)
@@ -327,6 +424,44 @@ int serve(Model& m, const ServeOptions& so) {
                                  "read from %lld\n", from, (long long) kept);
         from = (size_t) kept;
         state.resize(from);
+        held.erase(std::remove_if(held.begin(), held.end(), [&](const Held& q) { return q.start + q.n > (long long) from; }),
+                   held.end());
+        // the pictures whose rows the prompt still reads: encoded now (between prefill / verify calls)
+        std::vector<std::vector<float>> prow(pics.size());
+        std::vector<int> pn(pics.size(), 0);   // each picture's image tokens in the prompt
+        std::vector<EmbdSpan> spans;
+        bool pic_bad = false;
+        for (size_t i = 0; i < pics.size() && !pic_bad; ++i) {
+            Pic& q = pics[i];
+            long long z = q.start;
+            while (z < (long long) n && r.ids[(size_t) z] == 120120) ++z;
+            pn[i] = (int) (z - q.start);
+            if (z <= (long long) from) continue;   // (in the cache already: the same pixels at the same start)
+            const std::string ppm = "P6\n" + std::to_string(q.width) + " " + std::to_string(q.height) + "\n255\n";
+            std::vector<uint8_t> buf(ppm.begin(), ppm.end());
+            buf.insert(buf.end(), q.rgb.begin(), q.rgb.end());
+            int nt = 0;
+            const double te = now_ms();
+            if (!m.encode_image_mem(buf.data(), buf.size(), prow[i], nt, err)) {
+                std::printf("ERR picture %zu: %s\n", i, err.c_str());
+                pic_bad = true;
+                break;
+            }
+            if (z - q.start != nt || z >= (long long) n || r.ids[(size_t) z] != 120119) {
+                std::printf("ERR picture %zu: the encoder made %d rows, the prompt has %lld image tokens there\n", i, nt,
+                            z - q.start);
+                pic_bad = true;
+                break;
+            }
+            std::fprintf(stderr, "maya hy4f serve: picture %zu: %dx%d -> %d rows in %.0f ms\n", i, q.width, q.height, nt,
+                         now_ms() - te);
+            if (q.start + nt > (long long) from) spans.push_back({(int) q.start, nt, prow[i].data()});
+        }
+        if (pic_bad) {
+            std::printf("DONE 0 %zu 0.0 0.0 cancel 0 0 %zu 0 0\n", n, from);
+            std::fflush(stdout);
+            continue;
+        }
         bool cancel = false;
         auto pp_line = [&](size_t done) {
             const double ms = now_ms() - t0;
@@ -336,7 +471,9 @@ int serve(Model& m, const ServeOptions& so) {
         for (size_t a = from; a < n;) {
             const int T = (int) std::min<size_t>((size_t) CH, n - a);
             const bool last = a + (size_t) T == n;
-            if (!m.prefill(r.ids.data() + a, T, (int64_t) a, last ? lg.data() : nullptr, CH, err))
+            std::vector<EmbdSpan> cs;   // (the spans relative to this call's tokens; prefill clips them)
+            for (const EmbdSpan& e : spans) cs.push_back({e.offset - (int) a, e.n, e.rows});
+            if (!m.prefill(r.ids.data() + a, T, (int64_t) a, last ? lg.data() : nullptr, CH, err, cs.empty() ? nullptr : &cs))
                 fatal("prefill at " + std::to_string(a) + ": " + err, 0, n);
             state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + T);
             a += (size_t) T;
@@ -347,6 +484,10 @@ int serve(Model& m, const ServeOptions& so) {
             }
         }
         const double t1 = now_ms();
+        for (size_t i = 0; i < pics.size(); ++i)   // (the pictures now in the cache)
+            if (pics[i].start + pn[i] <= (long long) state.size() &&
+                std::none_of(held.begin(), held.end(), [&](const Held& q) { return q.start == pics[i].start; }))
+                held.push_back({pics[i].start, (long long) pn[i], pics[i].hash});
         if (cancel) {
             std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", n, t1 - t0, from);
             std::fflush(stdout);

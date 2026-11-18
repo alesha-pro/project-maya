@@ -12,6 +12,7 @@ import random
 import unittest
 from pathlib import Path
 
+from serve import hy4_vision
 from serve.frontend import ChatTemplate, OutputParser
 
 TEMPLATE = Path(os.environ.get("MAYA_HY4_TEMPLATE", "/mnt/ssd/models/hy4-flash/maya-tokenizer/chat_template.jinja"))
@@ -45,6 +46,21 @@ class Hy4Output(unittest.TestCase):
     def test_plain_answer_and_thinking_off(self):
         self.assertEqual(parse([f"hmm</think{S}>", "\n\nHello <there>."]), ("hmm", "Hello <there>.", []))
         self.assertEqual(parse(["Just text, no tags."], thinking=False), ("", "Just text, no tags.", []))
+
+
+class Hy4Pictures(unittest.TestCase):
+    def test_tokens_as_the_encoder(self):   # (src/hy4f/hy4f_vision.hpp: 1120x640 -> 35x20 -> 720; maya-hy4f 1920x1080 -> 2074)
+        g = hy4_vision.Geometry()
+        self.assertEqual([hy4_vision.image_tokens(w, h, g) for w, h in ((1120, 640), (1920, 1080), (30, 30), (8000, 6000))],
+                         [720, 2074, 6, 4070])
+
+    def test_expand(self):
+        v = hy4_vision.Vision.__new__(hy4_vision.Vision)
+        v.g = hy4_vision.Geometry()
+        pic = hy4_vision.Picture(b"", 1, 1, 3)
+        self.assertEqual(v.expand([5, 120118, 120120, 120119, 7], [pic]), ([5, 120118] + [120120] * 3 + [120119, 7], [2]))
+        with self.assertRaises(ValueError):
+            v.expand([5, 120120, 7], [pic])
 
 
 @unittest.skipUnless(TEMPLATE.exists(), f"the Hy4 chat template is not at {TEMPLATE}")

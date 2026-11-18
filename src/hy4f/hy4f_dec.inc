@@ -177,7 +177,7 @@ void d_engram(Shard& s, DShard& d, int e, int il, const int* pp, int T) {
     dec_mmvq(s, P + "engram_kv.weight", d.xq, d.eg_kv, T);
     kb_engram_mix<<<T, 1024, 0, s.st>>>(d.X, d.X, d.eg_kv, f32(s, P + "engram_kv_b.weight"), f32(s, P + "engram_gate.weight"),
                                         f32(s, P + "engram_hc_scale.weight"), f32(s, P + "engram_pre_gamma.weight"), E, hc,
-                                        1.1920929e-07f);
+                                        1.1920929e-07f, nullptr);
 }
 
 void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp) {
@@ -444,3 +444,30 @@ void dec_launch(bool mtp, int T, bool chain = false) {
     }
     HY_CK(cudaGetLastError());
 }
+
+#ifdef HY4F_VISION
+bool encode_img(const vision::Image& img, std::vector<float>& rows, int& n_tokens, std::string& err) {
+    if (!venc) throw std::runtime_error("hy4f: no vision encoder loaded");
+    if (bsh.empty()) batch_setup(2048);
+    // the shard whose batch arena is biggest relative to the need; the arena's contents are scratch between calls
+    Shard& s = sh[0];
+    BShard& b = bsh[0];
+    const size_t need = venc->arena_bytes(img.w, img.h);
+    if (need > b.arena_bytes)
+        throw std::runtime_error("hy4f: image needs a " + std::to_string(need >> 20) + " MiB arena, the batch arena has " +
+                                 std::to_string(b.arena_bytes >> 20) + " MiB (a larger prefill chunk or a smaller image)");
+    HY_CK(cudaSetDevice(s.dev));
+    vision::Arena ar;
+    ar.dev_ptr = b.arena_base;
+    ar.bytes = b.arena_bytes;
+    ar.gpu = s.dev;
+    ar.stream = (CUstream_st*) s.st;
+    ar.cublas = b.blas;
+    vision::Output out;
+    if (!venc->encode(img, out, err, ar, nullptr)) return false;
+    HY_BL(cublasSetStream(b.blas, s.st));
+    rows.swap(out.embd);
+    n_tokens = out.n_tokens;
+    return true;
+}
+#endif

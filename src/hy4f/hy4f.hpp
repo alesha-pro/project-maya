@@ -22,6 +22,13 @@ struct Options {
     bool verbose = false;
 };
 
+/// embedding rows (an encoded image) that replace the token embeddings of toks[offset .. offset + n) in prefill();
+/// rows: host [n][n_embd] floats.  The image token ids there are placeholders (120120); the Engram is masked on them.
+struct EmbdSpan {
+    int offset = 0, n = 0;
+    const float* rows = nullptr;
+};
+
 class Model {
 public:
     Model();
@@ -30,7 +37,15 @@ public:
     /// one token at position pos (pos must be the next position); logits (vocab) to the host when `logits` != null
     bool step(int32_t token, int64_t pos, float* logits, std::string& err);
     /// n tokens at positions pos .. pos + n - 1 in chunks of `chunk` (the batched path); the last token's logits
-    bool prefill(const int32_t* toks, int n, int64_t pos, float* logits, int chunk, std::string& err);
+    bool prefill(const int32_t* toks, int n, int64_t pos, float* logits, int chunk, std::string& err,
+                 const std::vector<EmbdSpan>* spans = nullptr);
+    /// the image encoder (mmproj GGUF): weights in pinned host memory, encodes inside the batch buffers' arena on one GPU
+    bool load_vision(const std::string& mmproj, std::string& err);
+    bool has_vision() const;
+    /// an encoded image file (PNG / JPEG / ...: a path or the bytes) -> rows [n_tokens][n_embd] for an EmbdSpan; call
+    /// between prefill()/verify() calls.  The sequence is ... 120118, n_tokens rows, 120119 ...
+    bool encode_image(const std::string& path, std::vector<float>& rows, int& n_tokens, std::string& err);
+    bool encode_image_mem(const uint8_t* bytes, size_t n, std::vector<float>& rows, int& n_tokens, std::string& err);
     /// T (1..4) tokens at positions pos .. pos+T-1 (pos <= the next position: a rejected tail is overwritten), logits
     /// of every row ([T][vocab], may be null) and their argmax; keeps the rows' final hidden states for mtp()
     bool verify(const int32_t* toks, int T, int64_t pos, float* logits, int32_t* argmax, std::string& err);
