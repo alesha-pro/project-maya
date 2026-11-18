@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <numeric>
@@ -178,6 +179,49 @@ __global__ void k_hc_pre(const float* X, const float* fn, const float* scale, co
     }
     __syncthreads();
     for (int d = threadIdx.x; d < E; d += blockDim.x) {
+        float v = 0.0f;
+        for (int i = 0; i < hc; ++i) v += pre[i] * X[(size_t) i * E + d];
+        cur[d] = v;
+    }
+}
+// HC in two light kernels: k_hc_mix (grid n_mix x HC_SPLIT) writes per-chunk partial dots part[r][s] and partial sums
+// of squares ss[s]; k_hc_apply reduces them (inv = rsqrt(mean sq + eps), m_r = sum_s part * inv), forms pre/post and
+// cur = sum_i pre_i X_i (post to `post` by thread 0 of block 0).
+constexpr int HC_SPLIT = 16;
+__global__ void k_hc_mix(const float* X, const float* fn, int n, float* part, float* ss) {
+    const int r = blockIdx.x, s = blockIdx.y, chunk = n / HC_SPLIT, i0 = s * chunk;
+    const float* w = fn + (size_t) r * n;
+    float d = 0.0f, q = 0.0f;
+    for (int i = i0 + threadIdx.x; i < i0 + chunk; i += blockDim.x) {
+        const float x = X[i];
+        d += w[i] * x;
+        q += x * x;
+    }
+    d = block_sum(d);
+    q = block_sum(q);
+    if (threadIdx.x == 0) {
+        part[r * HC_SPLIT + s] = d;
+        if (r == 0) ss[s] = q;
+    }
+}
+__global__ void k_hc_apply(const float* X, const float* part, const float* ss, const float* scale, const float* base,
+                           int E, int hc, int n_mix, float eps, float hc_eps, float mag, float* cur, float* post) {
+    __shared__ float pre[8];
+    if (threadIdx.x < 32) {
+        float q = threadIdx.x < HC_SPLIT ? ss[threadIdx.x] : 0.0f;
+        q = warp_sum(q);
+        const float inv = rsqrtf(q / (float) (E * hc) + eps);
+        for (int r = 0; r < n_mix; ++r) {
+            float m = threadIdx.x < HC_SPLIT ? part[r * HC_SPLIT + threadIdx.x] : 0.0f;
+            m = warp_sum(m) * inv;
+            if (threadIdx.x == 0) {
+                if (r < hc) pre[r] = sigm(m * scale[0] + base[r]) + hc_eps;
+                else if (blockIdx.x == 0) post[r - hc] = sigm(m * scale[1] + base[r]) * mag + hc_eps;
+            }
+        }
+    }
+    __syncthreads();
+    for (int d = blockIdx.x * blockDim.x + threadIdx.x; d < E; d += gridDim.x * blockDim.x) {
         float v = 0.0f;
         for (int i = 0; i < hc; ++i) v += pre[i] * X[(size_t) i * E + d];
         cur[d] = v;
@@ -346,6 +390,33 @@ __global__ void k_engram_mix(float* X, const float* kv, const float* gw, const f
     }
 }
 
+__global__ void k_set_int(int* p, int v) { *p = v; }
+// moe[i] = sum_k w[k] * dn[k][i]
+__global__ void k_moe_sum(float* moe, const float* dn, const float* w, int k_n, int n) {
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        float s = 0.0f;
+        for (int k = 0; k < k_n; ++k) s += w[k] * dn[(size_t) k * n + i];
+        moe[i] = s;
+    }
+}
+// Engram hash on the device: hist holds the tokens so far (hist[pos] is the current one).  One thread per column.
+__global__ void k_engram_hash(const int* hist, int pos, const int64_t* map, int64_t n_map, int64_t pad_id,
+                              const uint64_t* mult, const uint64_t* vsz, const uint64_t* off, int ng, int nh,
+                              int64_t* ids) {
+    const int col = threadIdx.x, ncol = (ng - 1) * nh;
+    if (col >= ncol) return;
+    const int64_t pad = map[pad_id];
+    auto cid = [&](int64_t t) -> int64_t { return t < 0 || t >= n_map ? -1 : map[t]; };
+    const int o_hi = col / nh + 1;   // this column's n-gram order (1 = bigram)
+    int64_t c = cid(hist[pos]);
+    uint64_t rolling = (uint64_t) (c < 0 ? pad : c) * mult[0];
+    for (int o = 1; o <= o_hi; ++o) {
+        c = pos - o < 0 ? -1 : cid(hist[pos - o]);
+        rolling ^= (uint64_t) (c < 0 ? pad : c) * mult[o];
+    }
+    ids[col] = (int64_t) (rolling % vsz[col] + off[col]);
+}
+
 int nb(int n, int t = 256) { return (n + t - 1) / t; }
 
 // ------------------------------------------------------------------------------------------------ model state
@@ -373,6 +444,13 @@ struct Part {
     int* eids = nullptr;
     float *eg_r = nullptr, *eg_kv = nullptr, *eg_delta = nullptr;
     int64_t* eg_ids = nullptr;
+    int *dpos = nullptr, *hist = nullptr;                 // device position, token history (Engram)
+    int64_t* eg_map = nullptr;
+    uint64_t *eg_mult = nullptr, *eg_vsz = nullptr, *eg_off = nullptr;
+    void* q8b = nullptr;                                   // Q8_1 scratch for the 16 down-projection columns
+    float *ga16 = nullptr, *up16 = nullptr, *dn16 = nullptr;
+    cudaEvent_t done = nullptr;
+    float *hcp = nullptr, *hcs = nullptr;   // HC partials
     float *head_cur = nullptr, *head_x = nullptr, *logits = nullptr, *emb = nullptr;
 };
 
@@ -394,6 +472,8 @@ struct Model::Impl {
     std::vector<Part> parts;
     std::vector<int32_t> hist;     // tokens so far (Engram history)
     int max_sel = 0;
+    bool host_select = std::getenv("HY4F_HOST_SELECT") != nullptr;   // v0's host top-k (parity check)
+    bool host_experts = std::getenv("HY4F_HOST_EXPERTS") != nullptr; // v0's per-expert launches
 
     const strata::TensorInfo* find(const std::string& n, const strata::GgufFile** f) const {
         for (const auto& g : files)
@@ -512,8 +592,23 @@ struct Model::Impl {
         if (!t) throw std::runtime_error("hy4f: no Engram table");
         if ((int) t->type != T_F8) throw std::runtime_error("hy4f: Engram table is not F8_E4M3");
         const size_t bytes = (size_t) t->shape[0] * (size_t) t->shape[1];
-        HY_CK(cudaHostAlloc((void**) &eg_table, bytes, cudaHostAllocMapped | cudaHostAllocPortable));
         const uint8_t* src = f->tensor_data(*t);
+        if (!std::getenv("HY4F_EG_COPY")) {
+            // pin the file's own pages in place (read-only, mapped): no 59 GiB copy; the page cache keeps them
+            const uintptr_t pg = 4096, a0 = reinterpret_cast<uintptr_t>(src) & ~(pg - 1);
+            const size_t len = ((reinterpret_cast<uintptr_t>(src) + bytes + pg - 1) & ~(pg - 1)) - a0;
+            const cudaError_t e = cudaHostRegister(reinterpret_cast<void*>(a0), len,
+                                                   cudaHostRegisterMapped | cudaHostRegisterPortable |
+                                                       cudaHostRegisterReadOnly);
+            if (e == cudaSuccess) {
+                eg_table = const_cast<uint8_t*>(src);
+                if (o.verbose) std::fprintf(stderr, "hy4f: Engram table %.1f GiB registered in place\n", bytes / 1073741824.0);
+                return;
+            }
+            cudaGetLastError();
+            std::fprintf(stderr, "hy4f: cudaHostRegister of the Engram table failed (%s) - copying it\n", cudaGetErrorString(e));
+        }
+        HY_CK(cudaHostAlloc((void**) &eg_table, bytes, cudaHostAllocMapped | cudaHostAllocPortable));
         const size_t chunk = (size_t) 1 << 30;
         for (size_t off = 0; off < bytes; off += chunk) std::memcpy(eg_table + off, src + off, std::min(chunk, bytes - off));
         if (o.verbose) std::fprintf(stderr, "hy4f: Engram table %.1f GiB pinned + mapped\n", bytes / 1073741824.0);
@@ -553,10 +648,44 @@ struct Model::Impl {
         HY_CK(cudaSetDevice(p.dev));
         HY_CK(cudaStreamCreateWithFlags(&p.st, cudaStreamNonBlocking));
         if (first) upload(p, "token_embd.weight");
-        if (last)
-            for (const char* n : {"output.weight", "output_norm.weight", "output_hc_fn.weight", "output_hc_scale.weight",
+        if (last) {
+            for (const char* n : {"output_norm.weight", "output_hc_fn.weight", "output_hc_scale.weight",
                                   "output_hc_base.weight"})
                 upload(p, n);
+            const strata::GgufFile* f = nullptr;
+            const strata::TensorInfo* t = find("output.weight", &f);
+            if (std::getenv("HY4F_HEAD_Q8") && t && (int) t->type == T_BF16) {
+                // the BF16 head (742 MB read per token) as Q8_0 (394 MB): quantized here, llama.cpp's Q8_0 rule
+                const int64_t n0 = (int64_t) t->shape[0], n1 = (int64_t) t->shape[1];
+                const uint16_t* src = reinterpret_cast<const uint16_t*>(f->tensor_data(*t));
+                std::vector<uint8_t> q((size_t) n1 * (n0 / 32) * 34);
+#pragma omp parallel for
+                for (int64_t r = 0; r < n1; ++r)
+                    for (int64_t b = 0; b < n0 / 32; ++b) {
+                        float v[32], amax = 0.0f;
+                        for (int i = 0; i < 32; ++i) {
+                            uint32_t u = (uint32_t) src[r * n0 + b * 32 + i] << 16;
+                            std::memcpy(&v[i], &u, 4);
+                            amax = std::max(amax, std::fabs(v[i]));
+                        }
+                        const float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
+                        uint8_t* blk = q.data() + ((size_t) r * (n0 / 32) + b) * 34;
+                        const __half hd = __float2half(d);
+                        std::memcpy(blk, &hd, 2);
+                        for (int i = 0; i < 32; ++i) blk[2 + i] = (uint8_t) (int8_t) std::lround(v[i] * id);
+                    }
+                DW w;
+                w.type = T_Q8_0;
+                w.ne[0] = n0, w.ne[1] = n1;
+                w.rb = row_bytes(T_Q8_0, n0);
+                HY_CK(cudaMalloc(&w.d, q.size()));
+                HY_CK(cudaMemcpy(w.d, q.data(), q.size(), cudaMemcpyHostToDevice));
+                p.w["output.weight"] = w;
+                if (o.verbose) std::fprintf(stderr, "hy4f: output head BF16 -> Q8_0 (HY4F_HEAD_Q8)\n");
+            } else {
+                upload(p, "output.weight");
+            }
+        }
         const int64_t C = o.max_context;
         for (int il = p.l0; il < p.l1; ++il) {
             const std::string P = "blk." + std::to_string(il) + ".";
@@ -609,6 +738,24 @@ struct Model::Impl {
         p.eg_kv = dalloc((size_t) E * (hc + 1));
         p.eg_delta = dalloc((size_t) E * hc);
         HY_CK(cudaMalloc(&p.eg_ids, sizeof(int64_t) * (eg_ngram - 1) * eg_heads));
+        HY_CK(cudaMalloc(&p.dpos, sizeof(int)));
+        HY_CK(cudaMalloc(&p.hist, sizeof(int) * C));
+        auto up_u64 = [&](uint64_t*& d, const std::vector<uint64_t>& v) {
+            HY_CK(cudaMalloc(&d, sizeof(uint64_t) * v.size()));
+            HY_CK(cudaMemcpy(d, v.data(), sizeof(uint64_t) * v.size(), cudaMemcpyHostToDevice));
+        };
+        up_u64(p.eg_mult, eg_mult);
+        up_u64(p.eg_vsz, eg_vsz);
+        up_u64(p.eg_off, eg_off);
+        HY_CK(cudaMalloc(&p.eg_map, sizeof(int64_t) * eg_map.size()));
+        HY_CK(cudaMemcpy(p.eg_map, eg_map.data(), sizeof(int64_t) * eg_map.size(), cudaMemcpyHostToDevice));
+        HY_CK(cudaMalloc(&p.q8b, kn::native_q8_1_bytes(n_ffx * n_used, 1)));
+        p.ga16 = dalloc((size_t) n_used * n_ffx);
+        p.up16 = dalloc((size_t) n_used * n_ffx);
+        p.dn16 = dalloc((size_t) n_used * latent);
+        HY_CK(cudaEventCreateWithFlags(&p.done, cudaEventDisableTiming));
+        p.hcp = dalloc(8 * HC_SPLIT);
+        p.hcs = dalloc(HC_SPLIT);
         if (first) p.emb = dalloc(E);
         if (last) {
             p.head_cur = dalloc(E);
@@ -653,27 +800,10 @@ struct Model::Impl {
 
     void engram(Part& p, int e, int il, int64_t pos) {
         const int ng = eg_ngram, nh = eg_heads, ncol = (ng - 1) * nh;
-        auto cid = [&](int64_t t) -> int64_t { return t < 0 || t >= (int64_t) eg_map.size() ? -1 : eg_map[t]; };
-        const int64_t pad = eg_map[eg_pad];
-        std::vector<uint64_t> tk(ng);
-        int64_t c = cid(hist[pos]);
-        tk[0] = c < 0 ? pad : c;
-        for (int s = 1; s < ng; ++s) {
-            c = pos - s < 0 ? -1 : cid(hist[pos - s]);
-            tk[s] = c < 0 ? pad : c;
-        }
-        const uint64_t* mult = eg_mult.data() + (size_t) e * ng;
-        std::vector<int64_t> ids(ncol);
-        uint64_t rolling = tk[0] * mult[0];
-        for (int oo = 1; oo < ng; ++oo) {
-            rolling ^= tk[oo] * mult[oo];
-            for (int h = 0; h < nh; ++h) {
-                const int col = (oo - 1) * nh + h;
-                ids[col] = (int64_t) (rolling % eg_vsz[(size_t) e * ncol + col] + eg_off[(size_t) e * ncol + col]);
-            }
-        }
+        k_engram_hash<<<1, 32, 0, p.st>>>(p.hist, (int) pos, p.eg_map, (int64_t) eg_map.size(), eg_pad,
+                                          p.eg_mult + (size_t) e * ng, p.eg_vsz + (size_t) e * ncol,
+                                          p.eg_off + (size_t) e * ncol, ng, nh, p.eg_ids);
         const std::string P = "blk." + std::to_string(il) + ".";
-        HY_CK(cudaMemcpyAsync(p.eg_ids, ids.data(), sizeof(int64_t) * ncol, cudaMemcpyHostToDevice, p.st));
         k_engram_rows<<<ncol, 128, 0, p.st>>>(eg_table, p.eg_ids, f32(p, P + "engram_lookup_norm.weight"), p.eg_r, eg_D,
                                               1.1920929e-07f);
         gemv(p, P + "engram_kv.weight", p.eg_r, p.eg_kv);
@@ -690,6 +820,14 @@ struct Model::Impl {
         const int64_t gcur = pos / kpool;           // the current token's group, forced through the tail
         const int n_pool = (int) gcur;              // candidate groups: completed and not the current one
         kn::glm_dsa_score(p.iq, p.pooled[il], p.iw, IK, IH, 1, n_pool, p.score, p.st);
+        if (!host_select) {
+            // glm5-next's select over the candidates: all of them visible, the tail = the current group's cells -
+            // llama.cpp's "group_topk - 1 scored groups + the forced current group"
+            const int top_pools = top_k / kpool - tail;
+            const int n_sel = kpool * top_pools + (tail ? kpool - 1 : 0);
+            kn::glm_dsa_select(p.score, n_pool, kpool, top_pools, tail, 1, n_sel, p.dpos, p.cells, p.st);
+            return n_sel;
+        }
         std::vector<float> s(n_pool);
         HY_CK(cudaMemcpyAsync(s.data(), p.score, 4 * (size_t) n_pool, cudaMemcpyDeviceToHost, p.st));
         HY_CK(cudaStreamSynchronize(p.st));
@@ -778,6 +916,42 @@ struct Model::Impl {
             gemv(p, P + "ffn_gate_inp.weight", p.x, p.logits_r);
             kn::router_sigmoid(p.logits_r, f32(p, P + "exp_probs_b.bias"), 1, n_exp, n_used, w_scale, true, p.eids, p.ew,
                                p.st);
+            const DW& G0 = p.w.at(P + "ffn_gate_exps.weight");
+            const DW& U0 = p.w.at(P + "ffn_up_exps.weight");
+            const DW& D0 = p.w.at(P + "ffn_down_exps.weight");
+            auto kq = [](int t) { return t == T_Q3_K || t == T_Q4_K; };
+            if (!host_experts && kq(G0.type) && kq(U0.type) && kq(D0.type)) {
+                // the routed experts with the ids on the device: gate and up for all n_used experts in one launch
+                // each (one shared quantized input), SwiGLU with the clamp, the n_used columns quantized together,
+                // down in one launch, the weighted sum with the router's device weights
+                auto ids_mmvq = [&](const DW& w, const void* xq, bool shared, float* y, int n_in, int n_out) {
+                    const size_t eb = w.rb * (size_t) w.ne[1];
+                    if (w.type == T_Q3_K)
+                        kn::native_q3_k_mmvq_ids(w.d, eb, p.eids, n_used, xq, shared, y, n_in, n_out, p.st);
+                    else
+                        kn::native_q4_k_mmvq_ids(w.d, eb, p.eids, n_used, xq, shared, y, n_in, n_out, p.st);
+                };
+                gemv(p, P + "ffn_routed_down.weight", p.x, p.xl);
+                kn::native_quantize_q8_1(p.xl, p.q8, latent, 1, p.st);
+                ids_mmvq(G0, p.q8, true, p.ga16, latent, n_ffx);
+                ids_mmvq(U0, p.q8, true, p.up16, latent, n_ffx);
+                k_swiglu<<<nb(n_used * n_ffx), 256, 0, p.st>>>(p.ga16, p.up16, n_used * n_ffx, clampv);
+                // n_used contiguous columns of n_ffx: quantized as 8 columns of n_used/8 * n_ffx (blocks stay
+                // inside one column since n_ffx % 32 == 0)
+                kn::native_quantize_q8_1(p.ga16, p.q8b, n_ffx * (n_used / 8), 8, p.st);
+                ids_mmvq(D0, p.q8b, false, p.dn16, n_ffx, latent);
+                k_moe_sum<<<nb(latent), 256, 0, p.st>>>(p.moe, p.dn16, p.ew, n_used, latent);
+                dump(p, "ffn_moe_out" + S, p.moe, latent);
+                gemv(p, P + "ffn_routed_up.weight", p.moe, p.mu);
+                gemv(p, P + "ffn_gate_shexp.weight", p.x, p.ga);
+                gemv(p, P + "ffn_up_shexp.weight", p.x, p.up);
+                k_swiglu<<<nb(n_ffx), 256, 0, p.st>>>(p.ga, p.up, n_ffx, INFINITY);
+                gemv(p, P + "ffn_down_shexp.weight", p.ga, p.sh);
+                dump(p, "ffn_shexp" + S, p.sh, E);
+                k_add<<<nb(E), 256, 0, p.st>>>(p.mu, p.sh, p.ffn, E);
+                k_rms<<<1, 1024, 0, p.st>>>(p.ffn, f32(p, P + "post_ffw_norm.weight"), p.y, E, eps);
+                return;
+            }
             std::vector<int> ids(n_used);
             HY_CK(cudaMemcpyAsync(ids.data(), p.eids, sizeof(int) * n_used, cudaMemcpyDeviceToHost, p.st));
             gemv(p, P + "ffn_routed_down.weight", p.x, p.xl);
@@ -806,24 +980,33 @@ struct Model::Impl {
         k_rms<<<1, 1024, 0, p.st>>>(p.ffn, f32(p, P + "post_ffw_norm.weight"), p.y, E, eps);
     }
 
+    void hc_pre(Part& p, const std::string& P, const std::string& k, int n_mix, float mag, float* cur) {
+        const int n = hc * E;
+        if (std::getenv("HY4F_HC_ONEBLOCK")) {
+            k_hc_pre<<<1, 1024, 0, p.st>>>(p.X, f32(p, P + k + "_fn.weight"), f32(p, P + k + "_scale.weight"),
+                                            f32(p, P + k + "_base.weight"), E, hc, n_mix, eps, hc_eps, mag, cur, p.post);
+            return;
+        }
+        k_hc_mix<<<dim3(n_mix, HC_SPLIT), 256, 0, p.st>>>(p.X, f32(p, P + k + "_fn.weight"), n, p.hcp, p.hcs);
+        k_hc_apply<<<nb(E), 256, 0, p.st>>>(p.X, p.hcp, p.hcs, f32(p, P + k + "_scale.weight"),
+                                             f32(p, P + k + "_base.weight"), E, hc, n_mix, eps, hc_eps, mag, cur,
+                                             p.post);
+    }
+
     void layer(Part& p, int il, int64_t pos) {
         const std::string P = "blk." + std::to_string(il) + ".", S = "-" + std::to_string(il);
         for (size_t e = 0; e < eg_layers.size(); ++e)
             if (eg_layers[e] == il) engram(p, (int) e, il, pos);
         const size_t XS = sizeof(float) * hc * E;
         HY_CK(cudaMemcpyAsync(p.R, p.X, XS, cudaMemcpyDeviceToDevice, p.st));
-        k_hc_pre<<<1, 1024, 0, p.st>>>(p.X, f32(p, P + "hc_attn_fn.weight"), f32(p, P + "hc_attn_scale.weight"),
-                                        f32(p, P + "hc_attn_base.weight"), E, hc, 2 * hc, eps, hc_eps, hc_mag, p.cur,
-                                        p.post);
+        hc_pre(p, P, "hc_attn", 2 * hc, hc_mag, p.cur);
         k_rms<<<1, 1024, 0, p.st>>>(p.cur, f32(p, P + "attn_norm.weight"), p.x, E, eps);
         dump(p, "attn_norm" + S, p.x, E);
         attention(p, il, pos);
         dump(p, "attn_out" + S, p.y, E);
         k_hc_post<<<nb(hc * E), 256, 0, p.st>>>(p.X, p.R, p.y, p.post, E, hc);
         HY_CK(cudaMemcpyAsync(p.R, p.X, XS, cudaMemcpyDeviceToDevice, p.st));
-        k_hc_pre<<<1, 1024, 0, p.st>>>(p.X, f32(p, P + "hc_ffn_fn.weight"), f32(p, P + "hc_ffn_scale.weight"),
-                                        f32(p, P + "hc_ffn_base.weight"), E, hc, 2 * hc, eps, hc_eps, hc_mag, p.cur,
-                                        p.post);
+        hc_pre(p, P, "hc_ffn", 2 * hc, hc_mag, p.cur);
         k_rms<<<1, 1024, 0, p.st>>>(p.cur, f32(p, P + "ffn_norm.weight"), p.x, E, eps);
         ffn(p, il);
         dump(p, "ffn_out" + S, p.y, E);
@@ -870,20 +1053,21 @@ bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
         for (size_t i = 0; i < d.parts.size(); ++i) {
             Part& p = d.parts[i];
             HY_CK(cudaSetDevice(p.dev));
+            k_set_int<<<1, 1, 0, p.st>>>(p.dpos, (int) pos);
+            k_set_int<<<1, 1, 0, p.st>>>(p.hist + pos, token);
             if (i == 0) {
                 const DW& emb = p.w.at("token_embd.weight");
                 k_q8_0_row<<<1, 256, 0, p.st>>>((const uint8_t*) emb.d + (size_t) token * emb.rb, p.emb, E);
                 k_rep<<<nb(E * hc), 256, 0, p.st>>>(p.emb, p.X, E, hc);
             } else {
                 Part& prev = d.parts[i - 1];
-                HY_CK(cudaStreamSynchronize(prev.st));
+                HY_CK(cudaStreamWaitEvent(p.st, prev.done, 0));
                 HY_CK(cudaMemcpyPeerAsync(p.X, p.dev, prev.X, prev.dev, sizeof(float) * hc * E, p.st));
             }
             for (int il = p.l0; il < p.l1; ++il) d.layer(p, il, pos);
+            HY_CK(cudaEventRecord(p.done, p.st));
             if (i + 1 == d.parts.size()) {
-                k_hc_pre<<<1, 1024, 0, p.st>>>(p.X, d.f32(p, "output_hc_fn.weight"), d.f32(p, "output_hc_scale.weight"),
-                                                d.f32(p, "output_hc_base.weight"), E, hc, hc, d.eps, d.hc_eps, 0.0f,
-                                                p.head_cur, p.post);
+                d.hc_pre(p, "", "output_hc", hc, 0.0f, p.head_cur);
                 k_rms<<<1, 1024, 0, p.st>>>(p.head_cur, d.f32(p, "output_norm.weight"), p.head_x, E, d.eps);
                 d.dump(p, "result_norm", p.head_x, E);
                 d.gemv(p, "output.weight", p.head_x, p.logits);

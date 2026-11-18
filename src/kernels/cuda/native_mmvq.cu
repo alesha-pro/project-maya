@@ -1491,3 +1491,85 @@ void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* 
 }
 
 } // namespace strata::kernels
+
+// ---------------------------------------------------------------------------------------------------------------
+// hy4f: routed-expert MMVQ with the experts picked on the device.  One launch covers n_ids experts of one 3-D
+// expert tensor {n_in, n_out, n_expert}: blockIdx.y = k reads expert ids[k], activation column k (or the one shared
+// column) and writes output column k.  The per-row math is the ncols=1 small-K kernels' (four rows per block,
+// eight weight blocks per iteration, the same dot and the same reduction order), so every column is bitwise the
+// single-expert native_*_mmvq call on that expert's slice.
+namespace strata::kernels {
+namespace {
+
+template <class Block, float (*Dot)(const Block* __restrict__, const Q81Block* __restrict__, int), int KQS_MUL>
+__launch_bounds__(WARPS * WARP, 1)
+__global__ void native_kq_mmvq_ids_kernel(const Block* __restrict__ w, std::size_t expert_blocks,
+                                          const int* __restrict__ ids, const Q81Block* __restrict__ x,
+                                          std::size_t x_col_blocks, float* __restrict__ y, int n_in, int n_out) {
+    constexpr int ROWS = WARPS;
+    constexpr int BLOCKS_PER_ITER = 8;
+    const int k = int(blockIdx.y);
+    const Block* __restrict__ wk = w + std::size_t(ids[k]) * expert_blocks;
+    const Q81Block* __restrict__ xk = x + std::size_t(k) * x_col_blocks;
+    float* __restrict__ yk = y + std::size_t(k) * n_out;
+    const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
+    const int row0 = ROWS * int(blockIdx.x);
+    const int blocks_per_row = n_in / QK;
+    float tmp[ROWS] = {};
+    for (int kbx = tid / 16; kbx < blocks_per_row; kbx += BLOCKS_PER_ITER) {
+        const int kby = kbx * (QK / Q8K);
+        const int kqs = KQS_MUL * (tid % 16);
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) {
+            if (row0 + i < n_out) {
+                const std::size_t block = std::size_t(row0 + i) * blocks_per_row + kbx;
+                tmp[i] += Dot(wk + block, xk + kby, kqs);
+            }
+        }
+    }
+    __shared__ float partial[WARPS - 1][ROWS][WARP];
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < ROWS; ++i) partial[threadIdx.y - 1][i][threadIdx.x] = tmp[i];
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) return;
+#pragma unroll
+    for (int i = 0; i < ROWS; ++i) {
+#pragma unroll
+        for (int l = 0; l < WARPS - 1; ++l) tmp[i] += partial[l][i][threadIdx.x];
+        tmp[i] = warp_sum(tmp[i]);
+        if (threadIdx.x == i && row0 + i < n_out) yk[row0 + i] = tmp[i];
+    }
+}
+
+template <class Block, float (*Dot)(const Block* __restrict__, const Q81Block* __restrict__, int), int KQS_MUL>
+void launch_ids(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids, const void* x_q8_1,
+                bool x_shared, float* y, int n_in, int n_out, void* stream) {
+    if (n_in <= 0 || n_in % QK != 0 || n_in / QK >= 8) throw std::invalid_argument("native MMVQ ids: n_in");
+    if (n_out <= 0 || n_ids <= 0 || n_ids > 65535) throw std::invalid_argument("native MMVQ ids: n_out / n_ids");
+    if (expert_bytes % sizeof(Block) != 0) throw std::invalid_argument("native MMVQ ids: expert_bytes");
+    validate_pointer(weights);
+    validate_pointer(x_q8_1);
+    validate_pointer(y);
+    validate_stream(stream);
+    const dim3 threads(WARP, WARPS);
+    const dim3 blocks(unsigned((n_out + WARPS - 1) / WARPS), unsigned(n_ids));
+    native_kq_mmvq_ids_kernel<Block, Dot, KQS_MUL><<<blocks, threads, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const Block*>(weights), expert_bytes / sizeof(Block), ids, static_cast<const Q81Block*>(x_q8_1),
+        x_shared ? 0 : std::size_t(n_in / Q8K), y, n_in, n_out);
+    launch_check();
+}
+
+}  // namespace
+
+void native_q3_k_mmvq_ids(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids,
+                          const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream) {
+    launch_ids<Q3KBlock, q3_q8_dot, 1>(weights, expert_bytes, ids, n_ids, x_q8_1, x_shared, y, n_in, n_out, stream);
+}
+void native_q4_k_mmvq_ids(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids,
+                          const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream) {
+    launch_ids<Q4KBlock, q4_q8_dot, VDR>(weights, expert_bytes, ids, n_ids, x_q8_1, x_shared, y, n_in, n_out, stream);
+}
+
+}  // namespace strata::kernels

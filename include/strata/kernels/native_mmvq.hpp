@@ -109,4 +109,13 @@ std::size_t native_mmvq_weight_bytes(int ggml_type, int n_in, int n_out);
 void native_mmvq(int ggml_type, const void* weights, const void* x_q8_1, float* y,
                  int n_in, int n_out, int ncols, void* stream);
 
+
+// hy4f: routed experts picked on the device.  weights: a 3-D expert tensor {n_in, n_out, n_expert} in GGUF blocks,
+// expert_bytes apart; ids: n_ids device int32 expert indices; x_q8_1: one shared column (x_shared) or n_ids
+// contiguous columns; y: n_ids output columns of n_out.  n_in a multiple of 256 below 2048 (the small-K kernel).
+// Column k is bitwise the ncols=1 native_*_mmvq of expert ids[k] on its column.
+void native_q3_k_mmvq_ids(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids,
+                          const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream);
+void native_q4_k_mmvq_ids(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids,
+                          const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream);
 } // namespace strata::kernels
