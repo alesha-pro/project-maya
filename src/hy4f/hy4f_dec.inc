@@ -387,7 +387,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         HY_CK(cudaEventRecord(d.attention_fork, s.st));
         HY_CK(cudaStreamWaitEvent(side, d.attention_fork));
     }
-    if (dense_dsa && !sw && !s.prefix_kv.empty())
+    if (!sw && !s.prefix_kv.empty())
         kb_kv_prep<true><<<T,576,0,keys>>>(d.xp+okv,xpc,f32(s,P+"attn_kv_a_norm.weight"),kvl,
             rope,eps,th,s.kv[il],pp,2,S,s.g,0,s.prefix_kv.at(il),top_k);
     else
