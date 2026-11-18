@@ -1051,12 +1051,38 @@ __global__ void kd_add(const float* __restrict__ a, const float* __restrict__ b,
 __device__ __forceinline__ int art_g(int s, int s2) {   // index of G[s][s2] (s <= s2) among the 10
     return s == 0 ? s2 : s == 1 ? 3 + s2 : s == 2 ? 5 + s2 : 9;
 }
+template <bool FusedSend = false>
 __global__ void __launch_bounds__(256) kd_art_a(const float* __restrict__ x1, const float* __restrict__ x2, int T, int n,
                                                 PeersD P, int me, int n_shards, int* counter, int* arrive,
                                                 const float* __restrict__ nw, const float* __restrict__ X,
                                                 const float* __restrict__ post, int hc, HcNext nx, float* __restrict__ Y,
                                                 float* __restrict__ part, float* __restrict__ ppost) {
-    const int step = counter[0] + 1, tn = T * n, t = blockIdx.y, b = blockIdx.x, nbk = gridDim.x;
+    const int step = counter[0] + 1, tn = T * n, t = blockIdx.y, b = blockIdx.x, nbk = gridDim.x - int(FusedSend);
+    if constexpr (FusedSend) {
+        // One dedicated CTA publishes the words while the other CTAs consume
+        // ready portions. A cooperative launch guarantees all blocks can run.
+        if (b == nbk) {
+            if (t == 0) {
+                for (int r = 1; r < n_shards; ++r) {
+                    const int j = (me + r) % n_shards;
+                    auto* dst = reinterpret_cast<uint2*>(P.buf[j][step & 1]) + (size_t)me * (tn / 2);
+                    for (int q = threadIdx.x; q < tn / 2; q += blockDim.x) {
+                        float2 pair = reinterpret_cast<const float2*>(x1)[q];
+                        if (x2) {
+                            const float2 second = reinterpret_cast<const float2*>(x2)[q];
+                            pair.x += second.x;
+                            pair.y += second.y;
+                        }
+                        const auto packed = __floats2bfloat162_rn(pair.x, pair.y);
+                        const unsigned bits = *reinterpret_cast<const unsigned*>(&packed);
+                        asm volatile("st.volatile.global.v2.u32 [%0], {%1, %2};"
+                                     :: "l"(dst + q), "r"(bits), "r"((unsigned)step) : "memory");
+                    }
+                }
+            }
+            return;
+        }
+    }
     const int tid = threadIdx.x, lane = tid & 31, wid = tid >> 5, i = b * blockDim.x + tid;
     if (P.bf != 2) kd_wait_peers(P, me, n_shards, step);
     const float* rv = P.buf[me][step & 1];
@@ -1109,7 +1135,7 @@ __global__ void __launch_bounds__(256) kd_art_a(const float* __restrict__ x1, co
     }
     if (b == 0 && tid < 4) ppost[t * 4 + tid] = pp[tid];
     __syncthreads();
-    if (tid == 0) {
+    if (!FusedSend && tid == 0) {
         const int c = atomicAdd(arrive, 1);
         if (c == (int) (gridDim.x * gridDim.y) - 1) {
             arrive[0] = 0;
@@ -1120,7 +1146,8 @@ __global__ void __launch_bounds__(256) kd_art_a(const float* __restrict__ x1, co
 __global__ void __launch_bounds__(256) kd_art_b(int n, const float* __restrict__ nw, float eps, float* X, float* post, int hc,
                                                 HcNext nx, float hc_eps, const float* __restrict__ Y,
                                                 const float* __restrict__ part, const float* __restrict__ ppost,
-                                                float* __restrict__ xo, Q81* __restrict__ xq) {
+                                                float* __restrict__ xo, Q81* __restrict__ xq, int* advance = nullptr) {
+    if (advance && blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0) ++*advance;
     const int t = blockIdx.y, nbk = gridDim.x, tid = threadIdx.x, i = blockIdx.x * blockDim.x + tid;
     __shared__ float tot[32], sc[12];   // sc: r, pre[4], c, r2, p[4]
     if (tid < 32) {

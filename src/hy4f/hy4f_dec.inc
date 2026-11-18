@@ -19,6 +19,7 @@ int dec_score_blocks = std::getenv("HY4F_DEC_SCORE_BLOCKS") ? std::atoi(std::get
 bool push_all = std::getenv("HY4F_PUSH_ALL") != nullptr;
 bool push_seq = std::getenv("HY4F_PUSH_PER_PEER") == nullptr;
 bool push_one = std::getenv("HY4F_PUSH_ONEFENCE") != nullptr;
+bool ll_overlap = std::getenv("HY4F_LL_FUSED") != nullptr;
 bool tail_old = std::getenv("HY4F_TAIL_OLD") != nullptr;
 int ar_push_blocks = std::getenv("HY4F_PUSH_BLOCKS") ? std::atoi(std::getenv("HY4F_PUSH_BLOCKS")) : 1;
 int ar_push_threads = std::getenv("HY4F_PUSH_THREADS") ? std::atoi(std::getenv("HY4F_PUSH_THREADS")) : 256;
@@ -202,7 +203,18 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
         return;
     }
     const int tn = T * E;
-    if (push_seq)
+    const bool overlap = ll_overlap && d.ar.bf == 2 && nx && !mtp && E == 3072 && T <= 4 && !tail_old;
+    if (overlap) {
+        dim3 grid(E / 256 + 1, T);
+        int* arrive = d.arrive + 4;
+        const float* w = f32(s, norm);
+        auto args = std::make_tuple(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, arrive, w, d.X, d.post, hc,
+                                    *nx, d.ysc, d.tpart, d.tppost);
+        std::apply([&](auto&... val) {
+            void* params[] = { (void*)&val... };
+            HY_CK(cudaLaunchCooperativeKernel((const void*)kd_art_a<true>, grid, dim3(256), params, 0, s.st));
+        }, args);
+    } else if (push_seq)
         (push_one ? kd_push_seq1 : kd_push_seq)<<<ar_push_blocks, ar_push_threads, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, S, d.ar_ctr,
                                                                           d.arrive);
     else if (push_all)
@@ -212,10 +224,10 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
         for (int r = 1; r < S; ++r)
             kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, (s.g + r) % S, d.ar_ctr, d.arrive);
     if (nx && !mtp && E % 256 == 0 && E / 256 <= 16 && !tail_old) {   // (two wide kernels)
-        kd_art_a<<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), d.X, d.post,
+        if (!overlap) kd_art_a<false><<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), d.X, d.post,
                                                      hc, *nx, d.ysc, d.tpart, d.tppost);
         kd_art_b<<<dim3(E / 256, T), 256, 0, s.st>>>(E, f32(s, norm), eps, d.X, d.post, hc, *nx, hc_eps, d.ysc, d.tpart, d.tppost,
-                                                     d.x, d.xq);
+                                                     d.x, d.xq, overlap ? d.ar_ctr : nullptr);
     } else if (nx && !mtp)
         kd_ar_tail_hc<<<T, 1024, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), eps, d.X, d.post,
                                             hc, *nx, hc_eps, d.x, d.xq);
