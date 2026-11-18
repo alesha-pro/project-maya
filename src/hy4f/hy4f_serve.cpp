@@ -620,7 +620,7 @@ int serve(Model& m, const ServeOptions& so) {
             from = std::min(from, n - 1);
         }
         bool ring_cold_aligned = false;
-        const int64_t kept = m.rewind((int64_t) from, err, full_hit, host_keys.enabled() ? &ring_cold_aligned : nullptr);
+        const int64_t kept = m.rewind((int64_t) from, err, full_hit, (turn_mark || host_keys.enabled()) ? &ring_cold_aligned : nullptr);
         if (kept < 0) fatal("rewind: " + err, 0, n);
         if ((size_t) kept != from)
             std::fprintf(stderr, "maya hy4f serve: the prompt departs from the cache at %zu (the rings no longer hold it): "
@@ -648,8 +648,8 @@ int serve(Model& m, const ServeOptions& so) {
             }
         }
         // Capture only a lineage that used the same 2048-token chunk boundaries as a cold prefill.
-        const bool cold_aligned = text_cache && (from == 0 || host_restored || ring_cold_aligned);
-        const size_t host_checkpoint = cold_aligned ? HostPrefixIndex::checkpoint(n) : 0;
+        const bool cold_aligned = from == 0 || host_restored || ring_cold_aligned;
+        const size_t host_checkpoint = text_cache && cold_aligned ? HostPrefixIndex::checkpoint(n) : 0;
         state.resize(from);
         held.erase(std::remove_if(held.begin(), held.end(), [&](const Held& q) { return q.start + q.n > (long long) from; }),
                    held.end());
@@ -746,7 +746,9 @@ int serve(Model& m, const ServeOptions& so) {
                                  "reads its prompt again\n", err.c_str());
             mark_ok = false;
         }
-        if (turn_mark && mark_ok) saved_prompt = n;
+        // An unaligned warm suffix and a cold prefill can select different GEMM
+        // shapes. Preserve the established final-token replay for that lineage.
+        if (turn_mark && mark_ok && (full_hit || cold_aligned)) saved_prompt = n;
         ++counter;
         std::mt19937_64 rng(r.seed != 0 ? r.seed : 0x9E3779B97F4A7C15ull * counter);
         long long produced = 0;
