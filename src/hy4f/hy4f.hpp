@@ -97,6 +97,9 @@ public:
     bool mark(std::string& err, bool aligned_start = false);
     // Save one chunk-aligned prefix before a long prompt's tail.
     bool mark_prefix(std::string& err);
+    // Complete, bounded text-prefix snapshots, independent of the current sequence on the GPUs.
+    bool save_host_prefix(int slot, std::string& err);
+    bool load_host_prefix(int slot, int64_t pos, std::string& err);
 
 private:
     struct Impl;
@@ -105,6 +108,9 @@ private:
     std::shared_ptr<Snap> snap_;
     struct PrefixSnap;
     std::shared_ptr<PrefixSnap> prefix_;
+    struct HostPrefix;
+    std::vector<std::shared_ptr<HostPrefix>> host_prefixes_;
+    void transfer_host_prefix(HostPrefix& slot, int64_t pos, bool save);
     int64_t prefix_pos_ = -1;
     void transfer_prefix(bool save);
     int64_t hw_ = 0;              // positions ever written since the last reset (the rings may hold up to it)

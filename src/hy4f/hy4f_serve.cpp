@@ -40,6 +40,7 @@
 // departs right there), else the cache starts again at 0.  A step that fails ends the engine (END, DONE ... cancel,
 // exit 1): the server starts a new one.
 #include "hy4f_serve.hpp"
+#include "hy4f_host_prefix.hpp"
 #include "hy4f_draft_width.hpp"
 #include "hy4f_prompt_lookup.hpp"
 #include "hy4f_jacobi_probe.hpp"
@@ -531,6 +532,13 @@ int serve(Model& m, const ServeOptions& so) {
     bool mark_ok = true;
     const bool turn_mark = std::getenv("HY4F_PREFIX_TURN_MARK") != nullptr;
     size_t saved_prompt = 0;
+    const char* host_setting = std::getenv("HY4F_HOST_PREFIX_SLOTS");
+    const bool host_supported = CH == int(HostPrefixIndex::block) && !std::getenv("HY4F_SPARSE_REPLICA");
+    const int host_slots = host_setting && host_supported &&
+        (std::strcmp(host_setting, "2") == 0 || std::strcmp(host_setting, "3") == 0) ? host_setting[0] - '0' : 0;
+    HostPrefixIndex host_keys(host_slots);
+    if (host_setting && !host_slots)
+        std::fprintf(stderr, "maya hy4f serve: host prefix cache requires slots 2 or 3, chunk 2048 and sparse replica disabled\n");
     bool prefix_mark = std::getenv("HY4F_PREFIX_CHECKPOINT") != nullptr;
     std::string line;
     std::vector<float> lgT((size_t) 4 * V);   // verify's rows (sampling, penalties, a bias)
@@ -617,6 +625,29 @@ int serve(Model& m, const ServeOptions& so) {
             std::fprintf(stderr, "maya hy4f serve: the prompt departs from the cache at %zu (the rings no longer hold it): "
                                  "read from %lld\n", from, (long long) kept);
         from = (size_t) kept;
+        const bool text_cache = host_keys.enabled() && r.file.empty();
+        const int host_slot = text_cache && !full_hit ? host_keys.lookup(r.ids, from) : -1;
+        bool host_restored = false;
+        if (host_slot >= 0) {
+            const size_t pos = host_keys.length(host_slot);
+            const double started = now_ms();
+            if (m.load_host_prefix(host_slot, pos, err)) {
+                from = pos;
+                state.assign(r.ids.begin(), r.ids.begin() + pos);
+                held.clear();
+                host_restored = true;
+                std::fprintf(stderr, "maya hy4f serve: host prefix hit slot=%d rows=%zu ms=%.1f\n",
+                             host_slot, pos, now_ms() - started);
+            } else {
+                // A failed H2D copy can leave a partly restored branch. Rebuild all state from the beginning.
+                std::fprintf(stderr, "maya hy4f serve: host prefix restore failed (%s), restarting cold\n", err.c_str());
+                host_keys.clear(host_slot);
+                m.reset();
+                from = 0;
+            }
+        }
+        // Capture only a lineage that used the same 2048-token chunk boundaries as a cold prefill.
+        const size_t host_checkpoint = text_cache && (from == 0 || host_restored) ? HostPrefixIndex::checkpoint(n) : 0;
         state.resize(from);
         held.erase(std::remove_if(held.begin(), held.end(), [&](const Held& q) { return q.start + q.n > (long long) from; }),
                    held.end());
@@ -672,6 +703,20 @@ int serve(Model& m, const ServeOptions& so) {
                 fatal("prefill at " + std::to_string(a) + ": " + err, 0, n);
             state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + T);
             a += (size_t) T;
+            if (a == host_checkpoint) {
+                const int slot = host_keys.destination(state);
+                if (slot >= 0) {
+                    const double started = now_ms();
+                    host_keys.clear(slot);
+                    if (m.save_host_prefix(slot, err)) {
+                        host_keys.publish(slot, state);
+                        std::fprintf(stderr, "maya hy4f serve: host prefix saved slot=%d rows=%zu ms=%.1f\n",
+                                     slot, a, now_ms() - started);
+                    } else {
+                        std::fprintf(stderr, "maya hy4f serve: host prefix save failed (%s)\n", err.c_str());
+                    }
+                }
+            }
             if (prefix_mark && a >= 2*(size_t)CH && a%CH == 0 && a<n && n-a <= (size_t)CH) {
                 if (!m.mark_prefix(err)) {
                     std::fprintf(stderr,"maya hy4f serve: prefix checkpoint unavailable (%s)\n",err.c_str());

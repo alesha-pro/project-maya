@@ -1496,6 +1496,90 @@ void Model::transfer_prefix(bool save) {
     });
 }
 
+struct Model::HostPrefix {
+    struct Buffer { uint8_t* ptr = nullptr; size_t capacity = 0; };
+    std::vector<Buffer> buffers;
+    int64_t pos = 0;
+    ~HostPrefix() { for (auto& b : buffers) if (b.ptr) cudaFreeHost(b.ptr); }
+};
+
+void Model::transfer_host_prefix(HostPrefix& slot, int64_t pos, bool save) {
+    Impl& d = *d_;
+    d.launch_parallel([&](Shard& s) {
+        struct Region { void* device; size_t bytes; };
+        std::vector<Region> regions;
+        for (int il = 0; il < d.L + int(d.has_mtp); ++il) {
+            auto ring = serve_ring(s, il, d.swa[il] != 0, d.win, d.kpool, d.IK);
+            regions.push_back({ring.first, ring.second});
+            if (d.swa[il]) continue;
+            // Trunk positions [0,pos); the MTP prefills pairs [0,pos-1).
+            const size_t rows = size_t(pos - (il == d.L));
+            const size_t owned = (rows + d.S - 1 - s.g) / d.S;
+            regions.push_back({s.kv.at(il), owned * KV_RB});
+            regions.push_back({s.pooled.at(il), rows / d.kpool * d.IK * sizeof(__half)});
+            auto replica = s.prefix_kv.find(il);
+            if (replica != s.prefix_kv.end())
+                regions.push_back({replica->second, std::min(rows, size_t(d.top_k)) * KV_RB});
+        }
+        regions.push_back({s.hist, size_t(pos) * sizeof(int)});
+        if (d.has_mtp) regions.push_back({d.bsh[s.g].hprev, size_t(d.E) * sizeof(float)});
+
+        auto& buffer = slot.buffers[s.g];
+        size_t bytes = 0;
+        for (const Region& r : regions) bytes += r.bytes;
+        if (save && bytes > buffer.capacity) {
+            if (buffer.ptr) HY_CK(cudaFreeHost(buffer.ptr));
+            buffer = {};
+            HY_CK(cudaHostAlloc(reinterpret_cast<void**>(&buffer.ptr), bytes, cudaHostAllocPortable));
+            buffer.capacity = bytes;
+        }
+        if (!buffer.ptr || buffer.capacity < bytes) throw std::runtime_error("host prefix buffer incomplete");
+        size_t offset = 0;
+        try {
+            for (const Region& r : regions) {
+                if (save) HY_CK(cudaMemcpyAsync(buffer.ptr + offset, r.device, r.bytes, cudaMemcpyDeviceToHost, s.st));
+                else HY_CK(cudaMemcpyAsync(r.device, buffer.ptr + offset, r.bytes, cudaMemcpyHostToDevice, s.st));
+                offset += r.bytes;
+            }
+            if (!save && d.has_mtp && !d.dsh.empty())
+                HY_CK(cudaMemcpyAsync(d.dsh[s.g].h, d.bsh[s.g].hprev, sizeof(float) * d.E, cudaMemcpyDeviceToDevice, s.st));
+            HY_CK(cudaStreamSynchronize(s.st));
+        } catch (...) {
+            cudaStreamSynchronize(s.st);
+            throw;
+        }
+    });
+}
+
+bool Model::save_host_prefix(int i, std::string& err) {
+    try {
+        if (i < 0 || i >= 3 || d_->pos_next < 4096 || d_->pos_next > 32768 || d_->pos_next % 2048 || d_->bsh.empty())
+            throw std::runtime_error("invalid host prefix checkpoint");
+        if (host_prefixes_.size() <= size_t(i)) host_prefixes_.resize(i + 1);
+        auto& slot = host_prefixes_[i];
+        if (!slot) slot = std::make_shared<HostPrefix>();
+        slot->pos = 0;
+        slot->buffers.resize(d_->S);
+        transfer_host_prefix(*slot, d_->pos_next, true);
+        slot->pos = d_->pos_next;
+        return true;
+    } catch (const std::exception& e) { err = e.what(); return false; }
+}
+
+bool Model::load_host_prefix(int i, int64_t pos, std::string& err) {
+    try {
+        if (i < 0 || size_t(i) >= host_prefixes_.size() || !host_prefixes_[i] || host_prefixes_[i]->pos != pos || pos <= 0)
+            throw std::runtime_error("host prefix missing");
+        // A different branch owns the live rings now. Invalidate both old marks before the first write.
+        prefix_pos_ = -1;
+        if (snap_) snap_->pos = -1;
+        d_->pos_next = hw_ = 0;
+        transfer_host_prefix(*host_prefixes_[i], pos, false);
+        d_->pos_next = hw_ = pos;
+        return true;
+    } catch (const std::exception& e) { err = e.what(); return false; }
+}
+
 bool Model::mark_prefix(std::string& err) {
     prefix_pos_=-1;
     try {
