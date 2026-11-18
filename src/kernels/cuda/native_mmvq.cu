@@ -1509,7 +1509,14 @@ __global__ void native_kq_mmvq_ids_kernel(const Block* __restrict__ w, std::size
     constexpr int ROWS = WARPS;
     constexpr int BLOCKS_PER_ITER = 8;
     const int k = int(blockIdx.y);
-    const Block* __restrict__ wk = w + std::size_t(ids[k]) * expert_blocks;
+    const int id = ids[k];
+    if (id < 0) {   // not this shard's expert (expert parallel): its column is zero
+        const int r = WARPS * int(blockIdx.x);
+        if (threadIdx.y == 0 && int(threadIdx.x) < WARPS && r + int(threadIdx.x) < n_out)
+            y[std::size_t(k) * n_out + r + threadIdx.x] = 0.0f;
+        return;
+    }
+    const Block* __restrict__ wk = w + std::size_t(id) * expert_blocks;
     const Q81Block* __restrict__ xk = x + std::size_t(k) * x_col_blocks;
     float* __restrict__ yk = y + std::size_t(k) * n_out;
     const int tid = WARP * int(threadIdx.y) + int(threadIdx.x);
