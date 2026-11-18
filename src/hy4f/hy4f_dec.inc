@@ -65,6 +65,8 @@ struct DecodeGraph {
 };
 
 struct DShard {
+    cudaStream_t attention_side = nullptr;
+    cudaEvent_t attention_fork = nullptr, attention_join = nullptr;
     cudaStream_t side = nullptr;
     cudaEvent_t fork = nullptr, projected = nullptr, shared_done = nullptr;
     Q81* shq = nullptr;
@@ -194,6 +196,11 @@ void dec_alloc(Shard& s, DShard& d) {
     d.xq = qa((size_t) DT * std::max({2 * E, Hmax / S * vh, n_ff / S, ncol * eg_D, latent}));
     d.xlq = qa((size_t) DT * K * latent);
     d.q16 = qa((size_t) DT * K * n_ffx);
+    if (std::getenv("HY4F_ATTN_OVERLAP")) {
+        HY_CK(cudaStreamCreateWithFlags(&d.attention_side, cudaStreamNonBlocking));
+        HY_CK(cudaEventCreateWithFlags(&d.attention_fork, cudaEventDisableTiming));
+        HY_CK(cudaEventCreateWithFlags(&d.attention_join, cudaEventDisableTiming));
+    }
     if (std::getenv("HY4F_FFN_OVERLAP")) {
         d.shq = qa((size_t)DT * (n_ffx / S));
         HY_CK(cudaStreamCreateWithFlags(&d.side, cudaStreamNonBlocking));
@@ -301,14 +308,14 @@ void d_engram(Shard& s, DShard& d, int e, int il, const int* pp, int T) {
 }
 
 void d_indexer_cache(Shard& s, DShard& d, const std::string& P, int il, const int* pp, int T,
-                     int xpc, int oik, float th) {
-    kb_rms<<<T, 128, 0, s.st>>>(d.xp + oik, xpc, f32(s, P + "indexer.k_norm.weight"), IK, eps, d.ikn, IK);
+                     int xpc, int oik, float th, cudaStream_t stream) {
+    kb_rms<<<T, 128, 0, stream>>>(d.xp + oik, xpc, f32(s, P + "indexer.k_norm.weight"), IK, eps, d.ikn, IK);
     const DW& ivw = s.w.at(P + "ivg");
-    kb_q8_gemv<<<dim3(nb(2 * IK * 32), T), 256, 0, s.st>>>((const uint8_t*) ivw.d, d.ikn, IK, d.ivg, 2 * IK, IK, 2 * IK);
-    kb_pool_groups<<<T / kpool + 1, 128, 0, s.st>>>(d.ivg, s.ring[il], pp, T, f32(s, P + "indexer_compressor_ape.weight"),
+    kb_q8_gemv<<<dim3(nb(2 * IK * 32), T), 256, 0, stream>>>((const uint8_t*) ivw.d, d.ikn, IK, d.ivg, 2 * IK, IK, 2 * IK);
+    kb_pool_groups<<<T / kpool + 1, 128, 0, stream>>>(d.ivg, s.ring[il], pp, T, f32(s, P + "indexer_compressor_ape.weight"),
                                                     f32(s, P + "indexer_compressor_norm.weight"), s.pooled[il], IK,
                                                     kpool, rope, eps, th);
-    kb_ring_chunk<<<IRING, 256, 0, s.st>>>(d.ivg, s.ring[il], T, pp, IK, kpool);
+    kb_ring_chunk<<<IRING, 256, 0, stream>>>(d.ivg, s.ring[il], T, pp, IK, kpool);
 }
 
 void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false, bool dense_dsa = false, const int* last_pos = nullptr) {
@@ -324,12 +331,21 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
     }
     dec_mmvq(s, P + "xproj", d.xq, d.xp, T);
-    kb_kv_prep<<<T, 576, 0, s.st>>>(d.xp + okv, xpc, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th, s.kv[il], pp,
+    // KV and the pooled index keys depend only on xproj. Compute them on
+    // another graph branch during the query projection and absorption.
+    const auto side = d.attention_side;
+    const auto keys = side ? side : s.st;
+    if (side) {
+        HY_CK(cudaEventRecord(d.attention_fork, s.st));
+        HY_CK(cudaStreamWaitEvent(side, d.attention_fork));
+    }
+    kb_kv_prep<<<T, 576, 0, keys>>>(d.xp + okv, xpc, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th, s.kv[il], pp,
                                     sw ? 3 : 2, S, s.g, win + RING_PAD);
+    if (!sw) d_indexer_cache(s, d, P, il, pp, T, xpc, oik, th, keys);
+    if (side) HY_CK(cudaEventRecord(d.attention_join, side));
     if (last_pos) {
         // All accepted rows contribute keys and indexer state. Only the final
         // row contributes a query, residual, FFN output and draft logits.
-        d_indexer_cache(s, d, P, il, pp, T, xpc, oik, th);
         d.mr += (size_t) (T - 1) * E;
         d.x += (size_t) (T - 1) * E;
         d.xp += (size_t) (T - 1) * xpc;
@@ -361,6 +377,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     }
     else
         kb_absorb_bf16<<<dim3(nb(Ha * kvl), T), 256, 0, s.st>>>((const uint16_t*) kb.d, d.qp, qpc, QH, d.qabs, nope, kvl, Ha);
+    if (side) HY_CK(cudaStreamWaitEvent(s.st, d.attention_join));
     const bool split = !std::getenv("HY4F_DEC_ATTN2");
     if (sw) {
         if (split && Hl == 16) {
@@ -375,7 +392,6 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     } else {
         float* iq = d.qp + (size_t) Hd * QH;
         if (!dense_dsa) kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, s.st>>>(iq, qpc, IH, IK, IK - rope, rope, pp, th);
-        if (!last_pos) d_indexer_cache(s, d, P, il, pp, T, xpc, oik, th);
         if (!dense_dsa) {
             kb_f32_gemv<<<dim3(nb(IH * 32), T), 256, 0, s.st>>>(f32(s, P + "indexer.proj.weight"), d.x, E, d.iw, IH, E, IH,
                                                                 1.0f / std::sqrt((float) (IK * IH)));
