@@ -1484,7 +1484,7 @@ bool Model::mark(std::string& err) {
             for (auto& s : d.sh) {
                 HY_CK(cudaSetDevice(s.dev));
                 snap_->devices.push_back(s.dev);
-                if (d.has_mtp && std::getenv("HY4F_PREFIX_TURN_MARK")) {
+                if (d.has_mtp && !d.bsh.empty() && std::getenv("HY4F_PREFIX_TURN_MARK")) {
                     void* hidden = nullptr;
                     HY_CK(cudaMalloc(&hidden, sizeof(float) * d.E));
                     snap_->rows[s.g][Lm] = hidden;
