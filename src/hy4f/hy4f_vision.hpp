@@ -62,6 +62,8 @@ struct Image {
 
 /// decode a PNG / JPEG / BMP / ... file to RGB8 (stb_image, 3 channels forced, like mtmd)
 bool load_image(const std::string& path, Image& out, std::string& err);
+/// the same from an encoded file in memory (a data: URL's bytes)
+bool load_image_mem(const uint8_t* bytes, size_t n, Image& out, std::string& err);
 
 /// planning helper (no encoder needed): the token count an input w x h image becomes (smart resize -> merged grid
 /// + one newline per row).  ow / oh: merged grid without the newline column; tw / th: the resized image.

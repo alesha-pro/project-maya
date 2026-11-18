@@ -48,8 +48,9 @@ __global__ void kb_engram_rows(const uint8_t* table, const int64_t* ids, const f
     if (d < D) r[((size_t) t * ncol + col) * D + d] = v * k * lnorm[(size_t) col * D + d];
 }
 __global__ void kb_engram_mix(float* X, float* R, const float* kv, const float* kvb, const float* gw, const float* hcs,
-                              const float* gamma, int E, int hc, float eps) {
+                              const float* gamma, int E, int hc, float eps, const int* mask) {
     const int t = blockIdx.x;
+    if (mask && mask[t]) return;   // (an embedding row: no n-gram, the Engram adds nothing)
     X += (size_t) t * hc * E;
     R += (size_t) t * hc * E;
     kv += (size_t) t * (hc + 1) * E;
@@ -83,6 +84,18 @@ __global__ void kb_engram_mix(float* X, float* R, const float* kv, const float* 
             R[(size_t) i * E + d] = x[d];
         }
         __syncthreads();
+    }
+}
+// embedding rows (an image) over the chunk's token rows [t0, t0 + n): X[t][s] = row for every hc stream, the history
+// entry -1 (an embedding has no token id: the Engram n-gram of later tokens sees the pad there) and the Engram mask
+__global__ void kb_embed_rows(const float* rows, int t0, const int* pos0p, float* X, int E, int hc, int* hist, int* mask) {
+    const int t = t0 + blockIdx.y;
+    const float* r = rows + (size_t) blockIdx.y * E;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < E; i += gridDim.x * blockDim.x)
+        for (int s = 0; s < hc; ++s) X[((size_t) t * hc + s) * E + i] = r[i];
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        hist[*pos0p + t] = -1;
+        mask[t] = 1;
     }
 }
 // HC mix partials, all n_mix rows per block (blockIdx.x = split, blockIdx.y = token): part [T][8][HC_SPLIT], ss [T][HC_SPLIT]

@@ -28,6 +28,20 @@ bool load_image(const std::string& path, Image& out, std::string& err) {
     return true;
 }
 
+bool load_image_mem(const uint8_t* bytes, size_t n, Image& out, std::string& err) {
+    int w = 0, h = 0, c = 0;
+    unsigned char* data = stbi_load_from_memory(bytes, (int) n, &w, &h, &c, 3);
+    if (!data) {
+        err = std::string("load_image_mem: ") + (stbi_failure_reason() ? stbi_failure_reason() : "decode failed");
+        return false;
+    }
+    out.w = w;
+    out.h = h;
+    out.rgb.assign(data, data + (size_t) w * h * 3);
+    stbi_image_free(data);
+    return true;
+}
+
 namespace detail {
 
 // img_tool::calc_size_preserved_ratio with longest_edge = 0, round_half_even = false (the hy_v4_flash hparams)

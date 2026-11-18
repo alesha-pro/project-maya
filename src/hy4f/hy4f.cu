@@ -24,6 +24,9 @@
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/router_sigmoid.hpp"
 #include "strata/prefill/moe_mmq.hpp"
+#ifdef HY4F_VISION
+#include "hy4f_vision.hpp"
+#endif
 
 #include <cublas_v2.h>
 
@@ -152,6 +155,9 @@ struct Model::Impl {
     int64_t pos_next = 0;
     int n_cap = 2048, max_sel = 2048;
     bool graphs = std::getenv("HY4F_NOGRAPH") == nullptr;
+#ifdef HY4F_VISION
+    std::unique_ptr<vision::Encoder> venc;
+#endif
 
     const strata::TensorInfo* find(const std::string& n, const strata::GgufFile** f) const {
         for (const auto& g : files)
@@ -929,7 +935,8 @@ bool Model::load(const Options& o, std::string& err) {
     }
 }
 
-bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int chunk, std::string& err) {
+bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int chunk, std::string& err,
+                    const std::vector<EmbdSpan>* spans) {
     try {
         Impl& d = *d_;
         if (pos > d.pos_next) throw std::runtime_error("hy4f: prefill out of order");
@@ -944,10 +951,16 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
             const int T = std::min(chunk, n - c0);
             const bool last = c0 + T == n;
             const int p0 = (int) (pos + c0);
+            std::vector<Impl::Span> cs;   // the spans' pieces inside this chunk
+            if (spans)
+                for (const EmbdSpan& e : *spans) {
+                    const int a = std::max(e.offset, c0), z = std::min(e.offset + e.n, c0 + T);
+                    if (a < z) cs.push_back({a - c0, z - a, e.rows + (size_t) (a - e.offset) * d.E});
+                }
             d.launch_parallel([&](Shard& s) {
                 Impl::BShard& b = d.bsh[s.g];
                 HY_CK(cudaMemcpyAsync(b.toks, toks + c0, sizeof(int) * T, cudaMemcpyHostToDevice, s.st));
-                d.b_chunk(s, b, p0, T, last && logits);
+                d.b_chunk(s, b, p0, T, last && logits, cs);
             });
         }
         for (auto& s : d.sh) {
@@ -1047,6 +1060,64 @@ bool Model::mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& er
     }
 }
 bool Model::has_mtp() const { return d_->has_mtp; }
+
+bool Model::load_vision(const std::string& mmproj, std::string& err) {
+#ifdef HY4F_VISION
+    d_->venc.reset(new vision::Encoder());
+    vision::Options vo;
+    vo.verbose = d_->o.verbose;
+    if (!d_->venc->load(mmproj, vo, err)) {
+        d_->venc.reset();
+        return false;
+    }
+    return true;
+#else
+    (void) mmproj;
+    err = "hy4f: built without the vision encoder";
+    return false;
+#endif
+}
+bool Model::has_vision() const {
+#ifdef HY4F_VISION
+    return d_->venc != nullptr;
+#else
+    return false;
+#endif
+}
+
+
+bool Model::encode_image(const std::string& path, std::vector<float>& rows, int& n_tokens, std::string& err) {
+#ifdef HY4F_VISION
+    try {
+        vision::Image img;
+        if (!vision::load_image(path, img, err)) return false;
+        return d_->encode_img(img, rows, n_tokens, err);
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+#else
+    (void) path, (void) rows, (void) n_tokens;
+    err = "hy4f: built without the vision encoder";
+    return false;
+#endif
+}
+bool Model::encode_image_mem(const uint8_t* bytes, size_t n, std::vector<float>& rows, int& n_tokens, std::string& err) {
+#ifdef HY4F_VISION
+    try {
+        vision::Image img;
+        if (!vision::load_image_mem(bytes, n, img, err)) return false;
+        return d_->encode_img(img, rows, n_tokens, err);
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+#else
+    (void) bytes, (void) n, (void) rows, (void) n_tokens;
+    err = "hy4f: built without the vision encoder";
+    return false;
+#endif
+}
 
 bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
     if (!d_->dsh.empty() && !std::getenv("HY4F_OLD_DECODE")) {

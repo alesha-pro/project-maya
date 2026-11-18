@@ -30,6 +30,7 @@ int main(int argc, char** argv) {
     strata::hy4f::Options o;
     std::vector<int32_t> toks;
     int gen = 0, pchunk = 0, ptail = 0, repeat = 1, spec = 0, vtail = 0, vbench = 0;
+    std::string mmproj, image;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> const char* {
@@ -50,6 +51,8 @@ int main(int argc, char** argv) {
         else if (a == "--repeat") repeat = std::atoi(next());
         else if (a == "--verify-tail") vtail = std::atoi(next());   // the prompt tail through verify(T) chunks
         else if (a == "--verify-bench") vbench = std::atoi(next());   // time verify(T) for T = 1..4 (N reps)
+        else if (a == "--mmproj") mmproj = next();
+        else if (a == "--image") image = next();   // replaces the prompt's image pad token 120120
         else if (a == "--spec") spec = std::atoi(next());   // MTP drafts per step (1)
         else if (a == "--gen") gen = std::atoi(next());
         else if (a == "--dump") o.dump_dir = next();
@@ -90,6 +93,32 @@ int main(int argc, char** argv) {
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count();
         if (pos > 1) steps_s += dt, ++steps;
     };
+    std::vector<float> img_rows;
+    std::vector<strata::hy4f::EmbdSpan> spans;
+    if (!image.empty()) {
+        if (mmproj.empty() || !m.load_vision(mmproj, err)) {
+            std::fprintf(stderr, "maya-hy4f: vision: %s\n", mmproj.empty() ? "--image needs --mmproj" : err.c_str());
+            return 1;
+        }
+        if (pchunk <= 0) pchunk = 2048;
+        int nimg = 0;
+        const auto a = std::chrono::steady_clock::now();
+        if (!m.encode_image(image, img_rows, nimg, err)) {
+            std::fprintf(stderr, "maya-hy4f: encode_image: %s\n", err.c_str());
+            return 1;
+        }
+        std::printf("image: %d tokens, encoded in %.0f ms\n", nimg,
+                    1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - a).count());
+        const auto it = std::find(toks.begin(), toks.end(), 120120);
+        if (it == toks.end()) {
+            std::fprintf(stderr, "maya-hy4f: the prompt has no image pad token 120120\n");
+            return 1;
+        }
+        const int at = (int) (it - toks.begin());
+        toks.erase(it);
+        toks.insert(toks.begin() + at, (size_t) nimg, 120120);
+        spans.push_back({at, nimg, img_rows.data()});
+    }
     if (repeat > 1) {
         const std::vector<int32_t> base = toks;
         for (int r = 1; r < repeat; ++r) toks.insert(toks.end(), base.begin(), base.end());
@@ -97,7 +126,7 @@ int main(int argc, char** argv) {
     if (pchunk > 0) {
         const int np = (int) toks.size() - std::min(ptail, (int) toks.size() - 1);
         const auto a = std::chrono::steady_clock::now();
-        if (!m.prefill(toks.data(), np, 0, logits.data(), pchunk, err)) {
+        if (!m.prefill(toks.data(), np, 0, logits.data(), pchunk, err, spans.empty() ? nullptr : &spans)) {
             std::fprintf(stderr, "maya-hy4f: prefill failed: %s\n", err.c_str());
             return 1;
         }

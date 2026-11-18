@@ -32,7 +32,10 @@ struct BShard {
     Peers ar{}, cb{};
     int step = 0;
     int* hb = nullptr;   // pinned {0, T}
+    int* emask = nullptr;   // [T] 1 at embedding (image) rows: no Engram
     size_t bytes = 0;    // device bytes of the batch buffers
+    void* arena_base = nullptr;   // the arena (attention / FFN / Engram phases; the image encoder between calls)
+    size_t arena_bytes = 0;
     // the MTP layer over the chunk (plain residual mr, positions at dbounds[3])
     bool mtp = false;
     float *mr = nullptr, *ones = nullptr, *hprev = nullptr;
@@ -109,6 +112,7 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.rows_tok = m.take<int>((size_t) T * K + strata::prefill::mmq::IDS_PAD);
         b.row_of = m.take<int>((size_t) T * K);
         b.eg_ids = m.take<int64_t>((size_t) T * ncol);
+        b.emask = m.take<int>(T);
         // exchanges: one buffer each (the alternation RS -> AG -> RS .. and the waits order every reuse)
         b.ar_buf[0] = b.ar_buf[1] = m.take<float>((size_t) S * ts * E / 2 + 64);
         b.ag_buf[0] = b.ag_buf[1] = m.take<float>((size_t) T * E / 2 + 64);
@@ -173,6 +177,8 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     ffn(mf);
     engr(me);
     b.bytes = m0.off + arena;
+    b.arena_base = base + m0.off;
+    b.arena_bytes = arena;
     {
         std::vector<float> one((size_t) T * 8, 1.0f);
         HY_CK(cudaMemcpy(b.ones, one.data(), sizeof(float) * one.size(), cudaMemcpyHostToDevice));
@@ -291,7 +297,7 @@ void b_engram(Shard& s, BShard& b, int e, int il, int pos0, int T) {
     blin(s, b, P + "engram_kv.weight", b.eg_r, ncol * eg_D, b.eg_kv, (hc + 1) * E, T);
     kb_engram_mix<<<T, 1024, 0, s.st>>>(b.X, b.R, b.eg_kv, f32(s, P + "engram_kv_b.weight"), f32(s, P + "engram_gate.weight"),
                                         f32(s, P + "engram_hc_scale.weight"), f32(s, P + "engram_pre_gamma.weight"), E, hc,
-                                        1.1920929e-07f);
+                                        1.1920929e-07f, b.emask);
 }
 
 void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
@@ -472,7 +478,11 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
 }
 
 // one chunk on one shard: tokens b.toks (already on the device), positions pos0 ..; logits of the last token
-void b_chunk(Shard& s, BShard& b, int pos0, int T, bool want_logits) {
+struct Span {   // embedding rows over the chunk's token rows [t0, t0 + n) (host [n][E])
+    int t0, n;
+    const float* rows;
+};
+void b_chunk(Shard& s, BShard& b, int pos0, int T, bool want_logits, const std::vector<Span>& spans = {}) {
     b.hb[0] = 0;
     b.hb[1] = T;
     b.hb[2] = pos0;
@@ -482,6 +492,11 @@ void b_chunk(Shard& s, BShard& b, int pos0, int T, bool want_logits) {
     b.pp = b.dbounds + 2;
     const DW& emb = s.w.at("token_embd.weight");
     kb_embed<<<dim3(nb(E), T), 256, 0, s.st>>>((const uint8_t*) emb.d, emb.rb, b.toks, b.dbounds + 2, b.X, b.R, E, hc, s.hist);
+    HY_CK(cudaMemsetAsync(b.emask, 0, sizeof(int) * T, s.st));
+    for (const Span& sp : spans) {   // (staged through the FFN arena: free at the head of the chunk)
+        HY_CK(cudaMemcpyAsync(b.gu, sp.rows, sizeof(float) * (size_t) sp.n * E, cudaMemcpyHostToDevice, s.st));
+        kb_embed_rows<<<dim3(nb(E), sp.n), 256, 0, s.st>>>(b.gu, sp.t0, b.dbounds + 2, b.X, E, hc, s.hist, b.emask);
+    }
     for (int il = 0; il < L; ++il) {
         for (size_t e = 0; e < eg_layers.size(); ++e)
             if (eg_layers[e] == il) b_engram(s, b, (int) e, il, pos0, T);
