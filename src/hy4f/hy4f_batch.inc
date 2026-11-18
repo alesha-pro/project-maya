@@ -60,6 +60,7 @@ int peer_of(int g, int r) const { return paired && (S & (S - 1)) == 0 ? (g ^ r) 
 int cap_num = 3, cap_den = 2;   // expert rows buffered per shard: cap_num/cap_den x the even share (ranges past it)
 bool compact_arena = std::getenv("HY4F_PF_COMPACT") != nullptr;
 int attn_tile = 512;
+bool direct_dsa = std::getenv("HY4F_DIRECT_DSA") != nullptr;
 int mqa_opt = std::getenv("HY4F_PF_MQA") ? std::atoi(std::getenv("HY4F_PF_MQA")) : 0;
 int64_t idx_split_from = std::getenv("HY4F_IDX_SPLIT_FROM") ? std::atoll(std::getenv("HY4F_IDX_SPLIT_FROM")) : 16384;   // indexer split by tokens from this depth   // tokens per attention tile (q_abs / o / partials / cells / the combine are tile-sized)
 int CBW() const { return kvl + 4; }   // a combine partial's row: kvl accumulators, M, L, 2 pad (float4 / WMMA aligned)
@@ -486,6 +487,8 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
             const bool compact = split && std::getenv("HY4F_PF_GROUPS") && mbs.empty()
                 && (int64_t)pos0 + t0 + tt <= (int64_t)65536 * kpool && (pos0 + t0) / kpool >= groups
                 && pos0 + t0 + 1 > top_k;
+            const bool direct = direct_dsa && S == 4 && kpool == 4;
+            const uint16_t* selected = nullptr;
             int* cells = b.cells;
             int ra = 0, rz = tt;
             const int q = (tt + S - 1) / S;
@@ -523,7 +526,8 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                 for (int r = 0; r < S; ++r)
                     b_copy(s, b, b.cl, peer_of(s.g, r), pack, (size_t)ra * stride * 2, (size_t)rows * stride * 2);
                 kb_wait_k<<<1, 32, 0, b.st>>>(b.cl, s.g, S, b.step);
-                kb_unpack_groups<<<tt, 256, 0, b.st>>>(reinterpret_cast<const uint16_t*>(b.cellsx[b.step & 1]),
+                if (direct) selected = reinterpret_cast<const uint16_t*>(b.cellsx[b.step & 1]);
+                else kb_unpack_groups<<<tt, 256, 0, b.st>>>(reinterpret_cast<const uint16_t*>(b.cellsx[b.step & 1]),
                     cells, n_cap, kpool, groups, stride, b.pp, t0);
             } else if (split) {
                 const size_t per = (size_t) q * n_cap;
@@ -539,7 +543,7 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
             if (mqa) {
                 kb_mqa_attn<32><<<tt, 256, mqa_smem<32>(), b.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], nullptr,
                                                                  cells, n_cap, b.pp, t0, win, S, s.g, nullptr, scale,
-                                                                 nullptr, b.part, CBW(), nullptr, 0, mqa_opt & 1);
+                                                                 nullptr, b.part, CBW(), nullptr, 0, mqa_opt & 1, direct ? top_k : 0, groups, selected);
                 ++b.step;
                 if (std::getenv("HY4F_CB32")) {
                     const size_t per = (size_t) tt * Hl * CBW();

@@ -426,7 +426,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
             if (split && Hd == 32) {
                 (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>)<<<dim3(NSP, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
                                                                            n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
-                                                                           d.spacc);
+                                                                           d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail);
                 kd_mqa_merge<<<dim3(Hd, T), 256, 0, s.st>>>(d.spm, d.spl, d.spacc, NSP, Hd, nullptr, nullptr, d.part, CBW());
             } else {
                 kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp,

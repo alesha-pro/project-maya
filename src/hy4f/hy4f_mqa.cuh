@@ -41,13 +41,29 @@ __global__ void kb_swa_expand(const uint8_t* ring, const uint8_t* chunk,
     reinterpret_cast<uint4*>(expanded + (size_t)r * KV_ROW)[group] = out;
 }
 
+// With four token positions per selected pool and four interleaved KV shards,
+// every complete pool contributes exactly one position to each GPU. The only
+// incomplete pool is the causal tail. Preserve the selector's original order.
+__device__ __forceinline__ int grouped_rows(int pos, int top_k, int groups, int cap, int shard) {
+    const int rows = pos < top_k ? pos + 1 : min(cap, 4 * min(pos / 4, groups) + (pos % 4) + 1);
+    return (rows + 3 - shard) / 4;
+}
+
+__device__ __forceinline__ int grouped_kv_row(int row, int pos, int top_k, int groups,
+                                              const int* cells, const uint16_t* wire) {
+    if (pos < top_k) return row;
+    if (row >= min(groups, pos / 4)) return pos / 4;
+    return wire ? (int)wire[row] : cells[4 * row] / 4;
+}
+
 template <int H>
 __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qabs, const float* __restrict__ q, int ldq,
                                                    int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                    const uint8_t* __restrict__ chunk, const int* __restrict__ cells,
                                                    int n_cap, const int* pos0p, int t0, int win, int n_shards, int shard,
                                                    const float* __restrict__ sinks, float scale, float* __restrict__ o,
-                                                   float* __restrict__ part, int W, const __half* expanded = nullptr, int first = 0, bool cache_scores = false) {
+                                                   float* __restrict__ part, int W, const __half* expanded = nullptr, int first = 0, bool cache_scores = false,
+                                                   int top_k = 0, int groups = 0, const uint16_t* wire = nullptr) {
     const int pos0 = *pos0p;
     using namespace nvcuda;
     constexpr int KVL = 512, ROPE = 64, D = 576, LD = MQA_LD, TR = MQA_TR;
@@ -84,7 +100,9 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
     }
     // the rows: SWA window / this shard's cells (compacted in order)
     int n, lo = 0;
-    if (!cells) {
+    if (top_k > 0) {
+        n = grouped_rows(pos, top_k, groups, n_cap, shard);
+    } else if (!cells) {
         lo = max(0, pos - win + 1);
         n = pos - lo + 1;
     } else {
@@ -140,7 +158,9 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
                         const int pp = lo + s;
                         p = (chunk && pp >= pos0) ? chunk + (size_t) (pp - pos0) * KV_RB : kv + (size_t) (pp % (win + RING_PAD)) * KV_RB;
                     } else {
-                        p = kv + (size_t) cl[s] * KV_RB;
+                        const int row = top_k > 0 ? grouped_kv_row(s, pos, top_k, groups,
+                            cells + (size_t)t * n_cap, wire ? wire + (size_t)t * ((groups+7)/8*8) : nullptr) : cl[s];
+                        p = kv + (size_t)row * KV_RB;
                     }
                 }
                 rowp[tid] = p;
@@ -261,7 +281,7 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
                                                   int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                   const int* __restrict__ cells, int n_cap, const int* pos0p, int win,
                                                   int n_shards, int shard, float scale, float* __restrict__ pm,
-                                                  float* __restrict__ pl, float* __restrict__ pacc) {
+                                                  float* __restrict__ pl, float* __restrict__ pacc, int top_k = 0, int groups = 0) {
     using namespace nvcuda;
     constexpr int KVL = 512, ROPE = 64, D = 576, LD = MQA_LD, TR = MQA_TR;
     constexpr int NST = H / 8, KS = 8 / NST, KP = D / KS, OPW = H / 4;
@@ -281,6 +301,8 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
     int n, lo = 0;
     if constexpr (DenseDsa) {
         n = (pos + n_shards - shard) / n_shards;
+    } else if (top_k > 0) {
+        n = grouped_rows(pos, top_k, groups, n_cap, shard);
     } else if (!cells) {
         lo = max(0, pos - win + 1);
         n = pos - lo + 1;
@@ -342,6 +364,7 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
                 const uint8_t* p = nullptr;
                 if (s2 < re) {
                     if constexpr (DenseDsa) p = kv + (size_t) s2 * KV_RB;
+                    else if (top_k > 0) p = kv + (size_t)grouped_kv_row(s2, pos, top_k, groups, cells+(size_t)t*n_cap, nullptr) * KV_RB;
                     else p = !cells ? kv + (size_t) ((lo + s2) % (win + RING_PAD)) * KV_RB : kv + (size_t) cl[s2] * KV_RB;
                 }
                 rowp[tid] = p;
