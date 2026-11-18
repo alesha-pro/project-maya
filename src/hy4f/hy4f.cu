@@ -202,7 +202,7 @@ struct Model::Impl {
             const auto* original = find(name, &base);
             const auto* replacement = file->find(name);
             if (!original || !replacement || original->shape != replacement->shape ||
-                (replacement->type != T_Q3_K && replacement->type != T_Q4_K))
+                (replacement->type != T_Q3_K && replacement->type != T_Q4_K && replacement->type != T_Q8_0))
                 throw std::runtime_error("hy4f: incompatible draft expert tensor " + name);
             if (!std::strcmp(part, "gate")) gate_type = (int) replacement->type;
             if (!std::strcmp(part, "up") && (int) replacement->type != gate_type)
