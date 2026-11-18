@@ -1665,3 +1665,68 @@ void native_q4_k_mmvq_ids_loop(const void* weights, std::size_t expert_bytes, co
 }
 
 }  // namespace strata::kernels
+
+// ---------------------------------------------------------------------------------------------------------------
+// hy4f: routed experts for a few tokens with the weights read once per (row, expert): groups = the distinct local
+// experts of a step with the slots that picked each (at most one slot per token).  A warp takes work items
+// (row, group) from a balanced grid-stride list (persistent warps, no blocks that exit at once); two 16-lane halves
+// walk the row's 256-value blocks, each block's dot reused for every slot of the group.  Same dot as the ncols=1 path.
+namespace strata::kernels {
+namespace {
+
+template <class Block, float (*Dot)(const Block* __restrict__, const Q81Block* __restrict__, int), int KQS_MUL>
+__global__ void __launch_bounds__(256) native_kq_mmvq_grouped_kernel(
+    const Block* __restrict__ w, std::size_t expert_blocks, const int* __restrict__ ng_p, const int* __restrict__ gexp,
+    const int* __restrict__ goff, const int* __restrict__ gslot, const Q81Block* __restrict__ x, std::size_t x_col_blocks,
+    float* __restrict__ y, int n_in, int n_out) {
+    const int ng = *ng_p, lane = threadIdx.x & 31, half = lane >> 4;
+    const int bpr = n_in / QK;
+    const long long items = (long long) ng * n_out;
+    const long long nwarps = (long long) gridDim.x * (blockDim.x >> 5);
+    for (long long it = (long long) blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5); it < items; it += nwarps) {
+        const int gi = (int) (it / n_out), r = (int) (it % n_out);
+        const Block* __restrict__ wr = w + std::size_t(gexp[gi]) * expert_blocks + std::size_t(r) * bpr;
+        const int s0 = goff[gi], ns = goff[gi + 1] - s0;
+        float acc[4] = {0.f, 0.f, 0.f, 0.f};
+        const int kqs = KQS_MUL * (lane & 15);
+        for (int kbx = half; kbx < bpr; kbx += 2) {
+            const int kby = kbx * (QK / Q8K);
+#pragma unroll
+            for (int s = 0; s < 4; ++s)
+                if (s < ns) acc[s] += Dot(wr + kbx, x + std::size_t(gslot[s0 + s]) * x_col_blocks + kby, kqs);
+        }
+#pragma unroll
+        for (int s = 0; s < 4; ++s) {
+            if (s < ns) {
+                const float v = warp_sum(acc[s]);
+                if (lane == 0) y[std::size_t(gslot[s0 + s]) * n_out + r] = v;
+            }
+        }
+    }
+}
+
+template <class Block, float (*Dot)(const Block* __restrict__, const Q81Block* __restrict__, int), int KQS_MUL>
+void launch_grouped(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp, const int* goff,
+                    const int* gslot, const void* x_q8_1, float* y, int n_in, int n_out, int blocks, void* stream) {
+    if (n_in <= 0 || n_in % QK != 0) throw std::invalid_argument("native MMVQ grouped: n_in");
+    if (expert_bytes % sizeof(Block) != 0) throw std::invalid_argument("native MMVQ grouped: expert_bytes");
+    native_kq_mmvq_grouped_kernel<Block, Dot, KQS_MUL><<<blocks, 256, 0, static_cast<cudaStream_t>(stream)>>>(
+        static_cast<const Block*>(weights), expert_bytes / sizeof(Block), ng, gexp, goff, gslot,
+        static_cast<const Q81Block*>(x_q8_1), std::size_t(n_in / Q8K), y, n_in, n_out);
+    launch_check();
+}
+
+}  // namespace
+
+void native_q3_k_mmvq_grouped(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp,
+                              const int* goff, const int* gslot, const void* x_q8_1, float* y, int n_in, int n_out,
+                              int blocks, void* stream) {
+    launch_grouped<Q3KBlock, q3_q8_dot, 1>(weights, expert_bytes, ng, gexp, goff, gslot, x_q8_1, y, n_in, n_out, blocks, stream);
+}
+void native_q4_k_mmvq_grouped(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp,
+                              const int* goff, const int* gslot, const void* x_q8_1, float* y, int n_in, int n_out,
+                              int blocks, void* stream) {
+    launch_grouped<Q4KBlock, q4_q8_dot, VDR>(weights, expert_bytes, ng, gexp, goff, gslot, x_q8_1, y, n_in, n_out, blocks, stream);
+}
+
+}  // namespace strata::kernels

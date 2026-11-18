@@ -123,4 +123,12 @@ void native_q3_k_mmvq_ids_loop(const void* weights, std::size_t expert_bytes, co
                                const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream);
 void native_q4_k_mmvq_ids_loop(const void* weights, std::size_t expert_bytes, const int* ids, int n_ids,
                                const void* x_q8_1, bool x_shared, float* y, int n_in, int n_out, void* stream);
+// the experts of a few tokens read once per (row, distinct expert): groups g < *ng of expert gexp[g] with the slots
+// gslot[goff[g] .. goff[g+1]) (<= 4); x row / y column = the slot; persistent warps over (row, group), `blocks` blocks
+void native_q3_k_mmvq_grouped(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp,
+                              const int* goff, const int* gslot, const void* x_q8_1, float* y, int n_in, int n_out,
+                              int blocks, void* stream);
+void native_q4_k_mmvq_grouped(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp,
+                              const int* goff, const int* gslot, const void* x_q8_1, float* y, int n_in, int n_out,
+                              int blocks, void* stream);
 } // namespace strata::kernels

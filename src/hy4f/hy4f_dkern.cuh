@@ -575,6 +575,238 @@ __global__ void kd_sel_write(const float* __restrict__ score, int ld, const int*
     }
 }
 
+
+// the distinct local experts of a step and their slots (eloc [n]: local id or -1; n <= 64): groups in the order of
+// their first slot, a group's slots in slot order.  One block of 64 threads.  ng[0] = group count.
+__global__ void kd_moe_groups(const int* __restrict__ eloc, int n, int* ng, int* gexp, int* goff, int* gslot) {
+    __shared__ int id[64], leader[64], cnt[64], gidx[64];
+    const int i = threadIdx.x;
+    id[i] = i < n ? eloc[i] : -1;
+    __syncthreads();
+    int ld = -1, rank = 0;
+    if (id[i] >= 0) {
+        for (int j = 0; j < i; ++j)
+            if (id[j] == id[i]) {
+                if (ld < 0) ld = j;
+                ++rank;
+            }
+        if (ld < 0) ld = i;
+    }
+    leader[i] = (id[i] >= 0 && ld == i) ? 1 : 0;
+    int c = 0;
+    if (leader[i])
+        for (int j = i; j < n; ++j) c += id[j] == id[i];
+    cnt[i] = c;
+    __syncthreads();
+    int g = 0;
+    for (int j = 0; j < i; ++j) g += leader[j];
+    gidx[i] = g;
+    __syncthreads();
+    if (leader[i]) {
+        int off = 0;
+        for (int j = 0; j < i; ++j) off += cnt[j];
+        gexp[g] = id[i];
+        goff[g] = off;
+    }
+    if (i == 63) {
+        int tot = 0, ngr = 0;
+        for (int j = 0; j < 64; ++j) tot += cnt[j], ngr += leader[j];
+        ng[0] = ngr;
+        goff[ngr] = tot;
+    }
+    __syncthreads();
+    if (id[i] >= 0) {
+        int off = 0;
+        for (int j = 0; j < ld; ++j) off += cnt[j];
+        gslot[off + rank] = i;
+    }
+}
+
+
+// all peers in one launch: blocks [r*nbp, (r+1)*nbp) push x1 (+ x2) [tn] to peer (me + 1 + r) % n_shards (each peer its
+// own blocks, written concurrently); the last block per peer signals it.  mode 1: the head slice like kd_push1.
+__global__ void kd_push_all(const float* __restrict__ x1, const float* __restrict__ x2, int tn, int mode, int T, int H,
+                            int W, int Hl, Peers P, int me, int n_shards, int nbp, const int* counter, int* arrive) {
+    const int r = blockIdx.x / nbp, bb = blockIdx.x % nbp, j = (me + 1 + r) % n_shards;
+    const int step = counter[0] + 1, par = step & 1;
+    float* dst = P.buf[j][par] + (size_t) me * tn;
+    if (mode == 0) {
+        const float4* a4 = reinterpret_cast<const float4*>(x1);
+        const float4* c4 = reinterpret_cast<const float4*>(x2);
+        float4* d4 = reinterpret_cast<float4*>(dst);
+        for (int i = bb * blockDim.x + threadIdx.x; i < tn / 4; i += nbp * blockDim.x) {
+            float4 v = a4[i];
+            if (x2) {
+                const float4 w = c4[i];
+                v.x += w.x, v.y += w.y, v.z += w.z, v.w += w.w;
+            }
+            d4[i] = v;
+        }
+    } else {
+        const int slice = Hl * W;
+        for (int i = bb * blockDim.x + threadIdx.x; i < tn; i += nbp * blockDim.x) {
+            const int t = i / slice, rem = i % slice;
+            dst[i] = x1[(size_t) t * H * W + (size_t) j * slice + rem];
+        }
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int v = atomicAdd(arrive + j, 1);
+        if (v == nbp - 1) {
+            __threadfence_system();
+            reinterpret_cast<volatile int*>(P.flag[j])[me] = step;
+            arrive[j] = 0;
+        }
+    }
+}
+
+
+// the peers one after another inside one launch (a single launch per exchange instead of one per peer; still one peer
+// at a time per block): each block writes its slice to peer me+1, fences, counts in; then me+2, ...
+__global__ void kd_push_seq(const float* __restrict__ x1, const float* __restrict__ x2, int tn, int mode, int T, int H,
+                            int W, int Hl, Peers P, int me, int n_shards, const int* counter, int* arrive) {
+    const int step = counter[0] + 1, par = step & 1;
+    for (int r = 1; r < n_shards; ++r) {
+        const int j = (me + r) % n_shards;
+        float* dst = P.buf[j][par] + (size_t) me * tn;
+        if (mode == 0) {
+            const float4* a4 = reinterpret_cast<const float4*>(x1);
+            const float4* c4 = reinterpret_cast<const float4*>(x2);
+            float4* d4 = reinterpret_cast<float4*>(dst);
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tn / 4; i += gridDim.x * blockDim.x) {
+                float4 v = a4[i];
+                if (x2) {
+                    const float4 w = c4[i];
+                    v.x += w.x, v.y += w.y, v.z += w.z, v.w += w.w;
+                }
+                d4[i] = v;
+            }
+        } else {
+            const int slice = Hl * W;
+            for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < tn; i += gridDim.x * blockDim.x) {
+                const int t = i / slice, rem = i % slice;
+                dst[i] = x1[(size_t) t * H * W + (size_t) j * slice + rem];
+            }
+        }
+        __threadfence_system();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            const int v = atomicAdd(arrive + j, 1);
+            if (v == (int) gridDim.x - 1) {
+                __threadfence_system();
+                reinterpret_cast<volatile int*>(P.flag[j])[me] = step;
+                arrive[j] = 0;
+            }
+        }
+    }
+}
+
+
+// the all-reduce tail fused with the next sublayer's input (HC pre-mix + RMS norm + Q8_1): block t = row t.  After
+// X[t][s] += post[t][s] * RMS(sum) * w (the tail), the next mix m_r = fn[r] . X[t] / rms(X[t]) gives pre / post (post is
+// overwritten with the next sublayer's), x = RMS(sum_s pre[s] X[t][s]) * nw_next -> xo [T][E] fp32 and xq Q8_1.
+// E == 3 * 1024, hc <= 4, n_mix <= 8 (the Hy4 geometry; the caller checks).
+struct HcNext {
+    const float *fn = nullptr, *scale = nullptr, *base = nullptr, *nw = nullptr;
+    int n_mix = 0;
+    float mag = 0.0f;
+};
+__global__ void __launch_bounds__(1024) kd_ar_tail_hc(const float* __restrict__ x1, const float* __restrict__ x2, int T,
+                                                      int n, Peers P, int me, int n_shards, int* counter, int* arrive,
+                                                      const float* __restrict__ nw, float eps, float* X, float* post, int hc,
+                                                      HcNext nx, float hc_eps, float* __restrict__ xo, Q81* __restrict__ xq) {
+    constexpr int PER = 3;
+    const int step = counter[0] + 1, tn = T * n, t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, wid = tid >> 5;
+    kd_wait_peers(P, me, n_shards, step);
+    const float* rv = P.buf[me][step & 1];
+    float ysum[PER], sq = 0.0f;
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int i = tid + k * 1024;
+        float v = 0.0f;
+        for (int j = 0; j < n_shards; ++j)
+            v += j == me ? x1[(size_t) t * n + i] + (x2 ? x2[(size_t) t * n + i] : 0.0f)
+                         : __ldcv(rv + (size_t) j * tn + (size_t) t * n + i);
+        ysum[k] = v;
+        sq += v * v;
+    }
+    const float r = rsqrtf(block_sum(sq) / n + eps);
+    float pv[4];
+    for (int s2 = 0; s2 < 4; ++s2) pv[s2] = s2 < hc ? post[t * 8 + s2] : 0.0f;
+    float Xv[4][PER];
+    float* Xt = X + (size_t) t * hc * n;
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int i = tid + k * 1024;
+        const float y = ysum[k] * r * nw[i];
+#pragma unroll
+        for (int s2 = 0; s2 < 4; ++s2)
+            if (s2 < hc) {
+                const float v = Xt[(size_t) s2 * n + i] + pv[s2] * y;
+                Xt[(size_t) s2 * n + i] = v;
+                Xv[s2][k] = v;
+            }
+    }
+    // the next mix: 8 dots over the hc * n state + its square sum
+    float acc[9];
+#pragma unroll
+    for (int q = 0; q < 9; ++q) acc[q] = 0.0f;
+#pragma unroll
+    for (int s2 = 0; s2 < 4; ++s2)
+        if (s2 < hc)
+#pragma unroll
+            for (int k = 0; k < PER; ++k) {
+                const int i = s2 * n + tid + k * 1024;
+                const float xv = Xv[s2][k];
+                acc[8] += xv * xv;
+#pragma unroll
+                for (int q = 0; q < 8; ++q)
+                    if (q < nx.n_mix) acc[q] += nx.fn[(size_t) q * hc * n + i] * xv;
+            }
+    __shared__ float red[9][32], res[9], pre[4];
+#pragma unroll
+    for (int q = 0; q < 9; ++q) {
+        const float v = warp_sum(acc[q]);
+        if (lane == 0) red[q][wid] = v;
+    }
+    __syncthreads();
+    if (tid < 9) {
+        float v = 0.0f;
+        for (int w2 = 0; w2 < 32; ++w2) v += red[tid][w2];
+        res[tid] = v;
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const float inv = rsqrtf(res[8] / (float) (n * hc) + eps);
+        for (int q = 0; q < nx.n_mix; ++q) {
+            const float m = res[q] * inv;
+            if (q < hc) pre[q] = sigm(m * nx.scale[0] + nx.base[q]) + hc_eps;
+            else post[t * 8 + q - hc] = sigm(m * nx.scale[1] + nx.base[q]) * nx.mag + hc_eps;
+        }
+    }
+    __syncthreads();
+    float cur[PER], sq2 = 0.0f;
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        float v = 0.0f;
+#pragma unroll
+        for (int s2 = 0; s2 < 4; ++s2)
+            if (s2 < hc) v += pre[s2] * Xv[s2][k];
+        cur[k] = v;
+        sq2 += v * v;
+    }
+    const float r2 = rsqrtf(block_sum(sq2) / n + eps);
+#pragma unroll
+    for (int k = 0; k < PER; ++k) {
+        const int i = tid + k * 1024;
+        const float v = cur[k] * r2 * nx.nw[i];
+        xo[(size_t) t * n + i] = v;
+        q81_store(xq + ((size_t) t * n + i) / 32, v);
+    }
+    kd_post_done(counter, arrive, step);
+}
+
 // the sigmoid router: top-k by (sigmoid(l) + bias) descending, index ascending (router_sigmoid's rank order) through a
 // bitonic sort in shared memory instead of an O(n^2) rank count; the weights from the unbiased p summed in double on
 // one thread in rank order (router_sigmoid's arithmetic).  NE = n_expert, a power of two <= 1024; blockIdx.x = token,

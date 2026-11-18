@@ -10,8 +10,11 @@
 
 static constexpr int DT = 4;
 static constexpr int NSP = 16;
+int moe_blocks = std::getenv("HY4F_MOE_BLOCKS") ? std::atoi(std::getenv("HY4F_MOE_BLOCKS")) : 328;
 int dec_score_blocks = std::getenv("HY4F_DEC_SCORE_BLOCKS") ? std::atoi(std::getenv("HY4F_DEC_SCORE_BLOCKS")) : 256;   // split-K blocks per token of the decode attention
-int ar_push_blocks = std::getenv("HY4F_PUSH_BLOCKS") ? std::atoi(std::getenv("HY4F_PUSH_BLOCKS")) : 2;
+bool push_all = std::getenv("HY4F_PUSH_ALL") != nullptr;
+bool push_seq = std::getenv("HY4F_PUSH_PER_PEER") == nullptr;
+int ar_push_blocks = std::getenv("HY4F_PUSH_BLOCKS") ? std::atoi(std::getenv("HY4F_PUSH_BLOCKS")) : 1;
 
 struct IoT {   // a multi-token step's inputs (pinned host -> device at the head of each graph)
     int pos;
@@ -26,6 +29,7 @@ struct DShard {
           *ao = nullptr, *ikn = nullptr, *ivg = nullptr, *iw = nullptr, *score = nullptr;
     int *cells = nullptr, *eids = nullptr, *eloc = nullptr;
     unsigned *sel_st = nullptr, *sel_hist = nullptr;
+    int *mg_n = nullptr, *mg_exp = nullptr, *mg_off = nullptr, *mg_slot = nullptr;   // the step's expert groups
     int* sel_bc = nullptr;
     float *lg = nullptr, *ew = nullptr, *xm = nullptr, *ga16 = nullptr, *dn16 = nullptr, *moe = nullptr, *mu = nullptr,
           *shh = nullptr, *sh = nullptr, *ga = nullptr, *ffo = nullptr;
@@ -101,6 +105,10 @@ void dec_alloc(Shard& s, DShard& d) {
     d.sel_st = (unsigned*) ia((size_t) DT * 4);
     d.sel_hist = (unsigned*) ia((size_t) DT * 2048);
     d.sel_bc = ia((size_t) DT * SEL_NB * 2);
+    d.mg_n = ia(4);
+    d.mg_exp = ia(64);
+    d.mg_off = ia(65);
+    d.mg_slot = ia(64);
     d.lg = dalloc((size_t) DT * n_exp);
     d.ew = dalloc((size_t) DT * K);
     d.eids = ia((size_t) DT * K);
@@ -151,7 +159,19 @@ int rows_of(Shard& s, const std::string& n) {
     return (int) (w.ne[1] * w.ne[2]);
 }
 
-void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::string& norm, int T, bool mtp) {
+HcNext hc_next(Shard& s, const std::string& P, const std::string& k, const std::string& norm, int n_mix, float mag) {
+    HcNext n;
+    n.fn = f32(s, P + k + "_fn.weight");
+    n.scale = f32(s, P + k + "_scale.weight");
+    n.base = f32(s, P + k + "_base.weight");
+    n.nw = f32(s, norm);
+    n.n_mix = n_mix;
+    n.mag = mag;
+    return n;
+}
+bool fuse_ok() const { return E == 3072 && hc <= 4 && !std::getenv("HY4F_NO_FUSE"); }
+void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::string& norm, int T, bool mtp,
+          const HcNext* nx = nullptr) {
     float* X = mtp ? d.mr : d.X;
     const float* post = mtp ? d.ones : d.post;
     const int hcn = mtp ? 1 : hc;
@@ -161,9 +181,19 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
         return;
     }
     const int tn = T * E;
-    for (int r = 1; r < S; ++r)
-        kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, (s.g + r) % S, d.ar_ctr, d.arrive);
-    kd_ar_tail<<<T, 1024, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), eps, X, post, hcn);
+    if (push_seq)
+        kd_push_seq<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, S, d.ar_ctr, d.arrive);
+    else if (push_all)
+        kd_push_all<<<ar_push_blocks * (S - 1), 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, S, ar_push_blocks,
+                                                                d.ar_ctr, d.arrive);
+    else
+        for (int r = 1; r < S; ++r)
+            kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, (s.g + r) % S, d.ar_ctr, d.arrive);
+    if (nx && !mtp)
+        kd_ar_tail_hc<<<T, 1024, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), eps, d.X, d.post,
+                                            hc, *nx, hc_eps, d.x, d.xq);
+    else
+        kd_ar_tail<<<T, 1024, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), eps, X, post, hcn);
 }
 void d_norm_in(Shard& s, DShard& d, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
                float mag, int T) {
@@ -186,16 +216,18 @@ void d_engram(Shard& s, DShard& d, int e, int il, const int* pp, int T) {
                                         1.1920929e-07f, nullptr);
 }
 
-void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp) {
+void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false) {
     const std::string P = "blk." + std::to_string(il) + ".";
     const bool sw = swa[il] != 0;
     const int Hl = sw ? Hs / S : Hd / S, QH = nope + rope;
     const float th = sw ? theta_swa : theta;
     const int xpc = rows_of(s, P + "xproj"), qpc = rows_of(s, P + "qproj");
     const int oq = 0, okv = q_lora, og = q_lora + KV_ROW, oik = og + Hl * vh;
-    if (mtp) kb_rms<<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "attn_norm.weight"), E, eps, d.x, E);
-    else d_norm_in(s, d, P, "hc_attn", P + "attn_norm.weight", 2 * hc, hc_mag, T);
-    k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
+    if (!ready) {
+        if (mtp) kb_rms<<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "attn_norm.weight"), E, eps, d.x, E);
+        else d_norm_in(s, d, P, "hc_attn", P + "attn_norm.weight", 2 * hc, hc_mag, T);
+        k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
+    }
     dec_mmvq(s, P + "xproj", d.xq, d.xp, T);
     kb_rms<<<T, 1024, 0, s.st>>>(d.xp + oq, xpc, f32(s, P + "attn_q_a_norm.weight"), q_lora, eps, d.qr, q_lora);
     kb_kv_prep<<<T, 576, 0, s.st>>>(d.xp + okv, xpc, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th, s.kv[il], pp,
@@ -274,9 +306,16 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp) {
                 kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp,
                                                         win, S, s.g, nullptr, scale, nullptr, d.part, Hd);
             }
-            for (int r = 1; r < S; ++r)
-                kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd, CBW(), Hl, d.cb, s.g,
-                                                           (s.g + r) % S, d.cb_ctr, d.arrive + 8);
+            if (push_seq)
+                kd_push_seq<<<ar_push_blocks, 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd, CBW(), Hl, d.cb, s.g, S,
+                                                              d.cb_ctr, d.arrive + 8);
+            else if (push_all)
+                kd_push_all<<<ar_push_blocks * (S - 1), 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd, CBW(), Hl,
+                                                                        d.cb, s.g, S, ar_push_blocks, d.cb_ctr, d.arrive + 8);
+            else
+                for (int r = 1; r < S; ++r)
+                    kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(d.part, nullptr, T * Hl * CBW(), 1, T, Hd, CBW(), Hl, d.cb, s.g,
+                                                               (s.g + r) % S, d.cb_ctr, d.arrive + 8);
             kd_cb_tail<<<T * Hl, 256, 0, s.st>>>(d.part, T, Hd, kvl, CBW(), s.g * Hl, Hl, f32(s, P + "attn_sinks.weight"),
                                                  d.cb, s.g, S, d.cb_ctr, d.arrive + 12, d.o);
         } else {
@@ -299,21 +338,28 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp) {
                                                                      Hl);
     k_q8<<<nb(T * Hl * vh), 256, 0, s.st>>>(d.a, T * Hl * vh, d.xq);
     dec_mmvq(s, P + "attn_output.weight", d.xq, d.ao, T);
-    d_ar(s, d, d.ao, nullptr, P + "post_attention_norm.weight", T, mtp);
+    if (!mtp && fuse_ok()) {   // (the FFN's input comes out of the all-reduce tail)
+        const HcNext nx = hc_next(s, P, "hc_ffn", P + "ffn_norm.weight", 2 * hc, hc_mag);
+        d_ar(s, d, d.ao, nullptr, P + "post_attention_norm.weight", T, mtp, &nx);
+    } else {
+        d_ar(s, d, d.ao, nullptr, P + "post_attention_norm.weight", T, mtp);
+    }
 }
 
-void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp) {
+void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, const HcNext* nx_after = nullptr) {
     const std::string P = "blk." + std::to_string(il) + ".";
-    if (mtp) kb_rms<<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "ffn_norm.weight"), E, eps, d.x, E);
-    else d_norm_in(s, d, P, "hc_ffn", P + "ffn_norm.weight", 2 * hc, hc_mag, T);
-    k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
+    if (!ready) {
+        if (mtp) kb_rms<<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "ffn_norm.weight"), E, eps, d.x, E);
+        else d_norm_in(s, d, P, "hc_ffn", P + "ffn_norm.weight", 2 * hc, hc_mag, T);
+        k_q8<<<nb(T * E), 256, 0, s.st>>>(d.x, T * E, d.xq);
+    }
     if (il < dense_lead) {
         const int fl = n_ff / S;
         dec_mmvq(s, P + "dense_gu", d.xq, d.ga, T);
         kb_swiglu_rows<<<dim3(nb(fl), T), 256, 0, s.st>>>(d.ga, 2 * fl, fl, T, d.shh);
         k_q8<<<nb(T * fl), 256, 0, s.st>>>(d.shh, T * fl, d.xq);
         dec_mmvq(s, P + "ffn_down.weight", d.xq, d.ffo, T);
-        d_ar(s, d, d.ffo, nullptr, P + "post_ffw_norm.weight", T, mtp);
+        d_ar(s, d, d.ffo, nullptr, P + "post_ffw_norm.weight", T, mtp, nx_after);
         return;
     }
     const int K = n_used, e0 = ebound[s.g], e1 = ebound[s.g + 1], fl = n_ffx / S;
@@ -324,8 +370,18 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp) {
     kd_local_ids<<<1, 128, 0, s.st>>>(d.eids, d.eloc, T * K, e0, e1);
     dec_mmvq(s, P + "xmoe", d.xq, d.xm, T);
     kd_q8_slots<<<dim3(nb(latent), T * K), 256, 0, s.st>>>(d.xm, xmc, latent, K, d.xlq);
+    const bool grouped = !std::getenv("HY4F_IDS_LOOP");
+    if (grouped) kd_moe_groups<<<1, 64, 0, s.st>>>(d.eloc, T * K, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
     auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out) {
         const size_t eb = w.rb * (size_t) w.ne[1];
+        if (grouped) {
+            if (w.type == T_Q3_K)
+                kn::native_q3_k_mmvq_grouped(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, xq, y, n_in, n_out, moe_blocks, s.st);
+            else if (w.type == T_Q4_K)
+                kn::native_q4_k_mmvq_grouped(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, xq, y, n_in, n_out, moe_blocks, s.st);
+            else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
+            return;
+        }
         if (w.type == T_Q3_K) kn::native_q3_k_mmvq_ids_loop(w.d, eb, d.eloc, T * K, xq, false, y, n_in, n_out, s.st);
         else if (w.type == T_Q4_K) kn::native_q4_k_mmvq_ids_loop(w.d, eb, d.eloc, T * K, xq, false, y, n_in, n_out, s.st);
         else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
@@ -339,7 +395,7 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp) {
     kb_swiglu_rows<<<dim3(nb(fl), T), 256, 0, s.st>>>(d.xm + latent, xmc, fl, T, d.shh);
     k_q8<<<nb(T * fl), 256, 0, s.st>>>(d.shh, T * fl, d.xq);
     dec_mmvq(s, P + "ffn_down_shexp.weight", d.xq, d.sh, T);
-    d_ar(s, d, d.mu, d.sh, P + "post_ffw_norm.weight", T, mtp);
+    d_ar(s, d, d.mu, d.sh, P + "post_ffw_norm.weight", T, mtp, nx_after);
 }
 
 void head_rows(Shard& s, DShard& d, const float* x, int T, float* argv, int* argi) {
@@ -361,13 +417,31 @@ void verify_ops(Shard& s, DShard& d, int T) {
     const int* pp = &d.dio_v->pos;
     const DW& emb = s.w.at("token_embd.weight");
     kb_embed<<<dim3(nb(E), T), 256, 0, s.st>>>((const uint8_t*) emb.d, emb.rb, d.dio_v->toks, pp, d.X, d.X, E, hc, s.hist);
+    auto has_engram = [&](int il) {
+        for (int e : eg_layers)
+            if (e == il) return true;
+        return false;
+    };
+    const bool fuse = fuse_ok();
+    bool ready = false;   // the next sublayer's x / xq / post already made by the previous all-reduce tail
     for (int il = 0; il < L; ++il) {
         for (size_t e = 0; e < eg_layers.size(); ++e)
             if (eg_layers[e] == il) d_engram(s, d, (int) e, il, pp, T);
-        d_attention(s, d, il, pp, T, false);
-        d_ffn(s, d, il, T, false);
+        d_attention(s, d, il, pp, T, false, ready);
+        HcNext nx;
+        const HcNext* nxp = nullptr;
+        if (fuse && il + 1 < L && !has_engram(il + 1)) {
+            const std::string Pn = "blk." + std::to_string(il + 1) + ".";
+            nx = hc_next(s, Pn, "hc_attn", Pn + "attn_norm.weight", 2 * hc, hc_mag);
+            nxp = &nx;
+        } else if (fuse && il + 1 == L) {
+            nx = hc_next(s, "", "output_hc", "output_norm.weight", hc, 0.0f);
+            nxp = &nx;
+        }
+        d_ffn(s, d, il, T, false, fuse, nxp);
+        ready = nxp != nullptr;
     }
-    d_norm_in(s, d, "", "output_hc", "output_norm.weight", hc, 0.0f, T);
+    if (!ready) d_norm_in(s, d, "", "output_hc", "output_norm.weight", hc, 0.0f, T);
     HY_CK(cudaMemcpyAsync(d.h, d.x, sizeof(float) * T * E, cudaMemcpyDeviceToDevice, s.st));
     head_rows(s, d, d.x, T, d.argv, d.argi);
     const int rows = V / S;
