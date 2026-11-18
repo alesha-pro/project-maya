@@ -31,6 +31,7 @@ struct BShard {
     float* ar_buf[2] = {nullptr, nullptr};   // reduce-scatter receive [src][ts][E] bf16
     float* ag_buf[2] = {nullptr, nullptr};   // all-gather receive [T][E] fp16
     __half* yn = nullptr;                    // this shard's normalized slice [ts][E] fp16
+    const __half* pending_ag = nullptr;
     int* ag_flag = nullptr;
     Peers ag{};
     float* cb_buf[2] = {nullptr, nullptr};
@@ -53,6 +54,7 @@ struct BShard {
 };
 std::vector<BShard> bsh;
 int score_tile = 64;
+const bool fuse_hc = std::getenv("HY4F_PF_HC_FUSE") != nullptr;
 bool mtp_kv_only = std::getenv("HY4F_PF_MTP_KV_ONLY") != nullptr;
 int dma_mask = std::getenv("HY4F_PF_DMA") ? std::atoi(std::getenv("HY4F_PF_DMA")) : 0;   // RS=1, AG=2, DSA=4, residual=8
 bool paired = !std::getenv("HY4F_RING_PUSH");   // exchanges in XOR-paired phases (S a power of two)
@@ -367,6 +369,10 @@ void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int
         }
     }
     kb_wait_k<<<1, 32, 0, b.st>>>(b.ag, s.g, S, b.step);
+    if (fuse_hc && !b.mtp && hc == 4 && E == 3072 && HC_SPLIT == 16 && mbs.empty()) {
+        b.pending_ag = reinterpret_cast<const __half*>(b.ag.buf[s.g][b.step & 1]);
+        return;
+    }
     if ((dma_mask & 8) && E % 4 == 0)
         kb_ag_residual<<<dim3(nb(E / 4), T, hcn), 256, 0, b.st>>>(
             reinterpret_cast<const __half*>(b.ag.buf[s.g][b.step & 1]), X, post, E, hcn);
@@ -376,6 +382,22 @@ void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int
 
 void b_norm_in(Shard& s, BShard& b, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
                float mag, int T, size_t t0 = 0) {
+    if (fuse_hc && hc == 4 && E == 3072 && HC_SPLIT == 16 && mbs.empty()) {
+        float* X = b.X + t0 * hc * E;
+        const float* fn = f32(s, P + k + "_fn.weight");
+        const float* scale = f32(s, P + k + "_scale.weight");
+        const float* base = f32(s, P + k + "_base.weight");
+        const float* nw = f32(s, norm);
+        if (b.pending_ag) {
+            kb_hc_norm_fused<true><<<T, 1024, 0, b.st>>>(X, b.pending_ag + t0 * E, b.post + t0 * 8,
+                fn, scale, base, nw, n_mix, eps, hc_eps, mag, b.x, b.post);
+            b.pending_ag = nullptr;
+        } else {
+            kb_hc_norm_fused<false><<<T, 1024, 0, b.st>>>(X, nullptr, nullptr, fn, scale, base, nw,
+                n_mix, eps, hc_eps, mag, b.x, b.post);
+        }
+        return;
+    }
     const float* X = b.X + t0 * hc * E;
     kb_hc_mix<<<dim3(HC_SPLIT, T), 256, 0, b.st>>>(X, f32(s, P + k + "_fn.weight"), hc * E, n_mix, b.hcp, b.hcs);
     kb_hc_apply_norm<<<T, 1024, 0, b.st>>>(X, b.hcp, b.hcs, f32(s, P + k + "_scale.weight"), f32(s, P + k + "_base.weight"),
@@ -383,6 +405,10 @@ void b_norm_in(Shard& s, BShard& b, const std::string& P, const std::string& k, 
 }
 
 void b_engram(Shard& s, BShard& b, int e, int il, int pos0, int T) {
+    if (b.pending_ag) {
+        kb_ag_residual<<<dim3(nb(E / 4), T, hc), 256, 0, b.st>>>(b.pending_ag, b.X, b.post, E, hc);
+        b.pending_ag = nullptr;
+    }
     const int ng = eg_ngram, nh = eg_heads, ncol = (ng - 1) * nh;
     const std::string P = "blk." + std::to_string(il) + ".";
     kb_engram_hash<<<T, 32, 0, b.st>>>(s.hist, b.dbounds + 2, s.eg_map, (int64_t) eg_map.size(), eg_pad, s.eg_mult + (size_t) e * ng,

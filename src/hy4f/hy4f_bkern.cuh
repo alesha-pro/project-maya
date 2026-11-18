@@ -844,6 +844,96 @@ __global__ void kb_ag_post(int E, Peers P, int me, int n_shards, int step, float
     }
 }
 
+// One CTA owns one residual row. The 16 HC subreductions keep the
+// original 256-thread summation tree; the final 1024-thread RMS uses
+// exactly the same column assignment as kb_hc_apply_norm.
+template<bool ApplyResidual>
+__global__ void __launch_bounds__(1024) kb_hc_norm_fused(float* X, const __half* yn, const float* old_post,
+                    const float* __restrict__ fn, const float* __restrict__ scale, const float* __restrict__ base,
+                    const float* __restrict__ nw, int n_mix, float eps, float hc_eps, float mag,
+                    float* __restrict__ output, float* post) {
+    constexpr int E = 3072, H = 4, Splits = 16, Subgroup = 256, Chunk = (E * H) / Splits;
+    __shared__ union {
+        struct { float warp[Splits][9][8], partial[9][Splits]; } reduction;
+        float cur[E];
+    } sm;
+    __shared__ float pre[H];
+    const int t = blockIdx.x, tid = threadIdx.x, lane = tid % 32;
+    const int g = tid / Subgroup, local = tid % Subgroup, warp = local / 32;
+    const int col = g * Chunk + local;
+    X += (size_t)t * H * E;
+    float keep[H][3];
+#pragma unroll
+    for (int h = 0; h < H; ++h) {
+        const int seg = h * 4 + g;
+        float sq = 0.0f, dots[8] = {};
+        const float weight = ApplyResidual ? old_post[(size_t)t * 8 + h] : 0.0f;
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            const int c = col + j * Subgroup, i = h * E + c;
+            float v = X[i];
+            if constexpr (ApplyResidual) {
+                v += weight * __half2float(yn[(size_t)t * E + c]);
+                X[i] = v;
+            }
+            keep[h][j] = v;
+            sq += v * v;
+#pragma unroll
+            for (int r = 0; r < 8; ++r)
+                if (r < n_mix) dots[r] += fn[(size_t)r * E * H + i] * v;
+        }
+#pragma unroll
+        for (int r = 0; r < 8; ++r) {
+            const float v = warp_sum(dots[r]);
+            if (!lane) sm.reduction.warp[seg][r][warp] = v;
+        }
+        sq = warp_sum(sq);
+        if (!lane) sm.reduction.warp[seg][8][warp] = sq;
+    }
+    __syncthreads();
+    if (tid < 9 * Splits) {
+        const int r = tid / Splits, seg = tid % Splits;
+        float v = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) v += sm.reduction.warp[seg][r][i];
+        sm.reduction.partial[r][seg] = v;
+    }
+    __syncthreads();
+    if (tid < 32) {
+        const float sq = warp_sum(tid < Splits ? sm.reduction.partial[8][tid] : 0.0f);
+        const float inv = rsqrtf(sq / (E * H) + eps);
+        for (int r = 0; r < n_mix; ++r) {
+            const float v = warp_sum(tid < Splits ? sm.reduction.partial[r][tid] : 0.0f) * inv;
+            if (!tid) {
+                if (r < H) pre[r] = sigm(v * scale[0] + base[r]) + hc_eps;
+                else post[(size_t)t * 8 + r - H] = sigm(v * scale[1] + base[r]) * mag + hc_eps;
+            }
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        float v = 0;
+#pragma unroll
+        for (int h = 0; h < H; ++h) v += pre[h] * keep[h][j];
+        sm.cur[col + j * Subgroup] = v;
+    }
+    __syncthreads();
+    float sq = 0;
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const float v = sm.cur[tid + j * 1024];
+        sq += v * v;
+    }
+    const float r = rsqrtf(block_sum(sq) / E + eps);
+#pragma unroll
+    for (int j = 0; j < 3; ++j) {
+        const int c = tid + j * 1024;
+        output[(size_t)t * E + c] = sm.cur[c] * r * nw[c];
+    }
+}
+
+
 // the combine tail over fp16 slots (kb_push_cb16), per token (blockIdx.x = token): o[t][hl] for this shard's heads
 __global__ void kb_combine16(int kvl, int h0, int Hl, const float* sinks_all, Peers P, int me, int n_shards, int step,
                              int T, float* o) {
