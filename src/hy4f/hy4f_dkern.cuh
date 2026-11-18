@@ -942,6 +942,34 @@ __global__ void __launch_bounds__(NE) kd_router(const float* __restrict__ logits
 }
 
 
+// No normal rounding: each halfword is an original FP32 router coefficient's
+// high bits, and the loader proved the low bits were zero.
+__global__ void kd_router_gemv(const uint16_t* __restrict__ packed, const float* __restrict__ x,
+                               float* __restrict__ out, int cols, int rows) {
+    const int r = blockIdx.x * (blockDim.x / 32) + threadIdx.x / 32, lane = threadIdx.x & 31;
+    if (r >= rows) return;
+    const float* a = x + size_t(blockIdx.y) * cols + lane;
+    const uint4* w = reinterpret_cast<const uint4*>(packed + size_t(r) * cols) + lane;
+    float acc = 0.0f;
+    for (int c = 0; c < cols; c += 256) {
+        const uint4 v = w[c / 8];
+        const unsigned four[4] = {v.x, v.y, v.z, v.w};
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            acc += __uint_as_float(four[j] << 16) * a[c + 64*j];
+            acc += __uint_as_float(four[j] & 0xffff0000u) * a[c + 64*j + 32];
+        }
+    }
+    acc = warp_sum(acc);
+    if (!lane) out[size_t(blockIdx.y) * rows + r] = acc;
+}
+__global__ void kb_router_unpack(const uint16_t* __restrict__ packed, float* __restrict__ w, size_t size) {
+    const size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < size) {
+        const size_t orig = (i & ~size_t(255)) + ((i & 7) << 5) + ((i >> 3) & 31);
+        w[orig] = __uint_as_float(unsigned(packed[i]) << 16);
+    }
+}
 // Exact top-16 router. Merge sixteen warp-local runs four times, keeping only
 // their best sixteen entries after each merge. The low bits break ties by ID.
 __device__ __forceinline__ unsigned long long router_winner(unsigned long long v, int dist, bool want_max) {

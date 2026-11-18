@@ -505,8 +505,12 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         dec_mmvq(s, P + "ffn_down_shexp.weight", d.shq, d.sh, T, st);
         HY_CK(cudaEventRecord(d.shared_done, st));
     }
-    kb_f32_gemv<<<dim3(nb(n_exp * 32), T), 256, 0, s.st>>>(f32(s, P + "ffn_gate_inp.weight"), d.x, E, d.lg, n_exp, E, n_exp,
-                                                           1.0f);
+    const DW& rw = s.w.at(P + "ffn_gate_inp.weight");
+    if (rw.type == T_ROUTER_PACKED)
+        kd_router_gemv<<<dim3(nb(n_exp, 4), T), 128, 0, s.st>>>((const uint16_t*) rw.d, d.x, d.lg, E, n_exp);
+    else
+        kb_f32_gemv<<<dim3(nb(n_exp * 32), T), 256, 0, s.st>>>(f32(s, P + "ffn_gate_inp.weight"), d.x, E, d.lg, n_exp,
+                                                                E, n_exp, 1.0f);
     if (n_exp == 512 && K == 16 && !std::getenv("HY4F_OLD_ROUTER"))
         kd_router16<<<T, 512, 0, s.st>>>(d.lg, f32(s, P + "exp_probs_b.bias"), w_scale, e0, e1, d.eloc, d.ew);
     else {

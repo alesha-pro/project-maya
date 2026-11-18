@@ -64,6 +64,10 @@ namespace {
 
 enum : int { T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q8_0 = 8, T_Q3_K = 11, T_Q4_K = 12, T_Q6_K = 14, T_BF16 = 30, T_F8 = 43 };
 
+// Internal device layout, never a GGUF tensor type. Eight successive
+// K-iterations for each warp lane form one aligned vector.
+constexpr int T_ROUTER_PACKED = -2;
+
 size_t row_bytes(int type, int64_t n) {
     switch (type) {
     case T_F32: return (size_t) n * 4;
@@ -271,6 +275,29 @@ struct Model::Impl {
         return w;
     }
     DW up_full(Shard& s, const std::string& n) { return up_rows(s, n, 0, -1); }
+    void up_router(Shard& s, const std::string& name) {
+        const strata::GgufFile* file = nullptr;
+        const auto* tensor = T(name, &file);
+        if (std::getenv("HY4F_PACK_ROUTER") && tensor->type == T_F32 && tensor->shape.size() == 2 &&
+            tensor->shape[0] % 256 == 0) {
+            const auto* src = reinterpret_cast<const uint32_t*>(file->tensor_data(*tensor));
+            size_t count = size_t(tensor->shape[0]) * tensor->shape[1];
+            if (std::all_of(src, src + count, [](uint32_t bits) { return (bits & 65535) == 0; })) {
+                std::vector<uint16_t> packed(count);
+                for (size_t i = 0; i < count; ++i)
+                    packed[(i & ~size_t(255)) + (i & 31) * 8 + ((i >> 5) & 7)] = uint16_t(src[i] >> 16);
+                DW w;
+                w.type = T_ROUTER_PACKED;
+                w.ne[0] = tensor->shape[0]; w.ne[1] = tensor->shape[1];
+                w.rb = size_t(w.ne[0]) * sizeof(uint16_t);
+                w.d = walloc(packed.size() * sizeof(uint16_t));
+                HY_CK(cudaMemcpy(w.d, packed.data(), packed.size() * sizeof(uint16_t), cudaMemcpyHostToDevice));
+                s.w[name] = w;
+                return;
+            }
+        }
+        up_full(s, name);
+    }
     DW up_cols(Shard& s, const std::string& n, int64_t c0, int64_t c1) {
         const strata::GgufFile* f = nullptr;
         const strata::TensorInfo* t = T(n, &f);
@@ -455,7 +482,8 @@ struct Model::Impl {
                 up_concat(s, P + "dense_gu", {{P + "ffn_gate.weight", f0, f1}, {P + "ffn_up.weight", f0, f1}});
                 up_cols(s, P + "ffn_down.weight", f0, f1);
             } else {
-                for (const char* n : {"ffn_gate_inp.weight", "exp_probs_b.bias", "ffn_routed_up.weight"}) up_full(s, P + n);
+                up_router(s, P + "ffn_gate_inp.weight");
+                for (const char* n : {"exp_probs_b.bias", "ffn_routed_up.weight"}) up_full(s, P + n);
                 const int64_t e0 = ebound[g], e1 = ebound[g + 1];
                 {   // gate | up of each expert as one [2 n_ff, latent] matrix (MMQ run_glu's layout; one decode launch)
                     const strata::GgufFile *fg = nullptr, *fu = nullptr;
@@ -602,6 +630,9 @@ struct Model::Impl {
         case T_Q6_K: kn::native_q6_k_f32(d, x, s.q8, y, n_in, n_out, 1, s.st); break;
         case T_Q4_0: kn::native_q4_0_f32(d, x, s.q8, y, n_in, n_out, 1, s.st); break;
         case T_BF16: kn::bf16_gemv_fp32_mmvf(x, reinterpret_cast<const uint16_t*>(d), y, n_in, n_out, s.st); break;
+        case T_ROUTER_PACKED:
+            kd_router_gemv<<<dim3(nb(n_out, 4), 1), 128, 0, s.st>>>(reinterpret_cast<const uint16_t*>(d), x, y, n_in, n_out);
+            break;
         case T_F32: k_f32_gemv<<<nb(n_out, 8), 256, 0, s.st>>>(reinterpret_cast<const float*>(d), x, y, n_in, n_out); break;
         default: throw std::runtime_error("hy4f: gemv type " + std::to_string(w.type));
         }

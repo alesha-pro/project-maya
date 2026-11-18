@@ -4,6 +4,7 @@
 // exchanges as eager push / wait kernels with a host step counter.  Launched eagerly from the per-shard threads.
 
 struct BShard {
+    float* unpacked_router = nullptr;
     int Tmax = 0;
     cudaStream_t st = nullptr;   // this micro-batch's stream (A: the shard's stream, B: its own)
     // the SWA chunk buffer as this pass sees it (micro-batches share one per layer parity): kv rows written at chunk_off,
@@ -85,6 +86,8 @@ struct Bump {
 void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_CK(cudaSetDevice(s.dev));
     b.Tmax = Tmax;
+    if (std::any_of(s.w.begin(), s.w.end(), [](const auto& e) { return e.second.type == T_ROUTER_PACKED; }))
+        b.unpacked_router = dalloc(size_t(n_exp) * E);
     if (!b.st) b.st = s.st;
     if (S == 1) attn_tile = Tmax;   // (the single-GPU attention falls back to kb_attn2 over the whole chunk)
     const int T = Tmax, K = n_used, QH = nope + rope, Hmax = std::max(Hd, Hs);
@@ -260,9 +263,14 @@ void batch_setup(int Tmax) {
 void blin(Shard& s, BShard& b, const DW& w, const float* x, int ldx, float* y, int ldy, int T) {
     namespace mq = strata::prefill::mmq;
     const int cols = (int) w.ne[0], rows = (int) (w.ne[1] * w.ne[2]);
-    if (w.type == T_F32) {
+    if (w.type == T_F32 || w.type == T_ROUTER_PACKED) {
+        const float* matrix = (const float*)w.d;
+        if (w.type == T_ROUTER_PACKED) {
+            kb_router_unpack<<<nb(rows * cols), 256, 0, b.st>>>((const uint16_t*)w.d, b.unpacked_router, size_t(rows) * cols);
+            matrix = b.unpacked_router;
+        }
         const float one = 1.0f, zero = 0.0f;
-        HY_BL(cublasSgemm(b.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, T, cols, &one, (const float*) w.d, cols, x, ldx, &zero, y,
+        HY_BL(cublasSgemm(b.blas, CUBLAS_OP_T, CUBLAS_OP_N, rows, T, cols, &one, matrix, cols, x, ldx, &zero, y,
                           ldy));
         return;
     }
