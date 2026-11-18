@@ -94,7 +94,7 @@ public:
     /// copy the rings (trunk and MTP layer) as they are now (the prompt read, before the answer): a later rewind to
     /// this position, or to the one before it, gets them back - the next turn of a chat whose template drops the
     /// answer's reasoning
-    bool mark(std::string& err);
+    bool mark(std::string& err, bool aligned_start = false);
     // Save one chunk-aligned prefix before a long prompt's tail.
     bool mark_prefix(std::string& err);
 

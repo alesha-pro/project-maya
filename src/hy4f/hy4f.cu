@@ -1428,6 +1428,7 @@ bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
 // pooled groups and indexer ring: its ring is copied and restored with the trunk's; elsewhere it is best effort - a
 // stale MTP row only costs draft acceptance, never a token (every draft is verified by the trunk).
 struct Model::Snap {
+    bool aligned_start = false;
     int64_t pos = -1;                                   // the position mark() copied at (-1: none)
     std::vector<int> devices;
     ~Snap() {
@@ -1508,7 +1509,7 @@ bool Model::mark_prefix(std::string& err) {
     }
 }
 
-bool Model::mark(std::string& err) {
+bool Model::mark(std::string& err, bool aligned_start) {
     try {
         Impl& d = *d_;
         const int Lm = d.L + (d.has_mtp ? 1 : 0);
@@ -1546,6 +1547,7 @@ bool Model::mark(std::string& err) {
             HY_CK(cudaStreamSynchronize(s.st));
         }
         snap_->pos = d.pos_next;
+        snap_->aligned_start = aligned_start;
         return true;
     } catch (const std::exception& e) {
         if (snap_) snap_->pos = -1;
@@ -1573,7 +1575,7 @@ int64_t Model::rewind(int64_t pos, std::string& err, bool restore_prompt) {
             const int64_t down = has_dsa ? pos - pos % d.kpool : 0;
             const bool can_round = down > 0 && keeps(down, hw_);
             const bool earlier_turn = std::getenv("HY4F_PREFIX_TURN_MARK") && m > 0 && m < pos &&
-                                      !can_round && m >= prefix_pos_;
+                                      !can_round && m >= prefix_pos_ && snap_->aligned_start;
             if (earlier_turn || (m > 0 && (pos == m || pos == m - 1) && keeps(pos, m))) {
                 if (earlier_turn) pos = m;
                 for (auto& s : d.sh) {

@@ -690,7 +690,7 @@ int serve(Model& m, const ServeOptions& so) {
             std::fflush(stdout);
             continue;
         }
-        if (mark_ok && !full_hit && !m.mark(err)) {   // (the rings at the prompt's end: the next turn may go back here)
+        if (mark_ok && !full_hit && !m.mark(err, from % CH == 0 && n % CH == 0)) {   // (the rings at the prompt's end: the next turn may go back here)
             std::fprintf(stderr, "maya hy4f serve: no copy of the rings (%s) - a turn that departs from the answer "
                                  "reads its prompt again\n", err.c_str());
             mark_ok = false;
