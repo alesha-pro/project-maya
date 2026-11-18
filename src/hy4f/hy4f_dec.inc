@@ -14,6 +14,7 @@ static constexpr int DT = 6;   // (the DFly build: the block = bonus + 5 drafts;
 static constexpr int DT = 4;   // (6 costs ~40 MB per GPU and ~3% of prefill / T<=4 decode: the default build stays at 4)
 #endif
 static constexpr int NSP = 16;
+bool short_graphs = std::getenv("HY4F_SHORT_GRAPH") != nullptr;
 int moe_blocks = std::getenv("HY4F_MOE_BLOCKS") ? std::atoi(std::getenv("HY4F_MOE_BLOCKS")) : 328;
 int dec_score_blocks = std::getenv("HY4F_DEC_SCORE_BLOCKS") ? std::atoi(std::getenv("HY4F_DEC_SCORE_BLOCKS")) : 256;   // split-K blocks per token of the decode attention
 bool push_all = std::getenv("HY4F_PUSH_ALL") != nullptr;
@@ -52,6 +53,7 @@ struct DShard {
     float* cb_buf[2] = {nullptr, nullptr};
     int *ar_flag = nullptr, *cb_flag = nullptr, *ar_ctr = nullptr, *cb_ctr = nullptr, *arrive = nullptr;
     PeersD ar{}, cb{};
+    cudaGraphExec_t gv_short[DT + 1] = {}, gm_short[DT + 1] = {}, gc_short = nullptr;
     cudaGraphExec_t gv[DT + 1] = {}, gm[DT + 1] = {}, gc = nullptr;   // verify(T), mtp(T), the chained draft
 };
 std::vector<DShard> dsh;
@@ -256,12 +258,12 @@ void d_engram(Shard& s, DShard& d, int e, int il, const int* pp, int T) {
                                         1.1920929e-07f, nullptr);
 }
 
-void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false) {
+void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false, bool dense_dsa = false) {
     const std::string P = "blk." + std::to_string(il) + ".";
     const bool sw = swa[il] != 0;
     const int Hl = sw ? Hs / S : Hd / S, QH = nope + rope;
     const float th = sw ? theta_swa : theta;
-    const int xpc = rows_of(s, P + "xproj"), qpc = rows_of(s, P + "qproj");
+    const int xpc = rows_of(s, P + "xproj"), qpc = !sw && dense_dsa ? Hd * QH : rows_of(s, P + "qproj");
     const int oq = 0, okv = q_lora, og = q_lora + KV_ROW, oik = og + Hl * vh;
     if (!ready) {
         if (mtp) kb_rms<<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "attn_norm.weight"), E, eps, d.x, E);
@@ -273,7 +275,10 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     kb_kv_prep<<<T, 576, 0, s.st>>>(d.xp + okv, xpc, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th, s.kv[il], pp,
                                     sw ? 3 : 2, S, s.g, win + RING_PAD);
     k_q8<<<nb(T * q_lora), 256, 0, s.st>>>(d.qr, T * q_lora, d.xq);
-    dec_mmvq(s, P + "qproj", d.xq, d.qp, T);
+    if (!sw && dense_dsa) {
+        const DW& q = s.w.at(P + "qproj");
+        kn::native_q8_0_mmvq(q.d, d.xq, d.qp, (int) q.ne[0], qpc, T, s.st);
+    } else dec_mmvq(s, P + "qproj", d.xq, d.qp, T);
     const DW& kb = s.w.at(P + "attn_k_b.weight");
     const DW& vb = s.w.at(P + "attn_v_b.weight");
     const float scale = 1.0f / std::sqrt((float) QH);
@@ -305,7 +310,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         }
     } else {
         float* iq = d.qp + (size_t) Hd * QH;
-        kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, s.st>>>(iq, qpc, IH, IK, IK - rope, rope, pp, th);
+        if (!dense_dsa) kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, s.st>>>(iq, qpc, IH, IK, IK - rope, rope, pp, th);
         kb_rms<<<T, 128, 0, s.st>>>(d.xp + oik, xpc, f32(s, P + "indexer.k_norm.weight"), IK, eps, d.ikn, IK);
         const DW& ivw = s.w.at(P + "ivg");
         kb_q8_gemv<<<dim3(nb(2 * IK * 32), T), 256, 0, s.st>>>((const uint8_t*) ivw.d, d.ikn, IK, d.ivg, 2 * IK, IK, 2 * IK);
@@ -313,37 +318,39 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                                                         f32(s, P + "indexer_compressor_norm.weight"), s.pooled[il], IK,
                                                         kpool, rope, eps, th);
         kb_ring_chunk<<<IRING, 256, 0, s.st>>>(d.ivg, s.ring[il], T, pp, IK, kpool);
-        kb_f32_gemv<<<dim3(nb(IH * 32), T), 256, 0, s.st>>>(f32(s, P + "indexer.proj.weight"), d.x, E, d.iw, IH, E, IH,
-                                                            1.0f / std::sqrt((float) (IK * IH)));
-        const int ld_sc = (int) (o.max_context / kpool + 1);
-        if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))   // (grid for the whole context: the graph is fixed)
-            (T <= 4 ? kb_score_tc : kd_score_tc8)<<<dim3(dec_score_blocks, 1), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, kpool,
-                                                                                         top_k, pp, 0, T, ld_sc - 1, d.score, ld_sc);
-        else
-            kb_score<<<dim3(nb(ld_sc * 32), T), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, IK, IH, kpool, top_k, pp, 0,
-                                                                d.score, ld_sc);
-        if (std::getenv("HY4F_OLD_SELECT")) {
-            kb_select_kpool<1024><<<T, 1024, 0, s.st>>>(d.score, ld_sc, pp, 0, 0, kpool, top_k, top_k / kpool - tail, n_cap,
-                                                       d.cells);
-        } else {   // (multi-block: 32 blocks per token)
-            const int tp = top_k / kpool - tail;
-            kd_sel_init<<<T, 256, 0, s.st>>>(pp, kpool, tp, d.sel_st, d.sel_hist);
-            const int shifts[3] = {21, 10, 0}, widths[3] = {11, 11, 10};
-            for (int p2 = 0; p2 < 3; ++p2) {
-                kd_sel_hist<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, d.sel_st, d.sel_hist,
-                                                               shifts[p2], widths[p2]);
-                kd_sel_resolve<<<T, 1024, 0, s.st>>>(pp, top_k, d.sel_st, d.sel_hist, shifts[p2], widths[p2]);
+        if (!dense_dsa) {
+            kb_f32_gemv<<<dim3(nb(IH * 32), T), 256, 0, s.st>>>(f32(s, P + "indexer.proj.weight"), d.x, E, d.iw, IH, E, IH,
+                                                                1.0f / std::sqrt((float) (IK * IH)));
+            const int ld_sc = (int) (o.max_context / kpool + 1);
+            if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))   // (grid for the whole context: the graph is fixed)
+                (T <= 4 ? kb_score_tc : kd_score_tc8)<<<dim3(dec_score_blocks, 1), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, kpool,
+                                                                                             top_k, pp, 0, T, ld_sc - 1, d.score, ld_sc);
+            else
+                kb_score<<<dim3(nb(ld_sc * 32), T), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, IK, IH, kpool, top_k, pp, 0,
+                                                                    d.score, ld_sc);
+            if (std::getenv("HY4F_OLD_SELECT")) {
+                kb_select_kpool<1024><<<T, 1024, 0, s.st>>>(d.score, ld_sc, pp, 0, 0, kpool, top_k, top_k / kpool - tail, n_cap,
+                                                           d.cells);
+            } else {   // (multi-block: 32 blocks per token)
+                const int tp = top_k / kpool - tail;
+                kd_sel_init<<<T, 256, 0, s.st>>>(pp, kpool, tp, d.sel_st, d.sel_hist);
+                const int shifts[3] = {21, 10, 0}, widths[3] = {11, 11, 10};
+                for (int p2 = 0; p2 < 3; ++p2) {
+                    kd_sel_hist<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, d.sel_st, d.sel_hist,
+                                                                   shifts[p2], widths[p2]);
+                    kd_sel_resolve<<<T, 1024, 0, s.st>>>(pp, top_k, d.sel_st, d.sel_hist, shifts[p2], widths[p2]);
+                }
+                kd_sel_count<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, d.sel_st, d.sel_bc);
+                kd_sel_write<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, tp, n_cap, d.sel_st, d.sel_bc,
+                                                                d.cells);
             }
-            kd_sel_count<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, d.sel_st, d.sel_bc);
-            kd_sel_write<<<dim3(SEL_NB, T), 256, 0, s.st>>>(d.score, ld_sc, pp, kpool, top_k, tp, n_cap, d.sel_st, d.sel_bc,
-                                                            d.cells);
         }
         if (!mtp && !dfs.empty() && df_slot[il] >= 0)   // (the DFly drafter reads this layer's top-k of every row)
             HY_CK(cudaMemcpyAsync(dfs[s.g].snap + (size_t) df_slot[il] * DT * n_cap, d.cells, sizeof(int) * T * n_cap,
                                   cudaMemcpyDeviceToDevice, s.st));
         if (S > 1) {
             if (split && Hd == 32) {
-                kd_mqa_dec<32><<<dim3(NSP, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
+                (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>)<<<dim3(NSP, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
                                                                            n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
                                                                            d.spacc);
                 kd_mqa_merge<<<dim3(Hd, T), 256, 0, s.st>>>(d.spm, d.spl, d.spacc, NSP, Hd, nullptr, nullptr, d.part, CBW());
@@ -468,9 +475,10 @@ void head_rows(Shard& s, DShard& d, const float* x, int T, float* argv, int* arg
     kd_argmax<<<T, 1024, 0, s.st>>>(d.logits, rows, s.g * rows, argv, argi);
 }
 
-void verify_ops(Shard& s, DShard& d, int T) {
+void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false) {
     HY_CK(cudaMemcpyAsync(d.dio_v, hio_v, sizeof(IoT), cudaMemcpyHostToDevice, s.st));
     const int* pp = &d.dio_v->pos;
+    if (dense_dsa) kd_dense_cells<<<dim3(nb(n_cap), T), 256, 0, s.st>>>(pp, n_cap, d.cells);
     const DW& emb = s.w.at("token_embd.weight");
     kb_embed<<<dim3(nb(E), T), 256, 0, s.st>>>((const uint8_t*) emb.d, emb.rb, d.dio_v->toks, pp, d.X, d.X, E, hc, s.hist);
     auto has_engram = [&](int il) {
@@ -483,7 +491,7 @@ void verify_ops(Shard& s, DShard& d, int T) {
     for (int il = 0; il < L; ++il) {
         for (size_t e = 0; e < eg_layers.size(); ++e)
             if (eg_layers[e] == il) d_engram(s, d, (int) e, il, pp, T);
-        d_attention(s, d, il, pp, T, false, ready);
+        d_attention(s, d, il, pp, T, false, ready, dense_dsa);
         HcNext nx;
         const HcNext* nxp = nullptr;
         if (fuse && il + 1 < L && !has_engram(il + 1)) {
@@ -507,9 +515,10 @@ void verify_ops(Shard& s, DShard& d, int T) {
     HY_CK(cudaMemcpyAsync(hargi + (size_t) s.g * DT, d.argi, sizeof(int) * T, cudaMemcpyDeviceToHost, s.st));
 }
 
-void mtp_ops(Shard& s, DShard& d, int T, bool chain = false) {
+void mtp_ops(Shard& s, DShard& d, int T, bool chain = false, bool dense_dsa = false) {
     HY_CK(cudaMemcpyAsync(d.dio_m, hio_m, sizeof(IoT), cudaMemcpyHostToDevice, s.st));
     const int* pp = &d.dio_m->pos;
+    if (dense_dsa) kd_dense_cells<<<dim3(nb(n_cap), T), 256, 0, s.st>>>(pp, n_cap, d.cells);
     const std::string P = "blk." + std::to_string(L) + ".";
     const DW& emb = s.w.at("token_embd.weight");
     kd_embed_rows<<<dim3(nb(E), T), 256, 0, s.st>>>((const uint8_t*) emb.d, emb.rb, d.dio_m->toks, E, d.me);
@@ -518,7 +527,7 @@ void mtp_ops(Shard& s, DShard& d, int T, bool chain = false) {
     kb_rms<<<T, 1024, 0, s.st>>>(chain ? d.mh : d.h, E, f32(s, P + "nextn.hnorm.weight"), E, eps, d.cat + E, 2 * E);
     k_q8<<<nb(T * 2 * E), 256, 0, s.st>>>(d.cat, T * 2 * E, d.xq);
     dec_mmvq(s, P + "nextn.eh_proj.weight", d.xq, d.mr, T);
-    d_attention(s, d, L, pp, T, true);
+    d_attention(s, d, L, pp, T, true, false, dense_dsa);
     d_ffn(s, d, L, T, true);
     kb_rms<<<1, 1024, 0, s.st>>>(d.mr + (size_t) (T - 1) * E, E, f32(s, P + "nextn.shared_head_norm.weight"), E, eps, d.mh, E);
     head_rows(s, d, d.mh, 1, d.argv + DT - 1, d.argi + DT - 1);
@@ -560,6 +569,8 @@ void dec_setup() {
         HY_CK(cudaFuncSetAttribute(kd_ar_post, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) (sizeof(float) * DT * E)));
         HY_CK(cudaFuncSetAttribute(kd_mqa_dec<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqd_smem<16>()));
         HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqd_smem<32>()));
+        if (short_graphs)
+            HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqd_smem<32>()));
         if (std::getenv("HY4F_DEC_EAGER")) {   // (debug: one eager verify per T with a check after it)
             for (int T = 1; T <= DT; ++T) {
                 hio_v->pos = 0;
@@ -569,29 +580,32 @@ void dec_setup() {
             }
         }
         DShard& d = dsh[s.g];
-        for (int T = 1; T <= DT; ++T) {
-            cudaGraph_t gr = nullptr;
-            // (MMVQ with 5..8 columns: the upstream layout's 2-warp reduction is not bitwise equal to one column; the
-            // verify rows must equal plain steps (spec == greedy), so T >= 5 takes the exact layout)
-            kn::native_mmvq_set_multi_exact(T >= 5 && !std::getenv("HY4F_FAST_T56"));
-            HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
-            verify_ops(s, d, T);
-            HY_CK(cudaStreamEndCapture(s.st, &gr));
-            kn::native_mmvq_set_multi_exact(false);
-            HY_CK(cudaGraphInstantiate(&d.gv[T], gr, 0));
-            HY_CK(cudaGraphDestroy(gr));
-            if (has_mtp) {
+        for (int mode = 0; mode <= int(short_graphs); ++mode) {
+            const bool dense_dsa = mode != 0;
+            for (int T = 1; T <= DT; ++T) {
+                cudaGraph_t gr = nullptr;
+                // (MMVQ with 5..8 columns: the upstream layout's 2-warp reduction is not bitwise equal to one column; the
+                // verify rows must equal plain steps (spec == greedy), so T >= 5 takes the exact layout)
+                kn::native_mmvq_set_multi_exact(T >= 5 && !std::getenv("HY4F_FAST_T56"));
                 HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
-                mtp_ops(s, d, T);
+                verify_ops(s, d, T, dense_dsa);
                 HY_CK(cudaStreamEndCapture(s.st, &gr));
-                HY_CK(cudaGraphInstantiate(&d.gm[T], gr, 0));
+                kn::native_mmvq_set_multi_exact(false);
+                HY_CK(cudaGraphInstantiate(dense_dsa ? &d.gv_short[T] : &d.gv[T], gr, 0));
                 HY_CK(cudaGraphDestroy(gr));
-                if (T == 1) {
+                if (has_mtp) {
                     HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
-                    mtp_ops(s, d, 1, true);
+                    mtp_ops(s, d, T, false, dense_dsa);
                     HY_CK(cudaStreamEndCapture(s.st, &gr));
-                    HY_CK(cudaGraphInstantiate(&d.gc, gr, 0));
+                    HY_CK(cudaGraphInstantiate(dense_dsa ? &d.gm_short[T] : &d.gm[T], gr, 0));
                     HY_CK(cudaGraphDestroy(gr));
+                    if (T == 1) {
+                        HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
+                        mtp_ops(s, d, 1, true, dense_dsa);
+                        HY_CK(cudaStreamEndCapture(s.st, &gr));
+                        HY_CK(cudaGraphInstantiate(dense_dsa ? &d.gc_short : &d.gc, gr, 0));
+                        HY_CK(cudaGraphDestroy(gr));
+                    }
                 }
             }
         }
@@ -601,8 +615,12 @@ void dec_setup() {
 }
 
 void dec_launch(bool mtp, int T, bool chain = false) {
+    const bool dense_dsa = short_graphs && (mtp ? hio_m : hio_v)->pos + T <= top_k;
     launch_parallel([&](Shard& s) {
-        HY_CK(cudaGraphLaunch(chain ? dsh[s.g].gc : mtp ? dsh[s.g].gm[T] : dsh[s.g].gv[T], s.st));
+        DShard& d = dsh[s.g];
+        const cudaGraphExec_t graph = dense_dsa ? (chain ? d.gc_short : mtp ? d.gm_short[T] : d.gv_short[T])
+                                                : (chain ? d.gc : mtp ? d.gm[T] : d.gv[T]);
+        HY_CK(cudaGraphLaunch(graph, s.st));
     });
     for (auto& s : sh) {
         HY_CK(cudaSetDevice(s.dev));

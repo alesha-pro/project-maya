@@ -475,6 +475,13 @@ __global__ void kd_cb_tail(const float* __restrict__ part, int T, int H, int kvl
 // cells as kb_select_kpool (top k groups by hy4f_key, ties taken in index order, then the current group's tail), the
 // groups in index order.  st [T][4] = prefix, mask, kk (ties left), -; hist [T][2048]; bc [T][NB][2] = (gt, eq) per block.
 constexpr int SEL_NB = 32;
+// Before sparse selection starts, every DSA layer sees the same consecutive prefix.
+__global__ void kd_dense_cells(const int* pos0p, int cap, int* out) {
+    const int t = blockIdx.y, pos = *pos0p + t;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < cap) out[(size_t) t * cap + i] = i <= pos ? i : -1;
+}
+
 __global__ void kd_sel_init(const int* pos0p, int kpool, int top_pools, unsigned* st, unsigned* hist) {
     const int t = blockIdx.x, pos = *pos0p + t, n_pool = pos / kpool;
     if (threadIdx.x == 0) st[t * 4] = 0, st[t * 4 + 1] = 0, st[t * 4 + 2] = (unsigned) min(top_pools, n_pool), st[t * 4 + 3] = 0;

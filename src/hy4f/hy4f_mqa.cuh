@@ -256,7 +256,7 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
 // folds the splits (with the sink, or into the combine's partial).  Same tile math as kb_mqa_attn.
 template <int H> constexpr size_t mqd_smem() { return mqa_smem<H>(); }
 
-template <int H>
+template <int H, bool DenseDsa = false>
 __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs, const float* __restrict__ q, int ldq,
                                                   int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                   const int* __restrict__ cells, int n_cap, const int* pos0p, int win,
@@ -292,7 +292,9 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
         Qs[(size_t) h * LD + c] = __float2half_rn(v * scale);
     }
     int n, lo = 0;
-    if (!cells) {
+    if constexpr (DenseDsa) {
+        n = (pos + n_shards - shard) / n_shards;
+    } else if (!cells) {
         lo = max(0, pos - win + 1);
         n = pos - lo + 1;
     } else {
@@ -330,7 +332,10 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
             if (tid < TR) {
                 const int s2 = r0 + tid;
                 const uint8_t* p = nullptr;
-                if (s2 < re) p = !cells ? kv + (size_t) ((lo + s2) % (win + RING_PAD)) * KV_RB : kv + (size_t) cl[s2] * KV_RB;
+                if (s2 < re) {
+                    if constexpr (DenseDsa) p = kv + (size_t) s2 * KV_RB;
+                    else p = !cells ? kv + (size_t) ((lo + s2) % (win + RING_PAD)) * KV_RB : kv + (size_t) cl[s2] * KV_RB;
+                }
                 rowp[tid] = p;
             }
             __syncthreads();
