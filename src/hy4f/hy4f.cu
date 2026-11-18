@@ -20,6 +20,7 @@
 #include "hy4f_swa_prefill.cuh"
 #include "hy4f_dsa_prefill.cuh"
 #include "hy4f_dkern.cuh"
+#include "hy4f_q3packed.cuh"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -990,6 +991,8 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
         Impl& d = *d_;
         if (pos > d.pos_next) throw std::runtime_error("hy4f: prefill out of order");
         if (pos + n > d.o.max_context) throw std::runtime_error("hy4f: context full");
+        const auto t_start = std::chrono::steady_clock::now();
+        d.change_q3_layout(false);
         if (chunk <= 0) chunk = 1024;
         // two micro-batches (overlap one half's exchanges with the other's compute) unless HY4F_MB=1
         // (experimental, off by default: measured slower - MMQ / attention fill the SMs, the SM-based exchanges cannot run
@@ -1002,7 +1005,6 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
             d.batch_setup(tmax);
             if (mb) d.mb_setup(tmax);
         }
-        const auto t_start = std::chrono::steady_clock::now();
         for (int c0 = 0; c0 < n; c0 += chunk) {
             const int T = std::min(chunk, n - c0);
             const bool last = c0 + T == n;
@@ -1236,6 +1238,7 @@ bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
         if (pos > d.pos_next) throw std::runtime_error("hy4f: step out of order");
         if (pos >= d.o.max_context) throw std::runtime_error("hy4f: context full");
         d.hio->pos = (int) pos;
+        d.change_q3_layout(false);
         d.hio->tok = token;
         if (d.graphs) {
             // the shards' graphs launched from one host thread each: a 2500-node launch costs ~4 ms of CPU, and the

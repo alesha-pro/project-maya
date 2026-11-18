@@ -15,6 +15,34 @@ static constexpr int DT = 4;   // (6 costs ~40 MB per GPU and ~3% of prefill / T
 #endif
 static constexpr int NSP = 16;
 bool short_graphs = std::getenv("HY4F_SHORT_GRAPH") != nullptr;
+bool q3_pair_layout = DT == 4 && std::getenv("HY4F_PACK_Q3") && !std::getenv("HY4F_IDS_LOOP")
+                      && !std::getenv("HY4F_DEC_EAGER");
+bool q3_packed = false, q3_layout_failed = false;
+bool q3_eligible(const DW& w) const {
+    return w.type == T_Q3_K && w.ne[0] == 1536 && (w.ne[1] == 1536 || w.ne[1] == 3072);
+}
+void change_q3_layout(bool packed) {
+    if (q3_layout_failed) throw std::runtime_error("hy4f: expert layout conversion failed; reload the model");
+    if (!q3_pair_layout || packed == q3_packed) return;
+    q3_layout_failed = true;
+    launch_parallel([&](Shard& s) {
+        for (int il = dense_lead; il < L + int(has_mtp); ++il) {
+            const auto p = "blk." + std::to_string(il) + ".";
+            for (const char* suffix : {"ffn_gu_exps", "ffn_down_exps.weight"}) {
+                const auto& w = s.w.at(p + suffix);
+                if (!q3_eligible(w)) continue;
+                const int pairs = int(w.rb * size_t(w.ne[1]) * size_t(w.ne[2]) / sizeof(packed_q3::Pair));
+                const int grid = std::min(4096, (pairs + 7) / 8);
+                if (packed) packed_q3::convert_pairs<true><<<grid, 256, 0, s.st>>>((unsigned*)w.d, pairs);
+                else packed_q3::convert_pairs<false><<<grid, 256, 0, s.st>>>((unsigned*)w.d, pairs);
+                HY_CK(cudaGetLastError());
+            }
+        }
+        HY_CK(cudaStreamSynchronize(s.st));
+    });
+    q3_packed = packed;
+    q3_layout_failed = false;
+}
 int moe_blocks = std::getenv("HY4F_MOE_BLOCKS") ? std::atoi(std::getenv("HY4F_MOE_BLOCKS")) : 328;
 int dec_score_blocks = std::getenv("HY4F_DEC_SCORE_BLOCKS") ? std::atoi(std::getenv("HY4F_DEC_SCORE_BLOCKS")) : 256;   // split-K blocks per token of the decode attention
 bool push_all = std::getenv("HY4F_PUSH_ALL") != nullptr;
@@ -574,6 +602,10 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out) {
         const size_t eb = w.rb * (size_t) w.ne[1];
         if (grouped) {
+            if (q3_pair_layout && q3_eligible(w)) {
+                packed_q3::forward(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, xq, y, n_out, moe_blocks, s.st);
+                return;
+            }
             if (w.type == T_Q3_K)
                 (mp ? kn::native_q3_k_mmvq_grouped_mp : kn::native_q3_k_mmvq_grouped)(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot,
                                                                                     xq, y, n_in, n_out, moe_blocks, s.st);
@@ -765,6 +797,7 @@ void dec_setup() {
 
 void dec_launch(bool mtp, int T, bool chain = false) {
     const bool dense_dsa = short_graphs && (mtp ? hio_m : hio_v)->pos + T <= top_k;
+    change_q3_layout(true);
     launch_parallel([&](Shard& s) {
         DShard& d = dsh[s.g];
         DecodeGraph& graph = chain ? d.gc : mtp ? d.gm[T] : d.gv[T];
