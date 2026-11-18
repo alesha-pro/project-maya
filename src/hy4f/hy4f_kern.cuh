@@ -878,5 +878,16 @@ __global__ void k_ring_pool(const float* ivg, float* ring, const float* ape, con
     if (d < kd) pooled[(size_t) g * kd + d] = vals[d];
 }
 
+// SwiGLU (+ clamp) of [rows][gate n_ff | up n_ff] -> Q8_1 of rows * n_ff (row-major h)
+__global__ void k_swiglu_gu_q8(const float* gu, int n_ff, int n, float lim, Q81* q) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    float v = 0.0f;
+    if (i < n) {
+        const int r = i / n_ff, c = i % n_ff;
+        const float g = fminf(gu[(size_t) r * 2 * n_ff + c], lim), u = fminf(fmaxf(gu[(size_t) r * 2 * n_ff + n_ff + c], -lim), lim);
+        v = silu(g) * u;
+    }
+    if ((i & ~31) < n) q81_store(q + i / 32, v);
+}
 }  // namespace kern
 }  // namespace strata::hy4f

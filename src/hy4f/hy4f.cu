@@ -360,10 +360,30 @@ struct Model::Impl {
             } else {
                 for (const char* n : {"ffn_gate_inp.weight", "exp_probs_b.bias", "ffn_routed_up.weight"}) up_full(s, P + n);
                 const int64_t e0 = (int64_t) g * n_exp / S, e1 = (int64_t) (g + 1) * n_exp / S;
-                for (const char* n : {"ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"}) {
-                    const strata::GgufFile* f = nullptr;
-                    const int64_t per = (int64_t) T(P + n, &f)->shape[1];
-                    up_rows(s, P + n, e0 * per, e1 * per);
+                {   // gate | up of each expert as one [2 n_ff, latent] matrix (MMQ run_glu's layout; one decode launch)
+                    const strata::GgufFile *fg = nullptr, *fu = nullptr;
+                    const strata::TensorInfo* tg = T(P + "ffn_gate_exps.weight", &fg);
+                    const strata::TensorInfo* tu = T(P + "ffn_up_exps.weight", &fu);
+                    if (tg->type != tu->type) throw std::runtime_error("hy4f: gate/up expert types differ in " + P);
+                    const int64_t per = (int64_t) tg->shape[1];
+                    const size_t rb = row_bytes((int) tg->type, (int64_t) tg->shape[0]), eb = rb * (size_t) per;
+                    std::vector<uint8_t> h(2 * eb * (size_t) (e1 - e0));
+                    for (int64_t e = e0; e < e1; ++e) {
+                        std::memcpy(h.data() + 2 * eb * (size_t) (e - e0), fg->tensor_data(*tg) + eb * (size_t) e, eb);
+                        std::memcpy(h.data() + 2 * eb * (size_t) (e - e0) + eb, fu->tensor_data(*tu) + eb * (size_t) e, eb);
+                    }
+                    DW w;
+                    w.type = (int) tg->type;
+                    w.ne[0] = (int64_t) tg->shape[0];
+                    w.ne[1] = 2 * per;
+                    w.ne[2] = e1 - e0;
+                    w.rb = rb;
+                    HY_CK(cudaMalloc(&w.d, h.size()));
+                    HY_CK(cudaMemcpy(w.d, h.data(), h.size(), cudaMemcpyHostToDevice));
+                    s.w[P + "ffn_gu_exps"] = w;
+                    const strata::GgufFile* fd = nullptr;
+                    const int64_t pd = (int64_t) T(P + "ffn_down_exps.weight", &fd)->shape[1];
+                    up_rows(s, P + "ffn_down_exps.weight", e0 * pd, e1 * pd);
                 }
                 const int64_t f0 = (int64_t) g * n_ffx / S, f1 = (int64_t) (g + 1) * n_ffx / S;
                 // x -> [routed_down | shared gate (own) | shared up (own)]
@@ -422,7 +442,7 @@ struct Model::Impl {
         s.mu = dalloc(E);
         s.sh = dalloc(E);
         s.ffn = dalloc(E);
-        s.ga16 = dalloc((size_t) n_used * n_ffx);
+        s.ga16 = dalloc((size_t) n_used * 2 * n_ffx);
         s.up16 = dalloc((size_t) n_used * n_ffx);
         s.dn16 = dalloc((size_t) n_used * latent);
         auto qalloc = [&](int n) {
@@ -613,9 +633,8 @@ struct Model::Impl {
             else if (w.type == T_Q4_K) kn::native_q4_k_mmvq_ids(w.d, eb, s.eloc, n_used, xq, shared, y, n_in, n_out, s.st);
             else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
         };
-        ids_mmvq(s.w.at(P + "ffn_gate_exps.weight"), s.xlq, true, s.ga16, latent, n_ffx);
-        ids_mmvq(s.w.at(P + "ffn_up_exps.weight"), s.xlq, true, s.up16, latent, n_ffx);
-        k_swiglu_q8<<<nb(n_used * n_ffx), 256, 0, s.st>>>(s.ga16, s.up16, n_used * n_ffx, clampv, s.q16, nullptr);
+        ids_mmvq(s.w.at(P + "ffn_gu_exps"), s.xlq, true, s.ga16, latent, 2 * n_ffx);   // [n_used][gate | up]
+        k_swiglu_gu_q8<<<nb(n_used * n_ffx), 256, 0, s.st>>>(s.ga16, n_ffx, n_used * n_ffx, clampv, s.q16);
         ids_mmvq(s.w.at(P + "ffn_down_exps.weight"), s.q16, false, s.dn16, n_ffx, latent);
         k_moe_sum<<<nb(latent), 256, 0, s.st>>>(s.moe, s.dn16, s.ew, s.eloc, n_used, latent);
         k_q8<<<nb(latent), 256, 0, s.st>>>(s.moe, latent, s.moeq);
