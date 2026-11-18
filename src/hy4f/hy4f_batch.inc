@@ -676,7 +676,8 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
         b_ar_post(s, b, b.ffo, P + "post_ffw_norm.weight", T);
         return;
     }
-    const int K = n_used, e0 = ebound[s.g], nl = ebound[s.g + 1] - ebound[s.g], fl = n_ffx / S;
+    const auto& ownership = expert_bounds(il);
+    const int K = n_used, e0 = ownership[s.g], nl = ownership[s.g + 1] - ownership[s.g], fl = n_ffx / S;
     blin(s, b, P + "ffn_gate_inp.weight", b.x, E, b.lg, n_exp, T);
     router(s, b.lg, f32(s, P + "exp_probs_b.bias"), T, b.eids, b.ew, b.st);
     kb_moe_count<<<nl, 256, 0, b.st>>>(b.eids, T * K, e0, b.mcnt);

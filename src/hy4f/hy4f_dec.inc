@@ -603,7 +603,8 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         d_ar(s, d, d.ffo, nullptr, P + "post_ffw_norm.weight", T, mtp, nx_after);
         return;
     }
-    const int K = n_used, e0 = ebound[s.g], e1 = ebound[s.g + 1], fl = n_ffx / S;
+    const auto& ownership = expert_bounds(il);
+    const int K = n_used, e0 = ownership[s.g], e1 = ownership[s.g + 1], fl = n_ffx / S;
     const int xmc = rows_of(s, P + "xmoe");
     const auto st = d.side ? d.side : s.st;
     if (d.side) {

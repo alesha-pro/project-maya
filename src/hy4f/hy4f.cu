@@ -162,6 +162,8 @@ struct Model::Impl {
     uint8_t* eg_table = nullptr;
     int S = 4;
     std::vector<int> ebound;   // shard g owns the experts [ebound[g], ebound[g+1])
+    std::vector<int> mtp_ebound;
+    const std::vector<int>& expert_bounds(int layer) const { return layer == L ? mtp_ebound : ebound; }
     int nl_max = 0;
     std::vector<Shard> sh;
     Io* hio = nullptr;
@@ -450,6 +452,20 @@ struct Model::Impl {
         if (ebound[S] != n_exp) throw std::runtime_error("hy4f: the expert split does not add up to " + std::to_string(n_exp));
         nl_max = 0;
         for (int g = 0; g < S; ++g) nl_max = std::max(nl_max, n[g]);
+        mtp_ebound = ebound;
+        if (const char* split = std::getenv("HY4F_MTP_EXPERT_SPLIT")) {
+            const char* cursor = split;
+            for (int g = 0; g < S; ++g) {
+                char* end = nullptr;
+                long count = std::strtol(cursor, &end, 10);
+                if (end == cursor || count <= 0 || count > n_exp || (g+1 < S ? *end != ',' : *end != 0))
+                    throw std::runtime_error("hy4f: invalid MTP expert split");
+                mtp_ebound[g+1] = mtp_ebound[g] + (int)count;
+                nl_max = std::max(nl_max, (int)count);
+                if (*end) cursor = end+1;
+            }
+            if (mtp_ebound.back() != n_exp) throw std::runtime_error("hy4f: invalid MTP expert count");
+        }
         if (o.verbose) {
             std::fprintf(stderr, "hy4f: experts per GPU:");
             for (int g = 0; g < S; ++g) std::fprintf(stderr, " %d", n[g]);
@@ -531,7 +547,8 @@ struct Model::Impl {
             } else {
                 up_router(s, P + "ffn_gate_inp.weight");
                 for (const char* n : {"exp_probs_b.bias", "ffn_routed_up.weight"}) up_full(s, P + n);
-                const int64_t e0 = ebound[g], e1 = ebound[g + 1];
+                const auto& ownership = expert_bounds(il);
+                const int64_t e0 = ownership[g], e1 = ownership[g + 1];
                 {   // gate | up of each expert as one [2 n_ff, latent] matrix (MMQ run_glu's layout; one decode launch)
                     const strata::GgufFile *fg = nullptr, *fu = nullptr;
                     const strata::TensorInfo* tg = T(P + "ffn_gate_exps.weight", &fg);
@@ -816,7 +833,8 @@ struct Model::Impl {
         }
         gemv(s, P + "ffn_gate_inp.weight", s.x, s.lg);
         router(s, s.lg, f32(s, P + "exp_probs_b.bias"), 1, s.eids, s.ew);
-        const int e0 = ebound[s.g], e1 = ebound[s.g + 1], fl = n_ffx / S;
+        const auto& ownership = expert_bounds(il);
+        const int e0 = ownership[s.g], e1 = ownership[s.g + 1], fl = n_ffx / S;
         k_local_ids<<<1, 32, 0, s.st>>>(s.eids, s.eloc, n_used, e0, e1);
         mmvq(s, P + "xmoe", s.xq, s.xm);
         k_q8<<<nb(latent), 256, 0, s.st>>>(s.xm, latent, s.xlq);
