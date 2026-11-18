@@ -474,12 +474,16 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
             // the indexer split (deep prompts): shard g scores / selects rows [g*q, (g+1)*q) of the tile, the cells are
             // all-gathered (one peer at a time) - the score is O(depth) and was computed by all four GPUs
             const bool split = mqa && S > 1 && pos0 + t0 >= idx_split_from;
+            const int groups = top_k / kpool - tail;
+            const bool compact = split && std::getenv("HY4F_PF_GROUPS") && mbs.empty()
+                && (int64_t)pos0 + t0 + tt <= (int64_t)65536 * kpool && (pos0 + t0) / kpool >= groups
+                && pos0 + t0 + 1 > top_k;
             int* cells = b.cells;
             int ra = 0, rz = tt;
             const int q = (tt + S - 1) / S;
             if (split) {
                 ++b.step;
-                cells = b.cellsx[b.step & 1];
+                cells = compact ? b.cells : b.cellsx[b.step & 1];
                 ra = std::min(tt, s.g * q);
                 rz = std::min(tt, (s.g + 1) * q);
             }
@@ -502,7 +506,18 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                 kb_select_kpool<1024><<<st, 1024, 0, b.st>>>(b.score, (int) ld_sc, b.pp, s0, t0, kpool, top_k,
                                                              top_k / kpool - tail, n_cap, cells);
             }
-            if (split) {
+            if (compact) {
+                const int stride = (groups + 7) / 8 * 8, rows = rz - ra;
+                auto pack = reinterpret_cast<uint16_t*>(b.xq2);
+                if (rows)
+                    kb_pack_groups<<<rows, 256, 0, b.st>>>(cells + (size_t)ra * n_cap, pack,
+                                                          rows, n_cap, kpool, groups, stride);
+                for (int r = 0; r < S; ++r)
+                    b_copy(s, b, b.cl, peer_of(s.g, r), pack, (size_t)ra * stride * 2, (size_t)rows * stride * 2);
+                kb_wait_k<<<1, 32, 0, b.st>>>(b.cl, s.g, S, b.step);
+                kb_unpack_groups<<<tt, 256, 0, b.st>>>(reinterpret_cast<const uint16_t*>(b.cellsx[b.step & 1]),
+                    cells, n_cap, kpool, groups, stride, b.pp, t0);
+            } else if (split) {
                 const size_t per = (size_t) q * n_cap;
                 const int blocks = std::min(nb((int) (per / 4), 512), 64);
                 for (int r = 0; r < S; ++r) {   // (r = 0: this shard - a copy onto itself that sets its own flag)

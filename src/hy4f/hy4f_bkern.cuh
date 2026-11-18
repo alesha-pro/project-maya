@@ -618,6 +618,25 @@ __global__ void kb_push_cb16(const float* part, int T, int H, int W, int Hl, Pee
         }
     }
 }
+// The indexer selects ordered k-pools; their members are consecutive token
+// positions. Up to 256K context, transmitting one 16-bit group id per pool
+// reproduces every selected int32 cell exactly, including ties and the tail.
+__global__ void kb_pack_groups(const int* __restrict__ cells, uint16_t* __restrict__ wire,
+                               int rows, int cap, int kpool, int groups, int stride) {
+    const int t = blockIdx.x;
+    for (int g = threadIdx.x; g < stride; g += blockDim.x)
+        wire[(size_t)t * stride + g] = g < groups ? (uint16_t)(cells[(size_t)t * cap + g * kpool] / kpool) : 0;
+}
+__global__ void kb_unpack_groups(const uint16_t* __restrict__ wire, int* __restrict__ cells, int cap,
+                                 int kpool, int groups, int stride, const int* pos0p, int t0) {
+    const int t = blockIdx.x, pos = *pos0p + t0 + t, current = pos / kpool;
+    for (int i = threadIdx.x; i < cap; i += blockDim.x) {
+        const int g = i / kpool;
+        const int c = g < groups ? (int)wire[(size_t)t * stride + g] * kpool + (i % kpool)
+                                 : current * kpool + i - groups * kpool;
+        cells[(size_t)t * cap + i] = c <= pos ? c : -1;
+    }
+}
 // dequantize a Q8_0 / BF16 matrix into F32 (the batched products' cuBLAS operand)
 __global__ void kb_deq(const void* w, int type, size_t n, float* y) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
