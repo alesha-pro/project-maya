@@ -32,6 +32,7 @@ struct BShard {
     Peers ar{}, cb{};
     int step = 0;
     int* hb = nullptr;   // pinned {0, T}
+    size_t bytes = 0;    // device bytes of the batch buffers
 };
 std::vector<BShard> bsh;
 int score_tile = 64;
@@ -44,6 +45,18 @@ size_t xp_ld = 0, qp_ld = 0, xm_ld = 0;
         if (s_ != CUBLAS_STATUS_SUCCESS) throw std::runtime_error(std::string(#x) + ": cublas " + std::to_string((int) s_)); \
     } while (0)
 
+// one bump allocation, 256-byte aligned pieces
+struct Bump {
+    uint8_t* base = nullptr;
+    size_t off = 0;
+    template <class TT> TT* take(size_t n) {
+        TT* p = reinterpret_cast<TT*>(base + off);
+        off += (n * sizeof(TT) + 255) / 256 * 256;
+        return p;
+    }
+};
+
+// the batch buffers: persistent ones, and one arena the attention / FFN / Engram phases of a layer share
 void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_CK(cudaSetDevice(s.dev));
     b.Tmax = Tmax;
@@ -55,78 +68,99 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_BL(cublasCreate(&b.blas));
     HY_BL(cublasSetStream(b.blas, s.st));
     HY_BL(cublasSetMathMode(b.blas, CUBLAS_DEFAULT_MATH));
-    HY_CK(cudaMalloc(&b.dbounds, sizeof(int) * 2));
-    HY_CK(cudaMalloc(&b.iota, sizeof(int) * ((size_t) T * K + strata::prefill::mmq::IDS_PAD)));
-    strata::prefill::mmq::iota(b.iota, (int64_t) T * K + strata::prefill::mmq::IDS_PAD, s.st);
-    HY_CK(cudaMalloc(&b.toks, sizeof(int) * T));
     HY_CK(cudaHostAlloc((void**) &b.hb, sizeof(int) * 2, cudaHostAllocPortable));
-    const size_t q8a = std::max({strata::prefill::mmq::q8_bytes(std::min((int64_t) T * K, std::max<int64_t>(2 * (int64_t) T * K / S, 4 * T)), std::max(latent, n_ffx)),
-                                 strata::prefill::mmq::q8_bytes(T, std::max({E, Hmax / S * vh, n_ff / S, 4096})),
-                                 strata::prefill::mmq::q8_bytes(T, eg_D * (eg_ngram - 1) * eg_heads)});
-    HY_CK(cudaMalloc(&b.xq, q8a));
-    HY_CK(cudaMalloc(&b.xq2, q8a));
-    b.X = dalloc((size_t) T * hc * E);
-    b.R = dalloc((size_t) T * hc * E);
-    b.x = dalloc((size_t) T * E);
-    b.post = dalloc((size_t) T * 8);
-    b.hcp = dalloc((size_t) T * 8 * HC_SPLIT);
-    b.hcs = dalloc((size_t) T * HC_SPLIT);
+    HY_CK(cudaHostAlloc((void**) &b.hmb, sizeof(int) * (n_exp / S + 1), cudaHostAllocPortable));
+    b.cap = std::min((int64_t) T * K, std::max<int64_t>(2 * (int64_t) T * K / S, 4 * T));
     xp_ld = ((size_t) q_lora + KV_ROW + (size_t) Hmax / S * vh + IK + 3) / 4 * 4;
     qp_ld = std::max((size_t) Hd * QH + (size_t) IH * IK, (size_t) Hs / S * QH);
     xm_ld = (size_t) latent + 2 * n_ffx / S;
-    b.xp = dalloc((size_t) T * xp_ld);
-    b.qr = dalloc((size_t) T * q_lora);
-    b.qp = dalloc((size_t) T * qp_ld);
-    b.qabs = dalloc((size_t) T * Hmax * kvl);
-    b.o = dalloc((size_t) T * Hmax * kvl);
-    b.part = dalloc((size_t) T * Hd * CBW());
-    b.a = dalloc((size_t) T * Hmax / S * vh);
-    b.ao = dalloc((size_t) T * E);
-    b.ikn = dalloc((size_t) T * IK);
-    b.ivg = dalloc((size_t) T * 2 * IK);
-    b.iw = dalloc((size_t) T * IH);
-    b.score = dalloc((size_t) score_tile * (C / kpool + 1));
-    HY_CK(cudaMalloc(&b.chunk, (size_t) T * KV_RB));
-    HY_CK(cudaMalloc(&b.cells, sizeof(int) * (size_t) T * n_cap));
-    b.lg = dalloc((size_t) T * n_exp);
-    b.ew = dalloc((size_t) T * K);
-    HY_CK(cudaMalloc(&b.eids, sizeof(int) * (size_t) T * K));
-    HY_CK(cudaMalloc(&b.mb, sizeof(int) * (n_exp / S + 1)));
-    HY_CK(cudaMalloc(&b.mb2, sizeof(int) * (n_exp / S + 1)));
-    HY_CK(cudaMalloc(&b.mcnt, sizeof(int) * (n_exp / S + 1)));
-    HY_CK(cudaHostAlloc((void**) &b.hmb, sizeof(int) * (n_exp / S + 1), cudaHostAllocPortable));
-    b.cap = std::min((int64_t) T * K, std::max<int64_t>(2 * (int64_t) T * K / S, 4 * T));
-    HY_CK(cudaMalloc(&b.rows_tok, sizeof(int) * ((size_t) T * K + strata::prefill::mmq::IDS_PAD)));
-    HY_CK(cudaMemset(b.rows_tok, 0, sizeof(int) * ((size_t) T * K + strata::prefill::mmq::IDS_PAD)));
-    HY_CK(cudaMalloc(&b.row_of, sizeof(int) * (size_t) T * K));
-    b.xm = dalloc((size_t) T * xm_ld);
-    b.gu = dalloc((size_t) b.cap * 2 * n_ffx);
-    b.dn = dalloc((size_t) b.cap * latent);
-    b.moe = dalloc((size_t) T * latent);
-    b.mu = dalloc((size_t) T * E);
-    b.shh = dalloc((size_t) T * std::max(n_ffx / S, n_ff / S));
-    b.shd = dalloc((size_t) T * std::max((size_t) E, (size_t) 2 * n_ff / S));
-    b.ffo = dalloc((size_t) T * E);
-    const int ncol = (eg_ngram - 1) * eg_heads;
-    b.eg_r = dalloc((size_t) T * ncol * eg_D);
-    b.eg_kv = dalloc((size_t) T * (hc + 1) * E);
-    HY_CK(cudaMalloc(&b.eg_ids, sizeof(int64_t) * (size_t) T * ncol));
-    const int ts = (T + S - 1) / S;
-    for (int p = 0; p < 2; ++p) {
-        b.ar_buf[p] = dalloc((size_t) S * ts * E / 2 + 64);
-        b.ag_buf[p] = dalloc((size_t) T * E / 2 + 64);
-        b.cb_buf[p] = dalloc((size_t) S * T * (Hd / S) * CBW());
-    }
-    HY_CK(cudaMalloc(&b.yn, sizeof(__half) * (size_t) ts * E));
-    HY_CK(cudaMalloc(&b.ag_flag, sizeof(int) * 4));
-    HY_CK(cudaMemset(b.ag_flag, 0, sizeof(int) * 4));
-    HY_CK(cudaMalloc(&b.ar_flag, sizeof(int) * 4));
-    HY_CK(cudaMemset(b.ar_flag, 0, sizeof(int) * 4));
-    HY_CK(cudaMalloc(&b.cb_flag, sizeof(int) * 4));
-    HY_CK(cudaMemset(b.cb_flag, 0, sizeof(int) * 4));
-    HY_CK(cudaMalloc(&b.ctr, sizeof(int) * 12));
-    HY_CK(cudaMemset(b.ctr, 0, sizeof(int) * 12));
-    b.wdq = dalloc(std::max((size_t) Hd * kvl * nope, (size_t) Hmax / S * vh * kvl));
+    const size_t q8a = std::max({strata::prefill::mmq::q8_bytes(b.cap, std::max(latent, n_ffx)),
+                                 strata::prefill::mmq::q8_bytes(T, std::max({E, Hmax / S * vh, n_ff / S, 4096})),
+                                 strata::prefill::mmq::q8_bytes(T, eg_D * (eg_ngram - 1) * eg_heads)});
+    const int ts = (T + S - 1) / S, ncol = (eg_ngram - 1) * eg_heads;
+    const int Ha = std::max(Hd, Hs / S), Ho = S > 1 ? Hmax / S : Hmax;
+    // persistent
+    auto persistent = [&](Bump& m) {
+        b.dbounds = m.take<int>(2);
+        b.iota = m.take<int>((size_t) T * K + strata::prefill::mmq::IDS_PAD);
+        b.toks = m.take<int>(T);
+        b.xq = m.take<uint8_t>(q8a);
+        b.xq2 = m.take<uint8_t>(q8a);
+        b.X = m.take<float>((size_t) T * hc * E);
+        b.R = b.X;   // (X = R + post * y and R = X: the same values everywhere in the batched path)
+        b.x = m.take<float>((size_t) T * E);
+        b.post = m.take<float>((size_t) T * 8);
+        b.hcp = m.take<float>((size_t) T * 8 * HC_SPLIT);
+        b.hcs = m.take<float>((size_t) T * HC_SPLIT);
+        b.score = m.take<float>((size_t) score_tile * (C / kpool + 1));
+        b.chunk = m.take<uint8_t>((size_t) T * KV_RB);
+        b.ew = m.take<float>((size_t) T * K);
+        b.eids = m.take<int>((size_t) T * K);
+        b.mb = m.take<int>(n_exp / S + 1);
+        b.mb2 = m.take<int>(n_exp / S + 1);
+        b.mcnt = m.take<int>(n_exp / S + 1);
+        b.rows_tok = m.take<int>((size_t) T * K + strata::prefill::mmq::IDS_PAD);
+        b.row_of = m.take<int>((size_t) T * K);
+        b.eg_ids = m.take<int64_t>((size_t) T * ncol);
+        // exchanges: one buffer each (the alternation RS -> AG -> RS .. and the waits order every reuse)
+        b.ar_buf[0] = b.ar_buf[1] = m.take<float>((size_t) S * ts * E / 2 + 64);
+        b.ag_buf[0] = b.ag_buf[1] = m.take<float>((size_t) T * E / 2 + 64);
+        b.cb_buf[0] = b.cb_buf[1] = m.take<float>((size_t) S * T * (Hd / S) * CBW());
+        b.yn = m.take<__half>((size_t) ts * E);
+        b.ag_flag = m.take<int>(4);
+        b.ar_flag = m.take<int>(4);
+        b.cb_flag = m.take<int>(4);
+        b.ctr = m.take<int>(12);
+        b.wdq = m.take<float>(std::max((size_t) Hd * kvl * nope, (size_t) Hmax / S * vh * kvl));
+    };
+    auto attn = [&](Bump& m) {
+        b.xp = m.take<float>((size_t) T * xp_ld);
+        b.qr = m.take<float>((size_t) T * q_lora);
+        b.qp = m.take<float>((size_t) T * qp_ld);
+        b.qabs = m.take<float>((size_t) T * Ha * kvl);
+        b.o = m.take<float>((size_t) T * Ho * kvl);
+        b.part = S > 1 ? m.take<float>((size_t) T * Hd * CBW()) : nullptr;
+        b.a = m.take<float>((size_t) T * Hmax / S * vh);
+        b.ao = m.take<float>((size_t) T * E);
+        b.ikn = m.take<float>((size_t) T * IK);
+        b.ivg = m.take<float>((size_t) T * 2 * IK);
+        b.iw = m.take<float>((size_t) T * IH);
+        b.cells = m.take<int>((size_t) T * n_cap);
+    };
+    auto ffn = [&](Bump& m) {
+        b.lg = m.take<float>((size_t) T * n_exp);
+        b.xm = m.take<float>((size_t) T * xm_ld);
+        b.gu = m.take<float>((size_t) b.cap * 2 * n_ffx);
+        b.dn = m.take<float>((size_t) b.cap * latent);
+        b.moe = m.take<float>((size_t) T * latent);
+        b.mu = m.take<float>((size_t) T * E);
+        b.shh = m.take<float>((size_t) T * std::max(n_ffx / S, n_ff / S));
+        b.shd = m.take<float>((size_t) T * std::max((size_t) E, (size_t) 2 * n_ff / S));
+        b.ffo = m.take<float>((size_t) T * E);
+    };
+    auto engr = [&](Bump& m) {
+        b.eg_r = m.take<float>((size_t) T * ncol * eg_D);
+        b.eg_kv = m.take<float>((size_t) T * (hc + 1) * E);
+    };
+    Bump m0, ma, mf, me;
+    persistent(m0);
+    attn(ma);
+    ffn(mf);
+    engr(me);
+    const size_t arena = std::max({ma.off, mf.off, me.off});
+    uint8_t* base = nullptr;
+    HY_CK(cudaMalloc(&base, m0.off + arena));
+    HY_CK(cudaMemset(base, 0, m0.off + arena));
+    m0 = Bump{base, 0};
+    persistent(m0);
+    ma = Bump{base + m0.off, 0};
+    mf = ma;
+    me = ma;
+    attn(ma);
+    ffn(mf);
+    engr(me);
+    b.bytes = m0.off + arena;
+    strata::prefill::mmq::iota(b.iota, (int64_t) T * K + strata::prefill::mmq::IDS_PAD, s.st);
 }
 
 void batch_setup(int Tmax) {
@@ -145,6 +179,8 @@ void batch_setup(int Tmax) {
         cb.flag[j] = bsh[j].cb_flag;
     }
     for (auto& b : bsh) b.ar = ar, b.cb = cb, b.ag = ag;
+    if (o.verbose)
+        std::fprintf(stderr, "hy4f: batch buffers for %d tokens: %.0f MiB per GPU\n", Tmax, bsh[0].bytes / 1048576.0);
     for (auto& s : sh) {
         HY_CK(cudaSetDevice(s.dev));
         HY_CK(cudaDeviceSynchronize());
