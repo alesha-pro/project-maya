@@ -22,6 +22,7 @@
 #include "hy4f_dkern.cuh"
 #include "hy4f_project.cuh"
 #include "hy4f_q3packed.cuh"
+#include "hy4f_expert_q8.cuh"
 
 #include "strata/artifact/gguf_reader.hpp"
 #include "strata/kernels/bf16_gemv.hpp"
@@ -821,7 +822,12 @@ struct Model::Impl {
         k_q8<<<nb(latent), 256, 0, s.st>>>(s.xm, latent, s.xlq);
         auto ids_mmvq = [&](const DW& w, const void* xq, bool shared, float* y, int n_in, int n_out) {
             const size_t eb = w.rb * (size_t) w.ne[1];
-            if (w.type == T_Q3_K) kn::native_q3_k_mmvq_ids_loop(w.d, eb, s.eloc, n_used, xq, shared, y, n_in, n_out, s.st);
+            if (w.type == T_Q8_0) {
+                expert_q8::launch<false>(w.d, eb, s.eloc, n_used, nullptr, nullptr, nullptr, xq, shared, y, n_in, n_out,
+                                         nb(n_out, 4), s.st);
+                HY_CK(cudaGetLastError());
+            }
+            else if (w.type == T_Q3_K) kn::native_q3_k_mmvq_ids_loop(w.d, eb, s.eloc, n_used, xq, shared, y, n_in, n_out, s.st);
             else if (w.type == T_Q4_K) kn::native_q4_k_mmvq_ids_loop(w.d, eb, s.eloc, n_used, xq, shared, y, n_in, n_out, s.st);
             else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
         };

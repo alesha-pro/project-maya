@@ -640,6 +640,16 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     }
     auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out) {
         const size_t eb = w.rb * (size_t) w.ne[1];
+        if (w.type == T_Q8_0) {
+            if (grouped)
+                expert_q8::launch<true>(w.d, eb, d.mg_exp, 0, d.mg_n, d.mg_off, d.mg_slot, xq, false, y,
+                                        n_in, n_out, 2 * moe_blocks, s.st);
+            else
+                expert_q8::launch<false>(w.d, eb, d.eloc, T * K, nullptr, nullptr, nullptr, xq, false, y,
+                                         n_in, n_out, 2 * moe_blocks, s.st);
+            HY_CK(cudaGetLastError());
+            return;
+        }
         if (grouped) {
             if (q3_pair_layout && q3_eligible(w)) {
                 packed_q3::forward(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, xq, y, n_out, moe_blocks, s.st);
