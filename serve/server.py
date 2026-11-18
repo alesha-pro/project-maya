@@ -2581,14 +2581,16 @@ class Service:
                             # DeepSeek-V4.1 ends a turn with its EOS (and would start the next with <｜User｜>)
                             _special_ids("<｜end▁of▁sentence｜>") + _special_ids("<｜User｜>") +
                             # MiniMax-M3.1 with [e~[ (and would start the next turn with ]~b])
-                            _special_ids("[e~[") + _special_ids("]~b]"))
+                            _special_ids("[e~[") + _special_ids("]~b]") +
+                            # Hy4 flash ends a turn with <｜hy_end:opensource｜> (and would open the next with hy_start)
+                            _special_ids("<｜hy_end:opensource｜>") + _special_ids("<｜hy_start:opensource｜>"))
         # DeepSeek's turn openers: where its last user turn starts and its system prompt ends (MAYA_DS4_RESTORE_POINTS)
         self.ds_user_id = (_special_ids("<｜User｜>") or [None])[0]
         self.ds_system_id = (_special_ids("<｜System｜>") or [None])[0]
         # ... and a model that spells a role marker out of ordinary pieces ('<|', 'user', '|>') has ended its turn just
         # the same: the text stops there.  Only markers that are special tokens in this vocabulary count.
         self.stop_texts = [s for s in ("<|user|>", "<|observation|>", "<|endoftext|>", "<｜end▁of▁sentence｜>", "<｜User｜>",
-                                       "[e~[", "]~b]")
+                                       "[e~[", "]~b]", "<｜hy_start:opensource｜>")
                            if _special_ids(s)]
         # the thinking budget (run config `thinking_budget`, tokens; 0 = none): a reasoning block that reaches it is
         # closed with the template's </think> and the answer follows - GLM at High can plan for 14k+ tokens
@@ -2599,7 +2601,8 @@ class Service:
         # same budget at every level (every other model)
         self.think_budget_max = 0
         # (MiniMax-M3.1 closes its reasoning with </mm:think>; its vocabulary may hold a plain "</think>" too)
-        end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else _special_ids("</think>")
+        end = _special_ids("</mm:think>") if getattr(template, "minimax", False) else \
+            _special_ids(f"</think{template.hy4}>") if getattr(template, "hy4", "") else _special_ids("</think>")
         self.think_end_id = end[0] if end else None
         # the tokens the engine itself ends a request at, whatever the server does (see THINK_RESTARTS): a pack
         # tokenizer that names its "eos" (DeepSeek's, MiniMax's: their engines' --eos default) ends there only; the
@@ -4147,7 +4150,7 @@ class Service:
             if not f.startswith(p) or call_end not in p:
                 return None
             out[key] = (rep, self.tok.encode(p[p.rindex(call_end) + len(call_end):] + f[len(p):], parse_special=True),
-                        f.rstrip().endswith("<think>"))
+                        f.rstrip().endswith(getattr(self.template, "think_open", "<think>")))
         return out
 
     def _keep_suffix(self, tools, kwargs, note=loop_guard.KEEP_NOTE):
@@ -4173,7 +4176,8 @@ class Service:
         tail = f[f.rindex(mark) + len(mark):]
         if not tail:
             return None
-        return (self.tok.encode(tail, parse_special=True), f.rstrip().endswith("<think>"))
+        return (self.tok.encode(tail, parse_special=True),
+                f.rstrip().endswith(getattr(self.template, "think_open", "<think>")))
 
     def _collapse(self, messages):
         """A conversation that carries a loop across turns (loop_guard.collapse): its prompt without what the model
@@ -4417,6 +4421,7 @@ class Service:
                                 stream_tools=True, dsml=getattr(self.template, "deepseek", False),
                                 token_only_end=getattr(self.template, "deepseek", False) and self.think_end_id is not None,
                                 minimax=getattr(self.template, "minimax", False),
+                                hy4=getattr(self.template, "hy4", ""),
                                 strict_tools=responses, single_tool=single_tool,
                                 unions=getattr(self.template, "glm_dsa", False))
         parser = new_parser()

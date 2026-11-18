@@ -827,4 +827,115 @@ bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------------------------------
+// serve support (maya-hy4f --serve: hy4f_serve.cpp) - the cache kept across requests.
+//
+// What a step reads from earlier positions: the DSA layers' KV (context parallel, row pos / S on shard pos % S), the
+// indexer's pooled groups (row g = pos / kpool, written when the group's last position is read), the token history
+// (Engram) - all indexed by position, so dropping the positions from P on needs nothing but the counter: P is written
+// again and nothing past it is read.  The two rings alias: the SWA layers' KV keeps position p in row p % win and a
+// step at p reads p - win + 1 .. p; the indexer keeps the current group's positions in row p % kpool.  A row a kept
+// position needs is lost when a position past P that shares it was written after it - conservatively: any written
+// since the last reset (hw_ = their high-water mark).  So P is kept when
+//   SWA:     hw_ <= win (no row was ever reused) or P >= hw_ - 1 (P - win + 1 .. P - 1 still hold themselves), and
+//   indexer: P % kpool == 0 (the group's rows are not read) or nothing was written past P's group (hw_ <= its end);
+// mark() copies both rings at a position Pm (after the prompt): a rewind to Pm or Pm - 1 restores them (the rows then
+// hold Pm - win .. Pm - 1).  Any rewind below Pm drops the copy after use (position Pm - 1 may be written anew).
+// Else, when only the indexer's rule fails, P goes down to its group's start (P - P % kpool: < kpool tokens read again)
+// if the SWA rule holds there; else 0.
+struct Model::Snap {
+    int64_t pos = -1;                                   // the position mark() copied at (-1: none)
+    std::vector<std::map<int, void*>> rows;             // per shard: layer -> its ring's copy
+};
+
+int64_t Model::position() const { return d_->pos_next; }
+int64_t Model::max_context() const { return d_->o.max_context; }
+
+void Model::reset() {
+    std::string err;
+    rewind(0, err);
+}
+
+bool Model::mark(std::string& err) {
+    try {
+        Impl& d = *d_;
+        if (!snap_) {
+            snap_ = std::make_shared<Snap>();
+            snap_->rows.resize(d.S);
+            for (auto& s : d.sh) {
+                HY_CK(cudaSetDevice(s.dev));
+                for (int il = 0; il < d.L; ++il) {
+                    void* p = nullptr;
+                    HY_CK(cudaMalloc(&p, d.swa[il] ? (size_t) d.win * KV_RB : (size_t) d.kpool * 2 * d.IK * sizeof(float)));
+                    snap_->rows[s.g][il] = p;
+                }
+            }
+        }
+        for (auto& s : d.sh) {
+            HY_CK(cudaSetDevice(s.dev));
+            for (int il = 0; il < d.L; ++il) {
+                const bool sw = d.swa[il] != 0;
+                HY_CK(cudaMemcpyAsync(snap_->rows[s.g][il], sw ? (void*) s.kv[il] : (void*) s.ring[il],
+                                      sw ? (size_t) d.win * KV_RB : (size_t) d.kpool * 2 * d.IK * sizeof(float),
+                                      cudaMemcpyDeviceToDevice, s.st));
+            }
+        }
+        for (auto& s : d.sh) {
+            HY_CK(cudaSetDevice(s.dev));
+            HY_CK(cudaStreamSynchronize(s.st));
+        }
+        snap_->pos = d.pos_next;
+        return true;
+    } catch (const std::exception& e) {
+        if (snap_) snap_->pos = -1;
+        err = e.what();
+        return false;
+    }
+}
+
+int64_t Model::rewind(int64_t pos, std::string& err) {
+    try {
+        Impl& d = *d_;
+        hw_ = std::max(hw_, d.pos_next);                // (the positions written since the last rewind)
+        pos = std::max<int64_t>(0, std::min(pos, d.pos_next));
+        bool has_swa = false, has_dsa = false;
+        for (int il = 0; il < d.L; ++il) (d.swa[il] ? has_swa : has_dsa) = true;
+        auto keeps = [&](int64_t p, int64_t hw) {
+            const bool swa_ok = !has_swa || hw <= d.win || p >= hw - 1;
+            const bool idx_ok = !has_dsa || p % d.kpool == 0 || hw <= (p / d.kpool + 1) * d.kpool;
+            return swa_ok && idx_ok;
+        };
+        const int64_t m = snap_ ? snap_->pos : -1;
+        if (pos > 0 && !keeps(pos, hw_)) {
+            if (m > 0 && (pos == m || pos == m - 1) && keeps(pos, m)) {
+                for (auto& s : d.sh) {
+                    HY_CK(cudaSetDevice(s.dev));
+                    for (int il = 0; il < d.L; ++il) {
+                        const bool sw = d.swa[il] != 0;
+                        HY_CK(cudaMemcpyAsync(sw ? (void*) s.kv[il] : (void*) s.ring[il], snap_->rows[s.g][il],
+                                              sw ? (size_t) d.win * KV_RB : (size_t) d.kpool * 2 * d.IK * sizeof(float),
+                                              cudaMemcpyDeviceToDevice, s.st));
+                    }
+                }
+                for (auto& s : d.sh) {
+                    HY_CK(cudaSetDevice(s.dev));
+                    HY_CK(cudaStreamSynchronize(s.st));
+                }
+                hw_ = m;                                // (the rings as they were at m)
+            } else if (const int64_t down = has_dsa ? pos - pos % d.kpool : 0; down > 0 && keeps(down, hw_)) {
+                pos = down;                             // (the indexer group's start: < kpool tokens read again)
+            } else {
+                pos = 0;
+            }
+        }
+        if (snap_ && pos < m) snap_->pos = -1;          // (positions before the copy's are written anew)
+        if (pos == 0) hw_ = 0;
+        d.pos_next = pos;
+        return pos;
+    } catch (const std::exception& e) {
+        err = e.what();
+        return -1;
+    }
+}
+
 }  // namespace strata::hy4f
