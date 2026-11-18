@@ -1674,6 +1674,64 @@ void native_q4_k_mmvq_ids_loop(const void* weights, std::size_t expert_bytes, co
 namespace strata::kernels {
 namespace {
 
+// Hy4's latent width is 1536: the two halves of the warp always process
+// exactly three 256-value blocks each. Compile the singleton and shared
+// cases separately so weight decoding and activation address arithmetic
+// are invariant across the unrolled inner loop.
+template<class F, int Slots>
+__device__ __forceinline__ void grouped_row1536(const typename F::Block* w, const Q81Block* x,
+                                                const int* slots, float* y, int row, int rows) {
+    const int lane = threadIdx.x & 31;
+    const int kqs = F::kqs(lane & 15);
+    int slot[Slots];
+    float acc[Slots] = {};
+#pragma unroll
+    for (int j = 0; j < Slots; ++j) slot[j] = slots[j];
+#pragma unroll
+    for (int i = 0; i < 3; ++i) {
+        const int kb = lane / 16 + i * 2;
+        const auto v = F::load(w + kb, kqs);
+#pragma unroll
+        for (int j = 0; j < Slots; ++j) acc[j] += F::apply(v, x + slot[j] * 48 + kb * 8, kqs);
+    }
+#pragma unroll
+    for (int j = 0; j < Slots; ++j) {
+        const float v = warp_sum(acc[j]);
+        if (lane == 0) y[slot[j] * rows + row] = v;
+    }
+}
+
+template<class F, int Rows>
+__global__ void __launch_bounds__(128) native_hy4_grouped1536(
+    const typename F::Block* __restrict__ w, size_t expert_blocks, const int* __restrict__ ng,
+    const int* __restrict__ gexp, const int* __restrict__ goff, const int* __restrict__ gslot,
+    const Q81Block* __restrict__ x, float* __restrict__ y) {
+    const int items = *ng * Rows;
+    for (int it = blockIdx.x * 4 + (threadIdx.x >> 5); it < items; it += gridDim.x * 4) {
+        const int g = it / Rows, row = it % Rows;
+        const auto* wr = w + size_t(gexp[g]) * expert_blocks + row * 6;
+        const int off = goff[g], ns = goff[g + 1] - off;
+        switch (ns) {
+            case 1: grouped_row1536<F, 1>(wr, x, gslot + off, y, row, Rows); break;
+            case 2: grouped_row1536<F, 2>(wr, x, gslot + off, y, row, Rows); break;
+            case 3: grouped_row1536<F, 3>(wr, x, gslot + off, y, row, Rows); break;
+            case 4: grouped_row1536<F, 4>(wr, x, gslot + off, y, row, Rows); break;
+        }
+    }
+}
+template<class F> bool try_grouped1536(const void* weights, size_t expert_bytes, const int* ng, const int* gexp,
+                                       const int* goff, const int* gslot, const void* x, float* y,
+                                       int n_in, int n_out, int blocks, void* stream) {
+    if (n_in != 1536 || (n_out != 1536 && n_out != 3072)) return false;
+    const auto* w = static_cast<const typename F::Block*>(weights);
+    const size_t eb = expert_bytes / sizeof(typename F::Block);
+    const auto* q = static_cast<const Q81Block*>(x);
+    const auto st = static_cast<cudaStream_t>(stream);
+    if (n_out == 3072) native_hy4_grouped1536<F, 3072><<<blocks * 2, 128, 0, st>>>(w, eb, ng, gexp, goff, gslot, q, y);
+    else native_hy4_grouped1536<F, 1536><<<blocks * 2, 128, 0, st>>>(w, eb, ng, gexp, goff, gslot, q, y);
+    launch_check();
+    return true;
+}
 template <class Block, float (*Dot)(const Block* __restrict__, const Q81Block* __restrict__, int), int KQS_MUL>
 __global__ void __launch_bounds__(256) native_kq_mmvq_grouped_kernel(
     const Block* __restrict__ w, std::size_t expert_blocks, const int* __restrict__ ng_p, const int* __restrict__ gexp,
@@ -1766,11 +1824,13 @@ void launch_grouped_mp(const void* weights, std::size_t expert_bytes, const int*
 void native_q3_k_mmvq_grouped(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp,
                               const int* goff, const int* gslot, const void* x_q8_1, float* y, int n_in, int n_out,
                               int blocks, void* stream) {
+    if (try_grouped1536<Q3KTraits>(weights, expert_bytes, ng, gexp, goff, gslot, x_q8_1, y, n_in, n_out, blocks, stream)) return;
     launch_grouped<Q3KBlock, q3_q8_dot, 1>(weights, expert_bytes, ng, gexp, goff, gslot, x_q8_1, y, n_in, n_out, blocks, stream);
 }
 void native_q4_k_mmvq_grouped(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp,
                               const int* goff, const int* gslot, const void* x_q8_1, float* y, int n_in, int n_out,
                               int blocks, void* stream) {
+    if (try_grouped1536<Q4KTraits>(weights, expert_bytes, ng, gexp, goff, gslot, x_q8_1, y, n_in, n_out, blocks, stream)) return;
     launch_grouped<Q4KBlock, q4_q8_dot, VDR>(weights, expert_bytes, ng, gexp, goff, gslot, x_q8_1, y, n_in, n_out, blocks, stream);
 }
 
