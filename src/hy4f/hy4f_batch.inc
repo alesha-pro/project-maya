@@ -463,7 +463,10 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                 const int st = std::min(score_tile, t0 + rz - s0);
                 const int n_pool_max = (pos0 + s0 + st - 1) / kpool;
                 if (pos0 + s0 + st > top_k && n_pool_max > 0) {
-                    if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))
+                    if (IH == 16 && IK == 128 && n_pool_max >= 2048 && st >= 4 && std::getenv("HY4F_SCORE_TILE")) {
+                        kb_score_prefill<<<dim3(std::min(64, (n_pool_max + 63) / 64), (st + 3) / 4), 256, 0, b.st>>>(
+                            iq, (int)qp_ld, s.pooled[il], b.iw, IH, kpool, top_k, b.pp, s0, st, n_pool_max, b.score, (int)ld_sc);
+                    } else if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))
                         kb_score_tc<<<dim3(std::min(32, (n_pool_max + 255) / 256), (st + 7) / 8), 256, 0, b.st>>>(
                             iq, (int) qp_ld, s.pooled[il], b.iw, IH, kpool, top_k, b.pp, s0, st, n_pool_max, b.score,
                             (int) ld_sc);

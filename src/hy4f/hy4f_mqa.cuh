@@ -547,6 +547,62 @@ __global__ void __launch_bounds__(256) kb_score_tc(const float* __restrict__ iq,
     }
 }
 
+// Four queries share a tile of 64 pooled keys. Each warp keeps its query
+// fragments in registers and scores two 16-key subtiles in the original K order.
+__global__ void __launch_bounds__(256) kb_score_prefill(const float* iq, int ldq, const __half* pooled,
+        const float* weights, int stride_w, int kpool, int top_k, const int* pos0p,
+        int t0, int nt, int n_pool, float* score, int ld_score) {
+    using namespace nvcuda;
+    constexpr int D = 128, LD = 136, H = 16, QT = 4, GK = 64;
+    __shared__ __align__(32) __half qs[QT][H][LD], keys[GK][LD];
+    __shared__ __align__(32) float dots[8][H][20];
+    __shared__ float ws[QT][H];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int qb = blockIdx.y * QT;
+    for (int i = tid; i < QT * H * D; i += 256) {
+        int tk = i / (H*D), h = i / D % H, c = i % D;
+        qs[tk][h][c] = __float2half_rn(qb+tk < nt ? iq[(size_t)(t0+qb+tk)*ldq + h*D+c] : 0.0f);
+    }
+    if (tid < QT*H) ws[tid/H][tid%H] = qb+tid/H < nt ? weights[(size_t)(t0+qb+tid/H)*stride_w+tid%H] : 0.0f;
+    __syncthreads();
+    int tk = warp >> 1, tt = qb+tk, pos = *pos0p+t0+tt;
+    wmma::fragment<wmma::matrix_a,16,16,16,__half,wmma::row_major> a[D/16];
+#pragma unroll
+    for (int k=0; k<D/16; ++k) wmma::load_matrix_sync(a[k], &qs[tk][0][k*16], LD);
+    for (int gb = blockIdx.x*GK; gb < n_pool; gb += gridDim.x*GK) {
+        for (int i=tid; i<GK*(D/8); i+=256) {
+            const int g=i/(D/8), c=8*(i%(D/8));
+            uint4 v = make_uint4(0,0,0,0);
+            if (gb+g<n_pool) v = *reinterpret_cast<const uint4*>(pooled+(size_t)(gb+g)*D+c);
+            *reinterpret_cast<uint4*>(&keys[g][c])=v;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int half=0; half<2; ++half) {
+            const int first=32*half+16*(warp&1);
+            wmma::fragment<wmma::accumulator,16,16,16,float> accum;
+            wmma::fill_fragment(accum,0.0f);
+#pragma unroll
+            for (int k=0; k<D/16; ++k) {
+                wmma::fragment<wmma::matrix_b,16,16,16,__half,wmma::col_major> b;
+                wmma::load_matrix_sync(b, &keys[first][k*16], LD);
+                wmma::mma_sync(accum,a[k],b,accum);
+            }
+            wmma::store_matrix_sync(&dots[warp][0][0],accum,20,wmma::mem_row_major);
+            __syncwarp();
+            const int g=gb+first+lane;
+            if (lane<16 && tt<nt && pos+1>top_k && g<pos/kpool) {
+                float v=0;
+#pragma unroll
+                for (int h=0; h<H; ++h) v += fmaxf(dots[warp][h][lane],0.0f)*ws[tk][h];
+                score[(size_t)tt*ld_score+g]=v;
+            }
+            __syncwarp();
+        }
+        __syncthreads();
+    }
+}
+
 // (the few-token form of kb_score_tc: every warp a group sub-range for ALL the NT >= tt_n tokens, each key tile read once)
 template <int NT>
 __device__ __forceinline__ void score_few(const __half* __restrict__ pooled, int kpool, int top_k, int pos0, int t0, int tt_n,
