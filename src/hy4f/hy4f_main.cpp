@@ -14,6 +14,7 @@
 
 #include <cuda_profiler_api.h>
 #include "hy4f_serve.hpp"
+#include "hy4f_draft_width.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -414,16 +415,24 @@ int main(int argc, char** argv) {
         // prefix + the bonus token -> MTP over the accepted rows (draft d0) -> chain d1.. from the MTP's own state
         const int k = std::min(spec, 3);
         std::vector<int32_t> out;
-        int32_t last = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin()), dr[4], am[4];
+        int32_t last = (int32_t) (std::max_element(logits.begin(), logits.end()) - logits.begin()), dr[4] = {}, am[4];
         out.push_back(last);
+        strata::hy4f::DraftWidth width(m.vocab(), true);
+        int offered = 0, total_offered = 0;
         auto draft_chain = [&](int64_t mpos_next) {
-            for (int i = 1; i < k; ++i)
-                if (!m.mtp_chain(dr[i - 1], mpos_next + i - 1, &dr[i], err)) {
+            width.begin();
+            offered = 1;
+            width.offer(0, dr[0]);
+            for (int i = 1; i < k && width.extend(i - 1); ++i) {
+                if (!m.mtp_chain(dr[i - 1], mpos_next + i - 1, &dr[i], err, width.logits())) {
                     std::fprintf(stderr, "maya-hy4f: mtp_chain failed: %s\n", err.c_str());
                     std::exit(1);
                 }
+                if (!width.offer(i, dr[i])) break;
+                ++offered;
+            }
         };
-        if (!m.mtp(&last, 1, pos - 1, &dr[0], err)) {
+        if (!m.mtp(&last, 1, pos - 1, &dr[0], err, width.logits())) {
             std::fprintf(stderr, "maya-hy4f: mtp failed: %s\n", err.c_str());
             return 1;
         }
@@ -433,19 +442,21 @@ int main(int argc, char** argv) {
         const auto a = std::chrono::steady_clock::now();
         while ((int) out.size() < gen) {
             int32_t vt[4] = {last, dr[0], dr[1], dr[2]};
-            if (!m.verify(vt, k + 1, pos, nullptr, am, err)) {
+            if (!m.verify(vt, offered + 1, pos, nullptr, am, err)) {
                 std::fprintf(stderr, "maya-hy4f: verify failed: %s\n", err.c_str());
                 return 1;
             }
             ++steps2;
             int n = 0;
-            while (n < k && am[n] == dr[n]) ++n;
+            while (n < offered && am[n] == dr[n]) ++n;
             ++acc_hist[n];
+            total_offered += offered;
+            width.observe(offered, n);
             int32_t nt[4];
             for (int i = 0; i < n; ++i) nt[i] = dr[i];
             nt[n] = am[n];
             for (int i = 0; i <= n; ++i) out.push_back(nt[i]);
-            if (!m.mtp(nt, n + 1, pos, &dr[0], err)) {
+            if (!m.mtp(nt, n + 1, pos, &dr[0], err, width.logits())) {
                 std::fprintf(stderr, "maya-hy4f: mtp failed: %s\n", err.c_str());
                 return 1;
             }
@@ -463,7 +474,7 @@ int main(int argc, char** argv) {
         for (int32_t t : out) std::printf(" %d", t);
         std::printf("\nspec k=%d: %zu tokens in %d steps, %.2f tokens/step, draft accept %.1f%%, %.2f tok/s, %.2f ms/step\n", k,
                     out.size() - 1, steps2, (double) (out.size() - 1) / std::max(1, steps2),
-                    100.0 * acc / std::max(1, steps2 * k), (out.size() - 1) / dt, 1000.0 * dt / std::max(1, steps2));
+                    100.0 * acc / std::max(1, total_offered), (out.size() - 1) / dt, 1000.0 * dt / std::max(1, steps2));
         return 0;
     }
     std::vector<int32_t> out;

@@ -40,6 +40,7 @@
 // departs right there), else the cache starts again at 0.  A step that fails ends the engine (END, DONE ... cancel,
 // exit 1): the server starts a new one.
 #include "hy4f_serve.hpp"
+#include "hy4f_draft_width.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -599,21 +600,30 @@ int serve(Model& m, const ServeOptions& so) {
         (void) 0;   // (default: the same temperature - measured best: 0.6 and 0.8 accepted less)
         std::vector<float> mlg(ssamp ? (size_t) V : 0);
         std::vector<std::vector<float>> Q(ssamp ? 4 : 0);
+        DraftWidth width(V, adapt && spec && !rows);
+        if (width.enabled()) kc.k = 3;
+        int offered = kc.k;
         auto draft = [&](const int32_t* nt, int T, int64_t mpos) {
-            if (!m.mtp(nt, T, mpos, &dr[0], err, ssamp ? mlg.data() : nullptr))
+            if (!m.mtp(nt, T, mpos, &dr[0], err, ssamp ? mlg.data() : width.logits()))
                 fatal("mtp at " + std::to_string(mpos) + ": " + err, produced, n);
             if (ssamp) {
                 sampler.probs(mlg.data(), V, rq, state, Q[0]);
                 dr[0] = Sampler::draw(Q[0], rng);
             }
             const int64_t next = mpos + T;
-            for (int i = 1; i < kc.k; ++i) {
-                if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err, ssamp ? mlg.data() : nullptr))
+            width.begin();
+            offered = 1;
+            width.offer(0, dr[0]);
+            const int room = width.enabled() ? (int) std::min<long long>({(long long) kc.k, C - next - 1, r.max_new - produced}) : kc.k;
+            for (int i = 1; i < room && width.extend(i - 1); ++i) {
+                if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err, ssamp ? mlg.data() : width.logits()))
                     fatal("mtp_chain at " + std::to_string(next + i - 1) + ": " + err, produced, n);
                 if (ssamp) {
                     sampler.probs(mlg.data(), V, rq, state, Q[i]);
                     dr[i] = Sampler::draw(Q[i], rng);
                 }
+                if (!width.offer(i, dr[i])) break;
+                ++offered;
             }
         };
         std::vector<float> Pr, Res;
@@ -625,7 +635,7 @@ int serve(Model& m, const ServeOptions& so) {
             }
             const int64_t pos = (int64_t) state.size();
             if (pos >= C) break;   // (the context is full: length)
-            const int kk = spec ? (int) std::min<long long>({(long long) kc.k, C - pos - 1, r.max_new - produced}) : 0;
+            const int kk = spec ? (int) std::min<long long>({(long long) offered, C - pos - 1, r.max_new - produced}) : 0;
             const int32_t vt[4] = {tok, dr[0], dr[1], dr[2]};
             if (!m.verify(vt, kk + 1, pos, rows ? lgT.data() : nullptr, am, err))
                 fatal("verify at " + std::to_string(pos) + ": " + err, produced, n);
@@ -680,7 +690,8 @@ int serve(Model& m, const ServeOptions& so) {
             d_off += kk;
             d_acc += acc;
             if (!more || !spec) continue;
-            if (adapt) kc.step(kk, acc);
+            if (width.enabled()) width.observe(kk, acc);
+            else if (adapt) kc.step(kk, acc);
             int32_t nt[4];
             for (int i = 0; i < acc; ++i) nt[i] = dr[i];
             nt[acc] = tok;
