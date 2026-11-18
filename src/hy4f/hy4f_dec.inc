@@ -220,9 +220,10 @@ void dec_alloc(Shard& s, DShard& d) {
     d.cat = dalloc((size_t) DT * 2 * E);
     d.mr = dalloc((size_t) DT * E);
     d.mh = dalloc((size_t) DT * E);
-    d.spm = dalloc((size_t) DT * NSP * std::max(Hd, Hs / S));
-    d.spl = dalloc((size_t) DT * NSP * std::max(Hd, Hs / S));
-    d.spacc = dalloc((size_t) DT * NSP * std::max(Hd, Hs / S) * kvl);
+    const int split_heads = replicate_prefix() ? 64 : std::max(Hd, Hs/S);
+    d.spm = dalloc((size_t)DT * NSP * split_heads);
+    d.spl = dalloc((size_t)DT * NSP * split_heads);
+    d.spacc = dalloc((size_t)DT * NSP * split_heads * kvl);
     d.xq = qa((size_t) DT * std::max({2 * E, Hmax / S * vh, n_ff / S, ncol * eg_D, latent}));
     d.xlq = qa((size_t) DT * K * latent);
     d.q16 = qa((size_t) DT * K * n_ffx);
@@ -386,6 +387,10 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         HY_CK(cudaEventRecord(d.attention_fork, s.st));
         HY_CK(cudaStreamWaitEvent(side, d.attention_fork));
     }
+    if (dense_dsa && !sw && !s.prefix_kv.empty())
+        kb_kv_prep<true><<<T,576,0,keys>>>(d.xp+okv,xpc,f32(s,P+"attn_kv_a_norm.weight"),kvl,
+            rope,eps,th,s.kv[il],pp,2,S,s.g,0,s.prefix_kv.at(il),top_k);
+    else
     kb_kv_prep<<<T, 576, 0, keys>>>(d.xp + okv, xpc, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th, s.kv[il], pp,
                                     sw ? 3 : 2, S, s.g, win + RING_PAD);
     if (!sw) d_indexer_cache(s, d, P, il, pp, T, xpc, oik, th, keys);
@@ -479,7 +484,13 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         if (!mtp && !dfs.empty() && df_slot[il] >= 0)   // (the DFly drafter reads this layer's top-k of every row)
             HY_CK(cudaMemcpyAsync(dfs[s.g].snap + (size_t) df_slot[il] * DT * n_cap, d.cells, sizeof(int) * T * n_cap,
                                   cudaMemcpyDeviceToDevice, s.st));
-        if (S > 1) {
+        if (dense_dsa && !s.prefix_kv.empty()) {
+            kd_mqa_dec<16,true,1,true><<<dim3(NSP,T,4),256,mqd_smem<16>(),s.st>>>(
+                d.qabs,d.qp,qpc,QH,nope,th,s.prefix_kv.at(il),nullptr,0,pp,win,S,s.g,
+                scale,d.spm,d.spl,d.spacc,0,0,qh);
+            kd_replica_merge<<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,T,
+                f32(s,P+"attn_sinks.weight")+s.g*Hl,d.o);
+        } else if (S > 1) {
             if (split && Hd == 32) {
                 (value_groups==4 ? (dense_dsa ? kd_mqa_dec<32,true,4> : kd_mqa_dec<32,false,4>) : (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>))<<<dim3(NSP*value_groups, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
                                                                            n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
@@ -771,6 +782,9 @@ void dec_setup() {
             HY_CK(cudaFuncSetAttribute(kd_mqa_dec<16,false,4>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<16>()));
             HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32,false,4>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<32>()));
             HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32,true,4>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<32>()));
+        }
+        if (replicate_prefix()) {
+            HY_CK(cudaFuncSetAttribute(kd_mqa_dec<16,true,1,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<16>()));
         }
         HY_CK(cudaFuncSetAttribute(kd_mqa_dec<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqd_smem<16>()));
         HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqd_smem<32>()));

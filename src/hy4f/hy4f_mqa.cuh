@@ -300,7 +300,7 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
 // folds the splits (with the sink, or into the combine's partial).  Same tile math as kb_mqa_attn.
 template <int H> constexpr size_t mqd_smem() { return mqa_smem<H>(); }
 
-template <int H, bool DenseDsa = false, int ValueGroups = 1>
+template <int H, bool DenseDsa = false, int ValueGroups = 1, bool Replica = false>
 __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs, const float* __restrict__ q, int ldq,
                                                   int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                   const int* __restrict__ cells, int n_cap, const int* pos0p, int win,
@@ -308,7 +308,7 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
                                                   float* __restrict__ pl, float* __restrict__ pacc, int top_k = 0, int groups = 0, const __half* packed_q = nullptr) {
     using namespace nvcuda;
     constexpr int KVL = 512, ROPE = 64, D = 576, LD = MQA_LD, TR = MQA_TR;
-    constexpr int NST = H / 8, KS = 8 / NST, KP = D / KS, OPW = H / (4 * ValueGroups);
+    constexpr int NST = H / 8, KS = Replica ? 2 : 8 / NST, KP = D / KS, OPW = H / (4 * ValueGroups);
     extern __shared__ __align__(128) uint8_t smem[];
     __half* Qs = reinterpret_cast<__half*>(smem);
     __half* Ks = Qs + (size_t) H * LD;
@@ -322,9 +322,12 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
     __shared__ int wtot[8], s_n;
     const int vg=blockIdx.x % ValueGroups, sp = blockIdx.x / ValueGroups, nsp = gridDim.x / ValueGroups, t = blockIdx.y, pos = *pos0p + t;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    const int logical_shard = Replica ? (int)blockIdx.z : shard;
+    const int head_offset = Replica ? shard * 8 : 0;
+    constexpr int input_heads = Replica ? 32 : H;
     int n, lo = 0;
     if constexpr (DenseDsa) {
-        n = (pos + n_shards - shard) / n_shards;
+        n = (pos + n_shards - logical_shard) / n_shards;
     } else if (top_k > 0) {
         n = grouped_rows(pos, top_k, groups, n_cap, shard);
     } else if (!cells) {
@@ -355,7 +358,7 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
         n = s_n;
     }
     const int per = ((n + nsp - 1) / nsp + TR - 1) / TR * TR, rb = min(n, sp * per), re = min(n, rb + per);
-    const size_t pb = ((size_t) t * nsp + sp) * H;
+    const size_t pb = (((Replica ? (size_t)blockIdx.z * gridDim.y : 0) + t) * nsp + sp) * H;
     if (rb == re) {
         if (vg == 0 && tid < H) pm[pb + tid] = -INFINITY, pl[pb + tid] = 0.0f;
         return;  // merge only reads accumulator slices belonging to active splits
@@ -364,7 +367,7 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
         for (int i=tid;i<H*(D/8);i+=256) {
             const int h=i/(D/8),col=i%(D/8)*8;
             auto* dst=Qs+(size_t)h*LD+col;
-            auto* src=packed_q+((size_t)t*H+h)*D+col;
+            auto* src=packed_q+((size_t)t*input_heads+head_offset+(Replica ? h%8 : h))*D+col;
 #if __CUDA_ARCH__ >= 800
             unsigned da=(unsigned)__cvta_generic_to_shared(dst);
             asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(da),"l"(src));
@@ -378,10 +381,10 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
     } else for (int i = tid; i < H * D; i += 256) {
         const int h = i / D, c = i % D;
         float v;
-        if (c < KVL) v = qabs[((size_t) t * H + h) * KVL + c];
+        if (c < KVL) v = qabs[((size_t)t*input_heads+head_offset+(Replica ? h%8 : h))*KVL + c];
         else {
             const int j = c - KVL, jj = j >> 1;
-            const float* qp = q + (size_t) t * ldq + (size_t) h * qs + nope + 2 * jj;
+            const float* qp = q + (size_t) t * ldq + (size_t)(head_offset+(Replica ? h%8 : h)) * qs + nope + 2 * jj;
             float sn, cs;
             sincosf((float) pos * powf(theta, -2.0f * jj / ROPE), &sn, &cs);
             v = (j & 1) ? qp[0] * sn + qp[1] * cs : qp[0] * cs - qp[1] * sn;
@@ -402,7 +405,8 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
                 const int s2 = r0 + tid;
                 const uint8_t* p = nullptr;
                 if (s2 < re) {
-                    if constexpr (DenseDsa) p = kv + (size_t) s2 * KV_RB;
+                    if constexpr (Replica) p = kv + ((size_t)s2*n_shards+logical_shard)*KV_RB;
+                    else if constexpr (DenseDsa) p = kv + (size_t) s2 * KV_RB;
                     else if (top_k > 0) p = kv + (size_t)grouped_kv_row(s2, pos, top_k, groups, cells+(size_t)t*n_cap, nullptr) * KV_RB;
                     else p = !cells ? kv + (size_t) ((lo + s2) % (win + RING_PAD)) * KV_RB : kv + (size_t) cl[s2] * KV_RB;
                 }
@@ -424,7 +428,7 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
                 *reinterpret_cast<uint4*>(Ks + (size_t) r * LD + c) = out;
             }
             __syncthreads();
-            {
+            if (!Replica || w < NST * KS) {
                 const int st = w % NST, kp = w / NST, hi = st >> 1, ni = st & 1;
                 wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa;
                 wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
@@ -483,6 +487,51 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
         wmma::store_matrix_sync(pacc + (pb + hi * 16) * KVL + nj * 16, acc[i], KVL, wmma::mem_row_major);
     }
     if (vg == 0 && tid < H) pm[pb + tid] = sm_m[tid], pl[pb + tid] = sm_l[tid];
+}
+// Each virtual shard uses exactly the K splits and row order of the
+// context-parallel graph. Fold its partials before combining the four ranks.
+__global__ void kd_replica_merge(const float* pm,const float* pl,const float* acc,
+                                 int splits,int tokens,const float* sinks,float* out) {
+    const int t=blockIdx.y,h=blockIdx.x,tid=threadIdx.x,lane=tid%32,warp=tid/32;
+    __shared__ float factor[4][32], rank_max[4], rank_sum[4], scaling[4], denominator;
+    __shared__ int count[4];
+    if (warp<4) {
+        const size_t row=(((size_t)warp*tokens+t)*splits+lane)*16+h;
+        const float m=lane<splits ? pm[row] : -INFINITY;
+        const float l=lane<splits ? pl[row] : 0.f;
+        const int active=32-__clz(__ballot_sync(~0u,m!=-INFINITY));
+        const float mx=warp_max(m);
+        const float f=m==-INFINITY ? 0.f : __expf(m-mx);
+        factor[warp][lane]=f;
+        float sum=0.f;
+        for(int i=0;i<active;++i)
+            sum+=__shfl_sync(~0u,f,i)*__shfl_sync(~0u,l,i);
+        if(lane==0) { rank_max[warp]=mx;rank_sum[warp]=sum;count[warp]=active; }
+    }
+    __syncthreads();
+    if(tid==0) {
+        float mx=sinks[h];
+        for(int j=0;j<4;++j) mx=fmaxf(mx,rank_max[j]);
+        float den=__expf(sinks[h]-mx);
+        for(int j=0;j<4;++j) {
+            scaling[j]=rank_max[j]==-INFINITY ? 0.f : __expf(rank_max[j]-mx);
+            den+=scaling[j]*rank_sum[j];
+        }
+        denominator=den;
+    }
+    __syncthreads();
+    for(int c=tid;c<512;c+=blockDim.x) {
+        float combined=0.f;
+        for(int j=0;j<4;++j) {
+            float own=0.f;
+            for(int sp=0;sp<count[j];++sp) {
+                const size_t row=(((size_t)j*tokens+t)*splits+sp)*16+h;
+                own+=factor[j][sp]*acc[row*512+c];
+            }
+            combined+=scaling[j]*own;
+        }
+        out[((size_t)t*8+h)*512+c]=combined/denominator;
+    }
 }
 // fold the splits of (t, h): full (sinks != null): o[t][h] = acc / (L + e^(sink - M)); else the combine's partial
 // part[t][h][W] = (acc, M, L) relative to the splits' common max.  grid (H, T), 256 threads.

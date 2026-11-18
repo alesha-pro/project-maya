@@ -110,6 +110,7 @@ struct Shard {
     cudaStream_t st = nullptr;
     std::map<std::string, DW> w;
     std::map<int, uint8_t*> kv;       // layer -> Q8 rows (SWA ring / DSA context-parallel slots)
+    std::map<int, uint8_t*> prefix_kv;  // dense DSA prefix replicated per device
     std::map<int, float*> ring;
     std::map<int, __half*> pooled;   // the k-pool keys, F16 (replicated: the score reads every group)
     Io* dio = nullptr;
@@ -183,6 +184,11 @@ struct Model::Impl {
                 return t;
             }
         return nullptr;
+    }
+    bool replicate_prefix() const {
+        return S == 4 && Hd == 32 && graphs && std::getenv("HY4F_SHORT_GRAPH") &&
+               std::getenv("HY4F_REPLICATE_PREFIX") && !std::getenv("HY4F_OLD_DECODE") &&
+               !std::getenv("HY4F_DEC_ATTN2");
     }
     void load_draft_experts(const char* path, bool down_only) {
         if (!path || !*path) return;
@@ -561,6 +567,8 @@ struct Model::Impl {
                 HY_CK(cudaMemset(s.kv[il], 0, (size_t) (win + RING_PAD) * KV_RB));
             } else {
                 HY_CK(cudaMalloc(&s.kv[il], (size_t) (C / S + 1) * KV_RB));
+                if (replicate_prefix())
+                    HY_CK(cudaMalloc(&s.prefix_kv[il], (size_t)top_k * KV_RB));
                 s.ring[il] = dalloc((size_t) IRING * 2 * IK);
                 HY_CK(cudaMalloc(&s.pooled[il], sizeof(__half) * (size_t) (C / kpool + 1) * IK));
                 HY_CK(cudaMemset(s.pooled[il], 0, sizeof(__half) * (size_t) (C / kpool + 1) * IK));
