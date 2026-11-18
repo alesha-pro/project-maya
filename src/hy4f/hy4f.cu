@@ -1039,8 +1039,17 @@ bool Model::load(const Options& o, std::string& err) {
         for (int g = 0; g < d.S; ++g) {
             d.sh[g].g = g;
             d.sh[g].dev = devs[g];
-            d.load_shard(d.sh[g]);
-            if (d.df_nl) d.load_dfly_shard(d.sh[g]);
+        }
+        if (d.S > 1 && std::getenv("HY4F_PARALLEL_LOAD")) {
+            // Materialize the only lazy host-side weight before rank workers read it.
+            d.emb_host();
+            d.launch_parallel([&](Shard& s) { d.load_shard(s); });
+        } else {
+            for (auto& s : d.sh) d.load_shard(s);
+        }
+        if (d.df_nl) for (auto& s : d.sh) {
+            HY_CK(cudaSetDevice(s.dev));
+            d.load_dfly_shard(s);
         }
         if (d.S > 1) d.setup_peers();
         for (auto& s : d.sh) {
