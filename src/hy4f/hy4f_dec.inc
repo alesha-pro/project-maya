@@ -401,8 +401,12 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     const int xmc = rows_of(s, P + "xmoe");
     kb_f32_gemv<<<dim3(nb(n_exp * 32), T), 256, 0, s.st>>>(f32(s, P + "ffn_gate_inp.weight"), d.x, E, d.lg, n_exp, E, n_exp,
                                                            1.0f);
-    router(s, d.lg, f32(s, P + "exp_probs_b.bias"), T, d.eids, d.ew);
-    kd_local_ids<<<1, 128, 0, s.st>>>(d.eids, d.eloc, T * K, e0, e1);
+    if (n_exp == 512 && K == 16 && !std::getenv("HY4F_OLD_ROUTER"))
+        kd_router16<<<T, 512, 0, s.st>>>(d.lg, f32(s, P + "exp_probs_b.bias"), w_scale, e0, e1, d.eloc, d.ew);
+    else {
+        router(s, d.lg, f32(s, P + "exp_probs_b.bias"), T, d.eids, d.ew);
+        kd_local_ids<<<1, 128, 0, s.st>>>(d.eids, d.eloc, T * K, e0, e1);
+    }
     dec_mmvq(s, P + "xmoe", d.xq, d.xm, T);
     kd_q8_slots<<<dim3(nb(latent), T * K), 256, 0, s.st>>>(d.xm, xmc, latent, K, d.xlq);
     const bool grouped = !std::getenv("HY4F_IDS_LOOP");
@@ -427,12 +431,12 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     ids_mmvq(s.w.at(P + "ffn_gu_exps"), d.xlq, d.ga16, latent, 2 * n_ffx);
     k_swiglu_gu_q8<<<nb(T * K * n_ffx), 256, 0, s.st>>>(d.ga16, n_ffx, T * K * n_ffx, clampv, d.q16);
     ids_mmvq(s.w.at(P + "ffn_down_exps.weight"), d.q16, d.dn16, n_ffx, latent);
-    kd_moe_sum<<<dim3(nb(latent), T), 256, 0, s.st>>>(d.moe, d.dn16, d.ew, d.eloc, K, latent);
-    k_q8<<<nb(T * latent), 256, 0, s.st>>>(d.moe, T * latent, d.xq);
+    // d.q16 is dead after the expert down projection. Reuse it for the
+    // shorter shared-expert activation so both inputs survive concurrently.
+    kd_ffn_q8<<<dim3(nb(latent + fl), T), 256, 0, s.st>>>(d.dn16, d.ew, d.eloc, K, latent,
+                                                           d.xm + latent, xmc, fl, d.xq, d.q16);
     dec_mmvq(s, P + "ffn_routed_up.weight", d.xq, d.mu, T);
-    kb_swiglu_rows<<<dim3(nb(fl), T), 256, 0, s.st>>>(d.xm + latent, xmc, fl, T, d.shh);
-    k_q8<<<nb(T * fl), 256, 0, s.st>>>(d.shh, T * fl, d.xq);
-    dec_mmvq(s, P + "ffn_down_shexp.weight", d.xq, d.sh, T);
+    dec_mmvq(s, P + "ffn_down_shexp.weight", d.q16, d.sh, T);
     d_ar(s, d, d.mu, d.sh, P + "post_ffw_norm.weight", T, mtp, nx_after);
 }
 

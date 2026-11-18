@@ -935,6 +935,73 @@ __global__ void __launch_bounds__(NE) kd_router(const float* __restrict__ logits
 }
 
 
+// Exact top-16 router. Merge sixteen warp-local runs four times, keeping only
+// their best sixteen entries after each merge. The low bits break ties by ID.
+__device__ __forceinline__ unsigned long long router_winner(unsigned long long v, int dist, bool want_max) {
+    const unsigned long long other = __shfl_xor_sync(0xffffffffu, v, dist);
+    return (other > v) == want_max ? other : v;
+}
+__global__ void kd_router16(const float* logits, const float* bias, float scale, int e0, int e1,
+                            int* local, float* weights) {
+    __shared__ float prob[512];
+    __shared__ unsigned long long run[2][256];
+    const int i = threadIdx.x, warp = i >> 5, lane = i & 31, t = blockIdx.x;
+    const float p = 1.0f / (1.0f + expf(-logits[t * 512 + i]));
+    prob[i] = p;
+    const float score = bias ? p + bias[i] : p;
+    const unsigned bits = __float_as_uint(score == 0.0f ? 0.0f : score);
+    const unsigned ordered = bits ^ ((bits >> 31) ? 0xffffffffu : 0x80000000u);
+    unsigned long long v = (static_cast<unsigned long long>(ordered) << 32) | (511 - i);
+#pragma unroll
+    for (int size = 2; size <= 32; size <<= 1)
+#pragma unroll
+        for (int d = size >> 1; d; d >>= 1)
+            v = router_winner(v, d, ((lane & size) == 0) == ((lane & d) == 0));
+    if (lane < 16) run[0][warp * 16 + lane] = v;
+#pragma unroll
+    for (int stage = 0; stage < 4; ++stage) {
+        __syncthreads();
+        if (warp < (8 >> stage)) {
+            // Lower half is descending, upper half ascending, hence bitonic.
+            v = run[stage & 1][warp * 32 + (lane < 16 ? lane : (47 - lane))];
+#pragma unroll
+            for (int d = 16; d; d >>= 1) v = router_winner(v, d, (lane & d) == 0);
+            if (lane < 16) run[(stage + 1) & 1][warp * 16 + lane] = v;
+        }
+    }
+    if (warp == 0) {
+        const int id = 511 - static_cast<int>(static_cast<unsigned>(v));
+        const float selected = prob[id];
+        double sum = 0.0;
+#pragma unroll
+        for (int k = 0; k < 16; ++k) sum += (double)__shfl_sync(0xffffffffu, selected, k);
+        if (lane < 16) {
+            const float norm = (float)(1.0 / fmax(sum, 6.103515625e-5));
+            weights[t * 16 + lane] = (float)((double)selected * norm * scale);
+            local[t * 16 + lane] = id >= e0 && id < e1 ? id - e0 : -1;
+        }
+    }
+}
+
+// Both latent and shared FFN projections consume Q8_1, so write the
+// quantized rows directly. The summation is in the original slot order.
+__global__ void kd_ffn_q8(const float* dn, const float* weights, const int* local, int K, int latent,
+                          const float* shared_gu, int ld, int fl, Q81* routed_q, Q81* shared_q) {
+    const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < latent) {
+        float sum = 0.0f;
+        for (int k = 0; k < K; ++k) {
+            const int r = t * K + k;
+            if (local[r] >= 0) sum += weights[r] * dn[(size_t)r * latent + i];
+        }
+        q81_store(routed_q + ((size_t)t * latent + i) / 32, sum);
+    } else if (i < latent + fl) {
+        const int j = i - latent;
+        const float* gu = shared_gu + (size_t)t * ld;
+        q81_store(shared_q + ((size_t)t * fl + j) / 32, silu(gu[j]) * gu[fl + j]);
+    }
+}
+
 // ---- DFly2 drafter (hy4f_dfly.inc).  io = the step's IoT {pos = anchor, n = source row, toks}.
 // the draft block's cell lists: row t = the target's top-k cells of the source row (positions < anchor, -1 unused) +
 // the block's own positions anchor .. anchor + t (causal inside the block).  blockIdx.x = t.
