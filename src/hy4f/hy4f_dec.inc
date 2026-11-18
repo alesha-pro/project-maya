@@ -316,7 +316,10 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
         for (int r = 1; r < S; ++r)
             kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, d.ar, s.g, (s.g + r) % S, d.ar_ctr, d.arrive);
     if (nx && !mtp && E % 256 == 0 && E / 256 <= 16 && !tail_old) {   // (two wide kernels)
-        if (!overlap) (d.hc_side ? kd_art_a<false,true> : kd_art_a<false,false>)<<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), d.X, d.post,
+        if (!overlap && !d.hc_side && d.ar.bf==2 && std::getenv("HY4F_HC_COLUMNS"))
+            kd_art_columns<<<dim3(E/256,T,4),256,0,s.st>>>(x1,x2,T,E,d.ar,s.g,S,d.ar_ctr,d.arrive+4,
+                f32(s,norm),d.X,d.post,hc,*nx,d.ysc,d.tpart,d.tppost);
+        else if (!overlap) (d.hc_side ? kd_art_a<false,true> : kd_art_a<false,false>)<<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, d.ar, s.g, S, d.ar_ctr, d.arrive + 4, f32(s, norm), d.X, d.post,
                                                      hc, *nx, d.ysc, d.tpart, d.tppost);
         if (d.hc_side) HY_CK(cudaStreamWaitEvent(s.st,d.hc_join));
         kd_art_b<<<dim3(E / 256, T), 256, 0, s.st>>>(E, f32(s, norm), eps, d.X, d.post, hc, *nx, hc_eps, d.ysc, d.tpart, d.tppost,

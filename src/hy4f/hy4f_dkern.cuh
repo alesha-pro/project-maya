@@ -1116,6 +1116,79 @@ __global__ void kd_add(const float* __restrict__ a, const float* __restrict__ b,
 __device__ __forceinline__ int art_g(int s, int s2) {   // index of G[s][s2] (s <= s2) among the 10
     return s == 0 ? s2 : s == 1 ? 3 + s2 : s == 2 ? 5 + s2 : 9;
 }
+// Split the 32 independent HC reduction columns into four CTA groups. In a
+// single-row decode the original twelve CTAs leave most SMs idle.
+__global__ void kd_art_columns(const float* x1,const float* x2,int T,int n,PeersD P,int me,int ranks,
+                               int* counter,int* arrive,const float* nw,const float* X,const float* post,
+                               int hc,HcNext nx,float* Y,float* part,float* ppost) {
+    const int t=blockIdx.y,b=blockIdx.x,g=blockIdx.z,tid=threadIdx.x,i=b*256+tid;
+    const int step=*counter+1,lane=tid&31,w=tid/32;
+    float xs[4],pp[4],a[10]={},fw[4][4];
+#pragma unroll
+    for(int h=0;h<4;++h) {
+        xs[h]=h<hc ? X[((size_t)t*hc+h)*n+i] : 0.f;
+        pp[h]=h<hc ? post[t*8+h] : 0.f;
+    }
+    int count;
+    if(g<=1) {
+        count=8;
+#pragma unroll
+        for(int q=0;q<4;++q)
+#pragma unroll
+            for(int h=0;h<4;++h) {
+                float f=q+4*g<nx.n_mix && h<hc?nx.fn[((size_t)(q+4*g)*hc+h)*n+i]:0.f;
+                fw[q][h]=f;
+                if(q+4*g<nx.n_mix && h<hc) a[q]+=f*xs[h];
+            }
+    } else if(g==2) {
+        count=10;
+#pragma unroll
+        for(int h=0;h<4;++h)
+#pragma unroll
+            for(int j=h;j<4;++j) a[art_g(h,j)]=xs[h]*xs[j];
+    } else count=6;
+    if(g!=2) {
+        const int tn=T*n; const float* rv=P.buf[me][step&1];
+        float v=0.f;
+        for(int j=0;j<ranks;++j)
+            v+=j==me?ar_own(P,x1[(size_t)t*n+i]+(x2?x2[(size_t)t*n+i]:0.f)):
+                     ar_peer(P,step,rv,(size_t)j*tn+(size_t)t*n+i);
+        float yp=v*nw[i];
+        if(g<=1) {
+#pragma unroll
+            for(int q=0;q<4;++q)
+#pragma unroll
+                for(int h=0;h<4;++h)
+                    if(q+4*g<nx.n_mix && h<hc) a[4+q]+=pp[h]*(fw[q][h]*yp);
+        } else {
+            Y[(size_t)t*n+i]=v;
+            a[0]=v*v;
+#pragma unroll
+            for(int h=0;h<4;++h) a[h+1]=xs[h]*yp;
+            a[5]=yp*yp;
+            if(!b && tid<4) ppost[t*4+tid]=pp[tid];
+        }
+    }
+    __shared__ float red[8][11];
+#pragma unroll
+    for(int j=0;j<10;++j) if(j<count) {
+        float v=warp_sum(a[j]);
+        if(!lane) red[w][j]=v;
+    }
+    __syncthreads();
+    if(tid<count) {
+        const int col=g<=1 ? (tid<4?1+g*4+tid:9+g*4+tid-4)
+                           : (g==2 ? 17+tid : (tid==0?0:26+tid));
+        float v=0.f;
+#pragma unroll
+        for(int z=0;z<8;++z) v+=red[z][tid];
+        part[((size_t)t*gridDim.x+b)*32+col]=v;
+    }
+    __syncthreads();
+    if(tid==0 && atomicAdd(arrive,1)==(int)(gridDim.x*gridDim.y*gridDim.z)-1) {
+        *arrive=0; *counter=step;
+    }
+}
 // The existing X-dependent HC partials can run alongside the sublayer.
 __global__ void kd_art_prepare(const float* X, int n, int hc, HcNext nx, float* part) {
     const int t=blockIdx.y,b=blockIdx.x,tid=threadIdx.x,i=b*256+tid;
