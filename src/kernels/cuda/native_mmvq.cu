@@ -1820,6 +1820,58 @@ __device__ __forceinline__ void q3_rows_cache(const Q3KBlock* weights, const Q81
         }
     }
 }
+// x's 8-element sums provide Q4_K's minimum correction. The four
+// dot-of-ones instructions and four x loads are shared by Reuse rows.
+template<int Slots, int Rows, int Reuse>
+__device__ __forceinline__ void q4_rows_cache(const Q4KBlock* weights, const Q81Block* x, const int* slots,
+                                             int start_row, float* y) {
+    const int lane = threadIdx.x & 31, iq = lane & 15;
+    const int qoff = 2 * (iq / 4), qi = iq % 4;
+    int id[Slots], u[Slots][3][4], usum[Slots][3][2]; float ds[Slots][3][2];
+#pragma unroll
+    for (int t = 0; t < Slots; ++t) {
+        id[t] = slots[t];
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const Q81Block* a = x + id[t] * 48 + ((lane >> 4) + 2 * k) * 8 + qoff;
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int* q = reinterpret_cast<const int*>(a[j].qs) + qi;
+                u[t][k][2*j] = q[0]; u[t][k][2*j + 1] = q[4];
+                usum[t][k][j] = __dp4a(0x01010101,q[4],__dp4a(0x01010101,q[0],0));
+                ds[t][k][j] = __low2float(a[j].ds);
+            }
+        }
+    }
+#pragma unroll 1
+    for (int row = start_row; row < start_row + 4 * Reuse; row += 4) {
+        float acc[Slots] = {};
+#pragma unroll
+        for (int k = 0; k < 3; ++k) {
+            const auto wt = Q4KTraits::load(weights + row * 6 + (lane >> 4) + 2*k, iq * 2);
+            const auto* sc = reinterpret_cast<const uint8_t*>(wt.aux);
+            const auto dm = __half22float2(wt.dm);
+            float sub[Slots] = {}, mins[Slots] = {};
+#pragma unroll
+            for (int j = 0; j < 2; ++j) {
+                const int v0 = (wt.v[0] >> (4*j)) & 0x0f0f0f0f, v1 = (wt.v[1] >> (4*j)) & 0x0f0f0f0f;
+#pragma unroll
+                for (int t = 0; t < Slots; ++t) {
+                    int dp = __dp4a(v1,u[t][k][2*j+1], __dp4a(v0,u[t][k][2*j],0));
+                    sub[t] += ds[t][k][j] * float(dp * sc[j]);
+                    mins[t] += ds[t][k][j] * float(usum[t][k][j] * sc[2+j]);
+                }
+            }
+#pragma unroll
+            for (int t = 0; t < Slots; ++t) acc[t] += dm.x * sub[t] - dm.y * mins[t];
+        }
+#pragma unroll
+        for (int t = 0; t < Slots; ++t) {
+            const float v = warp_sum(acc[t]);
+            if (!lane) y[id[t] * Rows + row] = v;
+        }
+    }
+}
 template<int Rows, int Reuse>
 __global__ void __launch_bounds__(128) hy4_q3_cache(const Q3KBlock* w, size_t eb, const int* ng, const int* gexp,
                                                     const int* goff, const int* gslot, const Q81Block* x, float* y) {
@@ -1838,6 +1890,24 @@ __global__ void __launch_bounds__(128) hy4_q3_cache(const Q3KBlock* w, size_t eb
         }
     }
 }
+template<int Rows, int Reuse>
+__global__ void __launch_bounds__(128) hy4_q4_cache(const Q4KBlock* w, size_t eb, const int* ng, const int* gexp,
+                                                    const int* goff, const int* gslot, const Q81Block* x, float* y) {
+    const int tiles = Rows / (4 * Reuse), total = *ng * tiles;
+    for (int tile = blockIdx.x; tile < total; tile += gridDim.x) {
+        const int g = tile / tiles, r = (tile % tiles) * (4 * Reuse) + (threadIdx.x >> 5);
+        const Q4KBlock* wg = w + size_t(gexp[g]) * eb;
+        const int off = goff[g], ns = goff[g + 1] - off;
+        const int* slots = gslot + off;
+        if (ns == 1) q4_rows_cache<1, Rows, Reuse>(wg, x, slots, r, y);
+        else if (ns == 2) q4_rows_cache<2, Rows, Reuse>(wg, x, slots, r, y);
+        else {
+            for (int i = r; i < r + 4 * Reuse; i += 4)
+                if (ns == 3) grouped_row1536<Q4KTraits, 3>(wg + i * 6, x, slots, y, i, Rows);
+                else grouped_row1536<Q4KTraits, 4>(wg + i * 6, x, slots, y, i, Rows);
+        }
+    }
+}
 template<class F> bool try_grouped1536(const void* weights, size_t expert_bytes, const int* ng, const int* gexp,
                                        const int* goff, const int* gslot, const void* x, float* y,
                                        int n_in, int n_out, int blocks, void* stream) {
@@ -1850,6 +1920,14 @@ template<class F> bool try_grouped1536(const void* weights, size_t expert_bytes,
         if (std::getenv("HY4F_Q3_CACHE")) {
             if (n_out == 3072) hy4_q3_cache<3072, 4><<<blocks * 2, 128, 0, st>>>(w, eb, ng, gexp, goff, gslot, q, y);
             else hy4_q3_cache<1536, 4><<<blocks * 2, 128, 0, st>>>(w, eb, ng, gexp, goff, gslot, q, y);
+            launch_check();
+            return true;
+        }
+    }
+    if constexpr (std::is_same_v<F, Q4KTraits>) {
+        if (std::getenv("HY4F_Q4_CACHE")) {
+            if (n_out == 3072) hy4_q4_cache<3072, 4><<<blocks * 2, 128, 0, st>>>(w, eb, ng, gexp, goff, gslot, q, y);
+            else hy4_q4_cache<1536, 4><<<blocks * 2, 128, 0, st>>>(w, eb, ng, gexp, goff, gslot, q, y);
             launch_check();
             return true;
         }
