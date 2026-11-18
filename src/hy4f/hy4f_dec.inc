@@ -52,6 +52,7 @@ float* hlogT = nullptr;    // [DT][V] pinned
 float* hargv = nullptr;    // [S][DT] pinned (per shard max)
 int* hargi = nullptr;
 float* hmargv = nullptr;   // [S] (MTP draft)
+float* hmlog = nullptr;    // [V] pinned: the MTP head's logits row (for drafts sampled from it)
 int* hmargi = nullptr;
 int64_t m_next = 0;        // next MTP position
 
@@ -468,6 +469,7 @@ void mtp_ops(Shard& s, DShard& d, int T, bool chain = false) {
     head_rows(s, d, d.mh, 1, d.argv + DT - 1, d.argi + DT - 1);
     HY_CK(cudaMemcpyAsync(hmargv + s.g, d.argv + DT - 1, sizeof(float), cudaMemcpyDeviceToHost, s.st));
     HY_CK(cudaMemcpyAsync(hmargi + s.g, d.argi + DT - 1, sizeof(int), cudaMemcpyDeviceToHost, s.st));
+    HY_CK(cudaMemcpyAsync(hmlog + (size_t) s.g * (V / S), d.logits, sizeof(float) * (V / S), cudaMemcpyDeviceToHost, s.st));
 }
 
 void dec_setup() {
@@ -478,6 +480,7 @@ void dec_setup() {
     HY_CK(cudaHostAlloc((void**) &hargi, sizeof(int) * S * DT, cudaHostAllocPortable));
     HY_CK(cudaHostAlloc((void**) &hmargv, sizeof(float) * S, cudaHostAllocPortable));
     HY_CK(cudaHostAlloc((void**) &hmargi, sizeof(int) * S, cudaHostAllocPortable));
+    HY_CK(cudaHostAlloc((void**) &hmlog, sizeof(float) * V, cudaHostAllocPortable));
     std::memset(hio_v, 0, sizeof(IoT));
     std::memset(hio_m, 0, sizeof(IoT));
     dsh.resize(sh.size());

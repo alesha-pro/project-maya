@@ -225,7 +225,11 @@ struct Lines {
 struct Sampler {
     std::vector<float> row;
     std::vector<std::pair<float, int>> c;
-    int next(const float* lg, int V, const Req& r, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+    std::vector<int> cand;
+    // the warped distribution of a row as dense probabilities P [V] (0 outside the kept set): logit_bias, the penalties,
+    // temperature, then top_k / min_p / top_p on the candidates (no sort over the whole vocabulary unless a cutoff
+    // needs it: the candidates are the tokens within 30 nats of the best)
+    void probs(const float* lg, int V, const Req& r, const std::vector<int32_t>& hist, std::vector<float>& P) {
         const bool pen = r.pen_n != 0 && (r.pen_repeat != 1.0f || r.pen_freq != 0.0f || r.pen_present != 0.0f);
         if (pen || !r.bias.empty()) {
             row.assign(lg, lg + V);
@@ -244,42 +248,74 @@ struct Sampler {
             }
             lg = row.data();
         }
-        if (!(r.temperature > 0.0f)) {
-            int b = 0;
-            for (int i = 1; i < V; ++i)
-                if (lg[i] > lg[b]) b = i;
-            return b;
-        }
-        c.resize((size_t) V);
-        for (int i = 0; i < V; ++i) c[(size_t) i] = {lg[i] / r.temperature, i};
-        const size_t k = r.top_k > 0 ? std::min((size_t) r.top_k, c.size()) : c.size();
-        std::partial_sort(c.begin(), c.begin() + (long) k, c.end(), [](const auto& a, const auto& b) {
-            return a.first > b.first || (a.first == b.first && a.second < b.second);
-        });
-        std::vector<double> p(k);
+        P.assign((size_t) V, 0.0f);
+        const float inv = 1.0f / r.temperature;
+        float mx = lg[0];
+        for (int i = 1; i < V; ++i) mx = std::max(mx, lg[i]);
+        const bool cut = r.top_k > 0 || r.top_p < 1.0f || r.min_p > 0.0f;
         double sum = 0;
-        for (size_t i = 0; i < k; ++i) sum += (p[i] = std::exp((double) (c[i].first - c[0].first)));
-        size_t keep = k;
-        double cum = 0;
-        for (size_t i = 0; i < k; ++i) {
-            cum += p[i] / sum;
-            if (r.min_p > 0.0f && p[i] < r.min_p * p[0]) {
-                keep = std::max<size_t>(1, i);
-                break;
+        if (!cut) {
+            for (int i = 0; i < V; ++i) sum += (P[(size_t) i] = std::exp((lg[i] - mx) * inv));
+        } else {
+            cand.clear();
+            for (int i = 0; i < V; ++i)
+                if ((lg[i] - mx) * inv > -30.0f) cand.push_back(i);
+            c.resize(cand.size());
+            for (size_t j = 0; j < cand.size(); ++j) c[j] = {lg[cand[j]] * inv, cand[j]};
+            const size_t k = r.top_k > 0 ? std::min((size_t) r.top_k, c.size()) : c.size();
+            std::partial_sort(c.begin(), c.begin() + (long) k, c.end(), [](const auto& a2, const auto& b2) {
+                return a2.first > b2.first || (a2.first == b2.first && a2.second < b2.second);
+            });
+            std::vector<double> e(k);
+            double tot = 0;
+            for (size_t i = 0; i < k; ++i) tot += (e[i] = std::exp((double) (c[i].first - c[0].first)));
+            size_t keep = k;
+            double cum = 0;
+            for (size_t i = 0; i < k; ++i) {
+                cum += e[i] / tot;
+                if (r.min_p > 0.0f && e[i] < r.min_p * e[0]) {
+                    keep = std::max<size_t>(1, i);
+                    break;
+                }
+                if (r.top_p < 1.0f && cum >= r.top_p) {
+                    keep = i + 1;
+                    break;
+                }
             }
-            if (r.top_p < 1.0f && cum >= r.top_p) {
-                keep = i + 1;
-                break;
+            for (size_t i = 0; i < keep; ++i) sum += (P[(size_t) c[i].second] = (float) e[i]);
+        }
+        const float is = (float) (1.0 / sum);
+        for (int i = 0; i < V; ++i) P[(size_t) i] *= is;
+    }
+    static int draw(const std::vector<float>& P, std::mt19937_64& rng) {
+        double u = std::uniform_real_distribution<double>(0.0, 1.0)(rng), acc = 0;
+        int last = 0;
+        for (size_t i = 0; i < P.size(); ++i)
+            if (P[i] > 0.0f) {
+                acc += P[i];
+                last = (int) i;
+                if (u <= acc) return (int) i;
             }
+        return last;
+    }
+    std::vector<float> pd;
+    int next(const float* lg, int V, const Req& r, const std::vector<int32_t>& hist, std::mt19937_64& rng) {
+        if (!(r.temperature > 0.0f)) {
+            const float* l = lg;
+            if (!r.bias.empty() || (r.pen_n != 0 && (r.pen_repeat != 1.0f || r.pen_freq != 0.0f || r.pen_present != 0.0f))) {
+                // (greedy with a bias / penalty: the warp at temperature 1, the argmax of it)
+                Req r1 = r;
+                r1.temperature = 1.0f, r1.top_k = 0, r1.top_p = 1.0f, r1.min_p = 0.0f;
+                probs(lg, V, r1, hist, pd);
+                return (int) (std::max_element(pd.begin(), pd.end()) - pd.begin());
+            }
+            int b2 = 0;
+            for (int i = 1; i < V; ++i)
+                if (l[i] > l[b2]) b2 = i;
+            return b2;
         }
-        double tot = 0;
-        for (size_t i = 0; i < keep; ++i) tot += p[i];
-        double u = std::uniform_real_distribution<double>(0.0, tot)(rng);
-        for (size_t i = 0; i < keep; ++i) {
-            u -= p[i];
-            if (u <= 0) return c[i].second;
-        }
-        return c[keep - 1].second;
+        probs(lg, V, r, hist, pd);
+        return draw(pd, rng);
     }
 };
 
@@ -547,13 +583,30 @@ int serve(Model& m, const ServeOptions& so) {
         if (in.stop.load()) finish = "cancel";
         int32_t dr[4] = {0, 0, 0, 0}, am[4];
         // drafts d0 (the MTP over the kept rows, or after the prompt its last state) and d1.. chained
+        // sampling: drafts drawn from the MTP's own (warped) distribution q_i, kept with probability min(1, p/q) and on a
+        // rejection the token drawn from max(0, p - q) (speculative sampling: the output is distributed exactly as the
+        // target's; the acceptance is 1 - TV(p, q) instead of p(d) for an argmax draft)
+        const bool ssamp = r.temperature > 0.0f;
+        std::vector<float> mlg(ssamp ? (size_t) V : 0);
+        std::vector<std::vector<float>> Q(ssamp ? 4 : 0);
         auto draft = [&](const int32_t* nt, int T, int64_t mpos) {
-            if (!m.mtp(nt, T, mpos, &dr[0], err)) fatal("mtp at " + std::to_string(mpos) + ": " + err, produced, n);
+            if (!m.mtp(nt, T, mpos, &dr[0], err, ssamp ? mlg.data() : nullptr))
+                fatal("mtp at " + std::to_string(mpos) + ": " + err, produced, n);
+            if (ssamp) {
+                sampler.probs(mlg.data(), V, r, state, Q[0]);
+                dr[0] = Sampler::draw(Q[0], rng);
+            }
             const int64_t next = mpos + T;
-            for (int i = 1; i < kc.k; ++i)
-                if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err))
+            for (int i = 1; i < kc.k; ++i) {
+                if (!m.mtp_chain(dr[i - 1], next + i - 1, &dr[i], err, ssamp ? mlg.data() : nullptr))
                     fatal("mtp_chain at " + std::to_string(next + i - 1) + ": " + err, produced, n);
+                if (ssamp) {
+                    sampler.probs(mlg.data(), V, r, state, Q[i]);
+                    dr[i] = Sampler::draw(Q[i], rng);
+                }
+            }
         };
+        std::vector<float> Pr, Res;
         if (more && spec) draft(&tok, 1, (int64_t) state.size() - 1);
         while (more) {
             if (in.stop.load()) {
@@ -569,8 +622,39 @@ int serve(Model& m, const ServeOptions& so) {
             state.push_back(tok);
             int acc = 0;
             for (int i = 0;; ++i) {
-                const int y = pick(lgT.data() + (size_t) i * V, am[i]);
-                if (i < kk && y == dr[i]) {   // the draft kept: its row is the cache's now
+                int y;
+                bool kept;
+                if (ssamp && i < kk) {
+                    sampler.probs(lgT.data() + (size_t) i * V, V, r, state, Pr);
+                    const float pq = Pr[(size_t) dr[i]], qq = Q[i][(size_t) dr[i]];
+                    const double u = std::uniform_real_distribution<double>(0.0, 1.0)(rng);
+                    kept = qq > 0.0f && u < std::min(1.0, (double) pq / (double) qq);
+                    if (kept) {
+                        y = dr[i];
+                    } else {
+                        Res.assign((size_t) V, 0.0f);
+                        double rs = 0;
+                        for (int v = 0; v < V; ++v) {
+                            const float d2 = Pr[(size_t) v] - Q[i][(size_t) v];
+                            if (d2 > 0.0f) rs += (Res[(size_t) v] = d2);
+                        }
+                        if (rs > 0) {
+                            const float is = (float) (1.0 / rs);
+                            for (auto& x : Res) x *= is;
+                            y = Sampler::draw(Res, rng);
+                        } else {
+                            y = Sampler::draw(Pr, rng);
+                        }
+                    }
+                    if (in_think && (produced >= r.think_budget || in.wrap.load()) && y != r.think_end) {
+                        y = r.think_end;
+                        kept = y == dr[i];
+                    }
+                } else {
+                    y = pick(lgT.data() + (size_t) i * V, am[i]);
+                    kept = i < kk && y == dr[i];
+                }
+                if (i < kk && kept) {   // the draft kept: its row is the cache's now
                     ++acc;
                     state.push_back(y);
                     if (!emit(y)) {

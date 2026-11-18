@@ -1042,7 +1042,7 @@ bool Model::verify(const int32_t* toks, int T, int64_t pos, float* logits, int32
     }
 }
 
-bool Model::mtp(const int32_t* next_toks, int T, int64_t mpos, int32_t* draft, std::string& err) {
+bool Model::mtp(const int32_t* next_toks, int T, int64_t mpos, int32_t* draft, std::string& err, float* logits) {
     try {
         Impl& d = *d_;
         if (!d.has_mtp || d.dsh.empty()) throw std::runtime_error("hy4f: no MTP layer (or no CUDA graphs)");
@@ -1058,13 +1058,14 @@ bool Model::mtp(const int32_t* next_toks, int T, int64_t mpos, int32_t* draft, s
         for (int g = 0; g < d.S; ++g)
             if (d.hmargv[g] > bv) bv = d.hmargv[g], bi = d.hmargi[g];
         if (draft) *draft = bi;
+        if (logits) std::memcpy(logits, d.hmlog, sizeof(float) * d.V);
         return true;
     } catch (const std::exception& e) {
         err = e.what();
         return false;
     }
 }
-bool Model::mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& err) {
+bool Model::mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& err, float* logits) {
     try {
         Impl& d = *d_;
         if (!d.has_mtp || d.dsh.empty()) throw std::runtime_error("hy4f: no MTP layer (or no CUDA graphs)");
@@ -1078,6 +1079,7 @@ bool Model::mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& er
         for (int g = 0; g < d.S; ++g)
             if (d.hmargv[g] > bv) bv = d.hmargv[g], bi = d.hmargi[g];
         if (draft) *draft = bi;
+        if (logits) std::memcpy(logits, d.hmlog, sizeof(float) * d.V);
         return true;
     } catch (const std::exception& e) {
         err = e.what();
