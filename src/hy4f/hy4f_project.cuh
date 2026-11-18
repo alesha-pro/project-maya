@@ -54,6 +54,7 @@ struct ProjectionArgs {
     const float* gate = nullptr;
     int gate_stride = 0;
     Q81* qout = nullptr;
+    const __half* scale_base = nullptr;  // Optional scale slice from a larger packed matrix.
 };
 
 template<int K, int T, int Groups, int Base>
@@ -83,7 +84,7 @@ __global__ void kd_project_q8(ProjectionArgs p) {
     constexpr int Lanes = 32 / Groups;
     const int row = (blockIdx.x * blockDim.x + threadIdx.x) / Lanes;
     const int lane = threadIdx.x % Lanes, head = row / O;
-    const auto* scales = reinterpret_cast<const __half*>(p.w + (size_t)p.H * O * K);
+    const auto* scales = p.scale_base ? p.scale_base : reinterpret_cast<const __half*>(p.w + (size_t)p.H * O * K);
     float acc[Groups][T] = {};
     projection_dot<K, T, Groups, 0>(p, scales, head, row, lane, acc);
     __shared__ float output_row[K == 512 ? T : 1][32];

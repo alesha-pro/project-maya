@@ -447,7 +447,7 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
         kb_kv_prep<true><<<T,576,0,b.st>>>(b.xp + okv, (int)xp_ld, f32(s,P+"attn_kv_a_norm.weight"),
             kvl,rope,eps,th,s.kv[il],b.pp,2,S,s.g,0,s.prefix_kv.at(il),top_k);
     else
-    kb_kv_prep<<<T, 576, 0, b.st>>>(b.xp + okv, (int) xp_ld, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th,
+        kb_kv_prep<<<T, 576, 0, b.st>>>(b.xp + okv, (int) xp_ld, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th,
                                     sw ? b.chunk_cur + (size_t) b.chunk_off * KV_RB : s.kv[il], b.pp, sw ? 1 : 2, S, s.g, 0);
     if (cache_only && sw) {
         if (b.ring_T > 0)

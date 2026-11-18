@@ -400,7 +400,12 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     const bool sw = swa[il] != 0;
     const int Hl = sw ? Hs / S : Hd / S, QH = nope + rope;
     const float th = sw ? theta_swa : theta;
-    const int xpc = rows_of(s, P + "xproj"), qpc = !sw && dense_dsa ? Hd * QH : rows_of(s, P + "qproj");
+    const DW& kb = s.w.at(P + "attn_k_b.weight");
+    const bool local_queries = !sw && dense_dsa && !s.prefix_kv.empty() && kb.type == T_Q8_0 &&
+                               std::getenv("HY4F_LOCAL_QUERY");
+    const int query_first = local_queries ? s.g * Hl : 0;
+    const int Ha = (sw || local_queries) ? Hl : Hd;
+    const int xpc = rows_of(s,P+"xproj"), qpc = !sw && dense_dsa ? Ha * QH : rows_of(s,P+"qproj");
     const int oq = 0, okv = q_lora, og = q_lora + KV_ROW, oik = og + Hl * vh;
     if (!ready) {
         if (mtp) kb_rms<<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "attn_norm.weight"), E, eps, d.x, E);
@@ -422,7 +427,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         kb_kv_prep<true><<<T,576,0,keys>>>(d.xp+okv,xpc,f32(s,P+"attn_kv_a_norm.weight"),kvl,
             rope,eps,th,s.kv[il],pp,2,S,s.g,0,s.prefix_kv.at(il),top_k);
     else
-    kb_kv_prep<<<T, 576, 0, keys>>>(d.xp + okv, xpc, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th, s.kv[il], pp,
+        kb_kv_prep<<<T, 576, 0, keys>>>(d.xp + okv, xpc, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th, s.kv[il], pp,
                                     sw ? 3 : 2, S, s.g, win + RING_PAD);
     if (!sw) d_indexer_cache(s, d, P, il, pp, T, xpc, oik, th, keys);
     if (side) HY_CK(cudaEventRecord(d.attention_join, side));
@@ -440,7 +445,8 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     k_q8<<<nb(T * q_lora), 256, 0, s.st>>>(d.qr, T * q_lora, d.xq);
     if (!sw && dense_dsa) {
         const DW& q = s.w.at(P + "qproj");
-        kn::native_q8_0_mmvq(q.d, d.xq, d.qp, (int) q.ne[0], qpc, T, s.st);
+        const auto* weights=static_cast<const uint8_t*>(q.d)+(size_t)query_first*QH*q.rb;
+        kn::native_q8_0_mmvq(weights, d.xq, d.qp, (int) q.ne[0], qpc, T, s.st);
     } else dec_mmvq(s, P + "qproj", d.xq, d.qp, T);
     const bool async_select = !sw && !dense_dsa && side && std::getenv("HY4F_INDEX_OVERLAP");
     if (async_select) {
@@ -449,19 +455,23 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         d_indexer_select(s,d,P,il,pp,T,qpc,QH,th,side);
         HY_CK(cudaEventRecord(d.attention_join,side));
     }
-    const DW& kb = s.w.at(P + "attn_k_b.weight");
     const DW& vb = s.w.at(P + "attn_v_b.weight");
     const float scale = 1.0f / std::sqrt((float) QH);
-    const int Ha = sw ? Hl : Hd;
     const bool split = !std::getenv("HY4F_DEC_ATTN2");
     const bool pack_query = std::getenv("HY4F_PACK_QUERY") && split && kb.type==T_Q8_0 && kvl==512 && rope==64
         && ((sw && Hl==16) || (!sw && S>1 && Hd==32)) && (size_t)Ha*576<=size_t(n_used)*2*n_ffx*2;
     __half* qh=pack_query ? reinterpret_cast<__half*>(d.ga16) : nullptr;
     if (kb.packed_projection) {
         ProjectionArgs args{(const uint8_t*)kb.d, d.qp, Ha, qpc, QH, d.qabs, qh, pp, th, scale};
+        if (local_queries) {
+            const size_t first_row=(size_t)query_first*kvl;
+            args.w+=first_row*nope;
+            args.scale_base=reinterpret_cast<const __half*>(static_cast<const uint8_t*>(kb.d)+(size_t)Hd*kvl*nope)
+                            + first_row*(nope/32);
+        }
         launch_projection<192>(T, args, s.st);
     } else if (kb.type == T_Q8_0) {
-        const uint8_t* kw = (const uint8_t*) kb.d;
+        const uint8_t* kw = (const uint8_t*)kb.d + (size_t)query_first*kvl*kb.rb;
         const int g = nb(Ha * kvl * 32);
         switch (T) {
         case 1: (pack_query ? kd_absorb<1,true> : kd_absorb<1,false>)<<<g,256,0,s.st>>>(kw,d.qp,qpc,QH,d.qabs,nope,kvl,Ha,qh,pp,th,scale); break;
@@ -498,7 +508,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         if (dense_dsa && !s.prefix_kv.empty()) {
             kd_mqa_dec<16,true,1,true><<<dim3(NSP,T,4),256,mqd_smem<16>(),s.st>>>(
                 d.qabs,d.qp,qpc,QH,nope,th,s.prefix_kv.at(il),nullptr,0,pp,win,S,s.g,
-                scale,d.spm,d.spl,d.spacc,0,0,qh);
+                scale,d.spm,d.spl,d.spacc,0,0,qh,local_queries);
             kd_replica_merge<<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,T,
                 f32(s,P+"attn_sinks.weight")+s.g*Hl,d.o);
         } else if (S > 1) {

@@ -305,7 +305,7 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
                                                   int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                   const int* __restrict__ cells, int n_cap, const int* pos0p, int win,
                                                   int n_shards, int shard, float scale, float* __restrict__ pm,
-                                                  float* __restrict__ pl, float* __restrict__ pacc, int top_k = 0, int groups = 0, const __half* packed_q = nullptr) {
+                                                  float* __restrict__ pl, float* __restrict__ pacc, int top_k = 0, int groups = 0, const __half* packed_q = nullptr, bool local_queries = false) {
     using namespace nvcuda;
     constexpr int KVL = 512, ROPE = 64, D = 576, LD = MQA_LD, TR = MQA_TR;
     constexpr int NST = H / 8, KS = Replica ? 2 : 8 / NST, KP = D / KS, OPW = H / (4 * ValueGroups);
@@ -323,8 +323,8 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
     const int vg=blockIdx.x % ValueGroups, sp = blockIdx.x / ValueGroups, nsp = gridDim.x / ValueGroups, t = blockIdx.y, pos = *pos0p + t;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const int logical_shard = Replica ? (int)blockIdx.z : shard;
-    const int head_offset = Replica ? shard * 8 : 0;
-    constexpr int input_heads = Replica ? 32 : H;
+    const int head_offset = Replica && !local_queries ? shard * 8 : 0;
+    const int input_heads = Replica ? (local_queries ? 8 : 32) : H;
     int n, lo = 0;
     if constexpr (DenseDsa) {
         n = (pos + n_shards - logical_shard) / n_shards;
