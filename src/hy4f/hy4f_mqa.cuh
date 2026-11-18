@@ -398,5 +398,59 @@ __global__ void kd_mqa_merge(const float* __restrict__ pm, const float* __restri
     }
 }
 
+
+// ---- the k-pool indexer scores on tensor cores: score[tt][g] = sum_h relu(q[t][h] . k[g]) * w[t][h] for the score
+// tile's tokens tt = 0 .. tt_n-1 (token t0 + tt) and the pooled groups g < pos / kpool.  Block (gs, tb): tokens
+// tb*8 .. tb*8+7 (warp = token: its 16 heads are one 16-row WMMA tile, loaded once), groups [gs*per, (gs+1)*per) in
+// tiles of 16 (fp16 keys straight from global / L2).  Scores of tokens with pos + 1 <= top_k are not needed.
+__global__ void __launch_bounds__(256) kb_score_tc(const float* __restrict__ iq, int ldq, const __half* __restrict__ pooled,
+                                                   const float* __restrict__ w, int ldw, int kpool, int top_k,
+                                                   const int* pos0p, int t0, int tt_n, int n_pool_max,
+                                                   float* __restrict__ score, int ld_score) {
+    using namespace nvcuda;
+    constexpr int KD = 128, NH = 16, QLD = KD + 8;
+    __shared__ __align__(32) __half Qs[8][NH][QLD];
+    __shared__ __align__(32) float Ss[8][16][20];
+    __shared__ float Ws[8][NH];
+    const int tb = blockIdx.y, gs = blockIdx.x, ngs = gridDim.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int pos0 = *pos0p;
+    for (int i = threadIdx.x; i < 8 * NH * KD; i += blockDim.x) {
+        const int tk = i / (NH * KD), rem = i % (NH * KD), h = rem / KD, d = rem % KD, tt = tb * 8 + tk;
+        Qs[tk][h][d] = __float2half_rn(tt < tt_n ? iq[(size_t) (t0 + tt) * ldq + h * KD + d] : 0.0f);
+    }
+    if (threadIdx.x < 8 * NH) {
+        const int tk = threadIdx.x / NH, h = threadIdx.x % NH, tt = tb * 8 + tk;
+        Ws[tk][h] = tt < tt_n ? w[(size_t) (t0 + tt) * ldw + h] : 0.0f;
+    }
+    __syncthreads();
+    const int tt = tb * 8 + warp, pos = pos0 + t0 + tt;
+    if (tt >= tt_n || pos + 1 <= top_k) return;
+    const int npool = pos / kpool;
+    const int per = ((n_pool_max + ngs - 1) / ngs + 15) / 16 * 16, g0 = gs * per, g1 = min(npool, g0 + per);
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, __half, wmma::row_major> fa[KD / 16];
+#pragma unroll
+    for (int k = 0; k < KD / 16; ++k) wmma::load_matrix_sync(fa[k], &Qs[warp][0][k * 16], QLD);
+    float* sc = score + (size_t) tt * ld_score;
+    for (int g = g0; g < g1; g += 16) {
+        wmma::fragment<wmma::accumulator, 16, 16, 16, float> acc;
+        wmma::fill_fragment(acc, 0.0f);
+#pragma unroll
+        for (int k = 0; k < KD / 16; ++k) {
+            wmma::fragment<wmma::matrix_b, 16, 16, 16, __half, wmma::col_major> fb;
+            wmma::load_matrix_sync(fb, pooled + (size_t) g * KD + k * 16, KD);
+            wmma::mma_sync(acc, fa[k], fb, acc);
+        }
+        wmma::store_matrix_sync(&Ss[warp][0][0], acc, 20, wmma::mem_row_major);
+        __syncwarp();
+        if (lane < 16 && g + lane < g1) {
+            float s2 = 0.0f;
+#pragma unroll
+            for (int h = 0; h < NH; ++h) s2 += fmaxf(Ss[warp][h][lane], 0.0f) * Ws[warp][h];
+            sc[g + lane] = s2;
+        }
+        __syncwarp();
+    }
+}
+
 }  // namespace kern
 }  // namespace strata::hy4f

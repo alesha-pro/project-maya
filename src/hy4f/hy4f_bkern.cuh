@@ -593,6 +593,31 @@ __global__ void kb_push(const float* src, size_t per_dst, int mode, int T, int H
         }
     }
 }
+// the combine partials to ONE peer j as fp16: per (t, hl) a 1040-byte slot = acc / L (512 halfs: |acc / L| <= max |c|,
+// so the half range is safe) + (M, L) as floats.  part [T][H][W] fp32 (acc, M, L), this shard's cells.  Half the
+// fp32 payload; the last block signals j.
+constexpr int CB_SLOT = 1040;
+__global__ void kb_push_cb16(const float* part, int T, int H, int W, int Hl, Peers P, int me, int step, int* arrive, int j) {
+    uint8_t* dst = reinterpret_cast<uint8_t*>(P.buf[j][step & 1]) + (size_t) me * T * Hl * CB_SLOT;
+    const int n = T * Hl * 256;   // half2 per slot: 256
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+        const int slot = i / 256, c2 = i % 256, t = slot / Hl, hl = slot % Hl;
+        const float* src = part + ((size_t) t * H + (size_t) j * Hl + hl) * W;
+        const float L = src[513], inv = L > 0.0f ? 1.0f / L : 0.0f;
+        reinterpret_cast<__half2*>(dst + (size_t) slot * CB_SLOT)[c2] = __floats2half2_rn(src[2 * c2] * inv, src[2 * c2 + 1] * inv);
+        if (c2 == 0) *reinterpret_cast<float2*>(dst + (size_t) slot * CB_SLOT + 1024) = make_float2(src[512], L);
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const int v = atomicAdd(arrive + j, 1);
+        if (v == (int) gridDim.x - 1) {
+            __threadfence_system();
+            reinterpret_cast<volatile int*>(P.flag[j])[me] = step;
+            arrive[j] = 0;
+        }
+    }
+}
 // dequantize a Q8_0 / BF16 matrix into F32 (the batched products' cuBLAS operand)
 __global__ void kb_deq(const void* w, int type, size_t n, float* y) {
     for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
@@ -750,6 +775,39 @@ __global__ void kb_ag_post(int E, Peers P, int me, int n_shards, int step, float
             const float x = R[(size_t) s * E + i] + post[(size_t) t * 8 + s] * v;
             X[(size_t) s * E + i] = x;
             R[(size_t) s * E + i] = x;
+        }
+    }
+}
+
+// the combine tail over fp16 slots (kb_push_cb16), per token (blockIdx.x = token): o[t][hl] for this shard's heads
+__global__ void kb_combine16(int kvl, int h0, int Hl, const float* sinks_all, Peers P, int me, int n_shards, int step,
+                             int T, float* o) {
+    const int t = blockIdx.x;
+    kb_wait(P, me, n_shards, step);
+    const uint8_t* rv = reinterpret_cast<const uint8_t*>(P.buf[me][step & 1]);
+    const size_t per = (size_t) T * Hl * CB_SLOT;
+    for (int hl = 0; hl < Hl; ++hl) {
+        const int h = h0 + hl;
+        float mj[4], lj[4], m = sinks_all[h];
+        for (int j = 0; j < n_shards; ++j) {
+            const float2 ml = __ldcv(reinterpret_cast<const float2*>(rv + j * per + ((size_t) t * Hl + hl) * CB_SLOT + 1024));
+            mj[j] = ml.x, lj[j] = ml.y;
+            m = fmaxf(m, mj[j]);
+        }
+        float den = __expf(sinks_all[h] - m), f[4];
+        for (int j = 0; j < n_shards; ++j) {
+            f[j] = mj[j] == -INFINITY ? 0.0f : __expf(mj[j] - m) * lj[j];   // (the slot holds acc / L)
+            den += f[j];
+        }
+        for (int c2 = threadIdx.x; c2 < kvl / 2; c2 += blockDim.x) {
+            float ax = 0.0f, ay = 0.0f;
+            for (int j = 0; j < n_shards; ++j) {
+                const __half2 v = reinterpret_cast<const __half2*>(rv + j * per + ((size_t) t * Hl + hl) * CB_SLOT)[c2];
+                const float2 fv = __half22float2(v);
+                ax += f[j] * fv.x, ay += f[j] * fv.y;
+            }
+            o[((size_t) t * Hl + hl) * kvl + 2 * c2] = ax / den;
+            o[((size_t) t * Hl + hl) * kvl + 2 * c2 + 1] = ay / den;
         }
     }
 }

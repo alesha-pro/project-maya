@@ -236,8 +236,12 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp) {
         kb_f32_gemv<<<dim3(nb(IH * 32), T), 256, 0, s.st>>>(f32(s, P + "indexer.proj.weight"), d.x, E, d.iw, IH, E, IH,
                                                             1.0f / std::sqrt((float) (IK * IH)));
         const int ld_sc = (int) (o.max_context / kpool + 1);
-        kb_score<<<dim3(nb(ld_sc * 32), T), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, IK, IH, kpool, top_k, pp, 0,
-                                                            d.score, ld_sc);
+        if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))   // (grid for the whole context: the graph is fixed)
+            kb_score_tc<<<dim3(64, 1), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, kpool, top_k, pp, 0, T, ld_sc - 1,
+                                                       d.score, ld_sc);
+        else
+            kb_score<<<dim3(nb(ld_sc * 32), T), 256, 0, s.st>>>(iq, qpc, s.pooled[il], d.iw, IH, IK, IH, kpool, top_k, pp, 0,
+                                                                d.score, ld_sc);
         kb_select_kpool<1024><<<T, 1024, 0, s.st>>>(d.score, ld_sc, pp, 0, 0, kpool, top_k, top_k / kpool - tail, n_cap, d.cells);
         if (S > 1) {
             if (split && Hd == 32) {

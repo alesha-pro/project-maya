@@ -362,10 +362,16 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
             for (int s0 = t0; s0 < t0 + tt; s0 += score_tile) {
                 const int st = std::min(score_tile, t0 + tt - s0);
                 const int n_pool_max = (pos0 + s0 + st - 1) / kpool;
-                if (pos0 + s0 + st > top_k && n_pool_max > 0)
-                    kb_score<<<dim3(nb(n_pool_max * 32), st), 256, 0, s.st>>>(iq, (int) qp_ld, s.pooled[il], b.iw, IH, IK,
-                                                                              IH, kpool, top_k, b.pp, s0, b.score,
-                                                                              (int) ld_sc);
+                if (pos0 + s0 + st > top_k && n_pool_max > 0) {
+                    if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))
+                        kb_score_tc<<<dim3(std::min(32, (n_pool_max + 255) / 256), (st + 7) / 8), 256, 0, s.st>>>(
+                            iq, (int) qp_ld, s.pooled[il], b.iw, IH, kpool, top_k, b.pp, s0, st, n_pool_max, b.score,
+                            (int) ld_sc);
+                    else
+                        kb_score<<<dim3(nb(n_pool_max * 32), st), 256, 0, s.st>>>(iq, (int) qp_ld, s.pooled[il], b.iw, IH,
+                                                                                  IK, IH, kpool, top_k, b.pp, s0, b.score,
+                                                                                  (int) ld_sc);
+                }
                 kb_select_kpool<1024><<<st, 1024, 0, s.st>>>(b.score, (int) ld_sc, b.pp, s0, t0, kpool, top_k,
                                                              top_k / kpool - tail, n_cap, b.cells);
             }
@@ -374,9 +380,17 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                                                                  b.cells, n_cap, b.pp, t0, win, S, s.g, nullptr, scale,
                                                                  nullptr, b.part, CBW());
                 ++b.step;
-                const size_t per = (size_t) tt * Hl * CBW();
-                push(s, b, b.part, per, 1, Hl, CBW(), b.cb, b.ctr + 4);
-                kb_combine<<<tt, 512, 0, s.st>>>(kvl, CBW(), s.g * Hl, Hl, sinks, b.cb, s.g, S, b.step, per, b.o);
+                if (std::getenv("HY4F_CB32")) {
+                    const size_t per = (size_t) tt * Hl * CBW();
+                    push(s, b, b.part, per, 1, Hl, CBW(), b.cb, b.ctr + 4);
+                    kb_combine<<<tt, 512, 0, s.st>>>(kvl, CBW(), s.g * Hl, Hl, sinks, b.cb, s.g, S, b.step, per, b.o);
+                } else {   // fp16 slots: half the bytes (the local partial goes through the same path)
+                    const int blocks = std::min(nb(tt * Hl * 256, 512), 160);
+                    for (int r = 1; r <= S; ++r)
+                        kb_push_cb16<<<blocks, 512, 0, s.st>>>(b.part, tt, Hd, CBW(), Hl, b.cb, s.g, b.step, b.ctr + 4,
+                                                                (s.g + r) % S);
+                    kb_combine16<<<tt, 256, 0, s.st>>>(kvl, s.g * Hl, Hl, sinks, b.cb, s.g, S, b.step, tt, b.o);
+                }
             } else if (S > 1) {
                 kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], nullptr, b.cells,
                                                         n_cap, b.pp, win, S, s.g, nullptr, scale, nullptr, b.part, Hd);
