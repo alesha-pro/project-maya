@@ -3,9 +3,10 @@
 #pragma once
 
 namespace strata::hy4f::kern {
-__global__ void kb_swa_queries(const float* qabs, const float* q, int ldq, int qs,
+template<int H>
+__global__ void kb_mqa_queries(const float* qabs, const float* q, int ldq, int qs,
                                int nope, float theta, int start, float scale, __half* dst) {
-    constexpr int H = 16, D = 576;
+    constexpr int D = 576;
     const int t = blockIdx.y, c0 = blockIdx.x * blockDim.x + threadIdx.x;
     if (c0 >= H*D) return;
     const int h = c0 / D, c = c0 % D;

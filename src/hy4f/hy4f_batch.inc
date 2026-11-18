@@ -464,7 +464,7 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                 auto* qh = reinterpret_cast<__half*>(b.o);
                 auto* ph = reinterpret_cast<__half*>(b.qabs);
                 const int base = pos0 + t0 - win + 1 - first_row;
-                kb_swa_queries<<<dim3(nb(16 * 576), tt),256,0,b.st>>>(b.qabs, qt, (int)qp_ld, QH, nope, th, pos0+t0, scale, qh);
+                kb_mqa_queries<16><<<dim3(nb(16 * 576), tt),256,0,b.st>>>(b.qabs, qt, (int)qp_ld, QH, nope, th, pos0+t0, scale, qh);
                 kb_swa_scores<<<dim3(16, (tt+3)/4),256,0,b.st>>>(qh, expanded, base, tt, b.part);
                 kb_swa_probs<<<tt,512,0,b.st>>>(b.part,sinks+s.g*Hl,ph);
                 kb_swa_values<<<dim3(4,tt),256,0,b.st>>>(ph,expanded,base,b.o);
@@ -541,7 +541,15 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                 kb_wait_k<<<1, 32, 0, b.st>>>(b.cl, s.g, S, b.step);
             }
             if (mqa) {
-                kb_mqa_attn<32><<<tt, 256, mqa_smem<32>(), b.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], nullptr,
+                if ((mqa_opt & 8) && direct && n_cap <= 2048 && std::max(Hd,Hs)/S >= 16 && mbs.empty()) {
+                    auto* qh = reinterpret_cast<__half*>(b.part);
+                    auto* ph = reinterpret_cast<__half*>(b.o);
+                    const int start = pos0 + t0;
+                    kb_mqa_queries<32><<<dim3(nb(32*576),tt),256,0,b.st>>>(b.qabs,qt,(int)qp_ld,QH,nope,th,start,scale,qh);
+                    kb_dsa_scores<<<dim3(16,tt),256,0,b.st>>>(qh,s.kv[il],cells,selected,groups,top_k,n_cap,start,s.g,b.qabs);
+                    kb_dsa_probs<<<dim3(tt,4),256,0,b.st>>>(b.qabs,start,top_k,groups,n_cap,s.g,ph,b.part,CBW());
+                    kb_dsa_values<<<dim3(8,tt),256,0,b.st>>>(ph,s.kv[il],cells,selected,groups,top_k,n_cap,start,s.g,b.part,CBW());
+                } else kb_mqa_attn<32><<<tt, 256, mqa_smem<32>(), b.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], nullptr,
                                                                  cells, n_cap, b.pp, t0, win, S, s.g, nullptr, scale,
                                                                  nullptr, b.part, CBW(), nullptr, 0, mqa_opt & 1, direct ? top_k : 0, groups, selected);
                 ++b.step;
