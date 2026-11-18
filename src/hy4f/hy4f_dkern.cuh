@@ -185,6 +185,23 @@ __global__ void kd_argmax(const float* y, int rows, int idx0, float* oval, int* 
         if (lane == 0) oval[t] = bv, oidx[t] = bi + idx0;
     }
 }
+// Take the best logit other than the shard's selected token. Ties hence give zero margin.
+__global__ void kd_runner_up(const float* y, int rows, int first, const int* best, float* next) {
+    __shared__ float warp_best[32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    float v = -INFINITY;
+    const int skip = *best - first;
+    for (int i = threadIdx.x; i < rows; i += blockDim.x)
+        if (i != skip) v = fmaxf(v, y[i]);
+    for (int d = 16; d > 0; d >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, d));
+    if (lane == 0) warp_best[warp] = v;
+    __syncthreads();
+    if (warp == 0) {
+        v = warp_best[lane];
+        for (int d = 16; d > 0; d >>= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, d));
+        if (lane == 0) *next = v;
+    }
+}
 // token rows (Q8_0 embedding) as floats [T][E] (the MTP's next-token input)
 __global__ void kd_embed_rows(const uint8_t* emb, size_t rb, const int* toks, int E, float* y) {
     const int t = blockIdx.y;

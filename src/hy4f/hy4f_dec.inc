@@ -139,6 +139,8 @@ float* hlogT = nullptr;    // [DT][V] pinned
 float* hargv = nullptr;    // [S][DT] pinned (per shard max)
 int* hargi = nullptr;
 float* hmargv = nullptr;   // [S] (MTP draft)
+const bool compact_io = std::getenv("HY4F_COMPACT_LOGITS") != nullptr;
+bool mtp_full_row = false;
 float* hmlog = nullptr;    // [V] pinned: the MTP head's logits row (for drafts sampled from it)
 int* hmargi = nullptr;
 int64_t m_next = 0;        // next MTP position
@@ -214,7 +216,7 @@ void dec_alloc(Shard& s, DShard& d) {
     d.eg_r = dalloc((size_t) DT * ncol * eg_D);
     d.eg_kv = dalloc((size_t) DT * (hc + 1) * E);
     d.logits = dalloc((size_t) DT * (V / S));
-    d.argv = dalloc(DT);
+    d.argv = dalloc(DT + int(compact_io));
     d.argi = ia(DT);
     d.me = dalloc((size_t) DT * E);
     d.cat = dalloc((size_t) DT * 2 * E);
@@ -755,7 +757,7 @@ void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false) {
     HY_CK(cudaMemcpyAsync(d.h, d.x, sizeof(float) * T * E, cudaMemcpyDeviceToDevice, s.st));
     head_rows(s, d, d.x, T, d.argv, d.argi);
     const int rows = V / S;
-    HY_CK(cudaMemcpy2DAsync(hlogT + (size_t) s.g * rows, sizeof(float) * V, d.logits, sizeof(float) * rows,
+    if (!compact_io) HY_CK(cudaMemcpy2DAsync(hlogT + (size_t) s.g * rows, sizeof(float) * V, d.logits, sizeof(float) * rows,
                             sizeof(float) * rows, T, cudaMemcpyDeviceToHost, s.st));
     HY_CK(cudaMemcpyAsync(hargv + (size_t) s.g * DT, d.argv, sizeof(float) * T, cudaMemcpyDeviceToHost, s.st));
     HY_CK(cudaMemcpyAsync(hargi + (size_t) s.g * DT, d.argi, sizeof(int) * T, cudaMemcpyDeviceToHost, s.st));
@@ -783,9 +785,12 @@ void mtp_ops(Shard& s, DShard& d, int T, bool chain = false, bool dense_dsa = fa
     }
     kb_rms<<<1, 1024, 0, s.st>>>(d.mr + (size_t) (T - 1) * E, E, f32(s, P + "nextn.shared_head_norm.weight"), E, eps, d.mh, E);
     head_rows(s, d, d.mh, 1, d.argv + DT - 1, d.argi + DT - 1);
-    HY_CK(cudaMemcpyAsync(hmargv + s.g, d.argv + DT - 1, sizeof(float), cudaMemcpyDeviceToHost, s.st));
+    if (compact_io)
+        kd_runner_up<<<1, 1024, 0, s.st>>>(d.logits, V / S, s.g * (V / S), d.argi + DT - 1, d.argv + DT);
+    const int count = compact_io ? 2 : 1;
+    HY_CK(cudaMemcpyAsync(hmargv + count * s.g, d.argv + DT - 1, count * sizeof(float), cudaMemcpyDeviceToHost, s.st));
     HY_CK(cudaMemcpyAsync(hmargi + s.g, d.argi + DT - 1, sizeof(int), cudaMemcpyDeviceToHost, s.st));
-    HY_CK(cudaMemcpyAsync(hmlog + (size_t) s.g * (V / S), d.logits, sizeof(float) * (V / S), cudaMemcpyDeviceToHost, s.st));
+    if (!compact_io) HY_CK(cudaMemcpyAsync(hmlog + (size_t) s.g * (V / S), d.logits, sizeof(float) * (V / S), cudaMemcpyDeviceToHost, s.st));
 }
 
 void dec_setup() {
@@ -794,7 +799,7 @@ void dec_setup() {
     HY_CK(cudaHostAlloc((void**) &hlogT, sizeof(float) * DT * V, cudaHostAllocPortable));
     HY_CK(cudaHostAlloc((void**) &hargv, sizeof(float) * S * DT, cudaHostAllocPortable));
     HY_CK(cudaHostAlloc((void**) &hargi, sizeof(int) * S * DT, cudaHostAllocPortable));
-    HY_CK(cudaHostAlloc((void**) &hmargv, sizeof(float) * S, cudaHostAllocPortable));
+    HY_CK(cudaHostAlloc((void**) &hmargv, sizeof(float) * S * (compact_io ? 2 : 1), cudaHostAllocPortable));
     HY_CK(cudaHostAlloc((void**) &hmargi, sizeof(int) * S, cudaHostAllocPortable));
     HY_CK(cudaHostAlloc((void**) &hmlog, sizeof(float) * V, cudaHostAllocPortable));
     std::memset(hio_v, 0, sizeof(IoT));
@@ -874,13 +879,24 @@ void dec_setup() {
     }
 }
 
-void dec_launch(bool mtp, int T, bool chain = false) {
+float mtp_max(int rank) const { return hmargv[rank * (compact_io ? 2 : 1)]; }
+
+void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
+    if (mtp) mtp_full_row = !compact_io || full_logits;
     const bool dense_dsa = short_graphs && (mtp ? hio_m : hio_v)->pos + T <= top_k;
     change_q3_layout(true);
     launch_parallel([&](Shard& s) {
         DShard& d = dsh[s.g];
         DecodeGraph& graph = chain ? d.gc : mtp ? d.gm[T] : d.gv[T];
         HY_CK(cudaGraphLaunch(graph.select(dense_dsa), s.st));
+        if (compact_io && full_logits) {
+            const int rows = V / S;
+            if (mtp)
+                HY_CK(cudaMemcpyAsync(hmlog + (size_t)s.g * rows, d.logits, sizeof(float) * rows, cudaMemcpyDeviceToHost, s.st));
+            else
+                HY_CK(cudaMemcpy2DAsync(hlogT + (size_t)s.g * rows, sizeof(float) * V, d.logits, sizeof(float) * rows,
+                                        sizeof(float) * rows, T, cudaMemcpyDeviceToHost, s.st));
+        }
     });
     for (auto& s : sh) {
         HY_CK(cudaSetDevice(s.dev));

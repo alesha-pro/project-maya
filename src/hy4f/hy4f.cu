@@ -1168,7 +1168,7 @@ bool Model::verify(const int32_t* toks, int T, int64_t pos, float* logits, int32
         d.hio_v->pos = (int) pos;
         d.hio_v->n = T;
         for (int t = 0; t < T; ++t) d.hio_v->toks[t] = toks[t];
-        d.dec_launch(false, T);
+        d.dec_launch(false, T, false, logits != nullptr);
         d.pos_next = pos + T;
         if (logits) std::memcpy(logits, d.hlogT, sizeof(float) * T * d.V);
         if (argmax)
@@ -1198,12 +1198,12 @@ bool Model::mtp(const int32_t* next_toks, int T, int64_t mpos, int32_t* draft, s
         d.hio_m->n = T;
         d.hio_m->last_pos = (int) mpos + T - 1;
         for (int t = 0; t < T; ++t) d.hio_m->toks[t] = next_toks[t];
-        d.dec_launch(true, T);
+        d.dec_launch(true, T, false, logits != nullptr);
         d.m_next = mpos + T;
         float bv = -INFINITY;
         int bi = 0;
         for (int g = 0; g < d.S; ++g)
-            if (d.hmargv[g] > bv) bv = d.hmargv[g], bi = d.hmargi[g];
+            if (d.mtp_max(g) > bv) bv = d.mtp_max(g), bi = d.hmargi[g];
         if (draft) *draft = bi;
         if (logits) std::memcpy(logits, d.hmlog, sizeof(float) * d.V);
         return true;
@@ -1220,11 +1220,11 @@ bool Model::mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& er
         d.hio_m->pos = (int) mpos;
         d.hio_m->n = 1;
         d.hio_m->toks[0] = tok;
-        d.dec_launch(true, 1, true);
+        d.dec_launch(true, 1, true, logits != nullptr);
         float bv = -INFINITY;
         int bi = 0;
         for (int g = 0; g < d.S; ++g)
-            if (d.hmargv[g] > bv) bv = d.hmargv[g], bi = d.hmargi[g];
+            if (d.mtp_max(g) > bv) bv = d.mtp_max(g), bi = d.hmargi[g];
         if (draft) *draft = bi;
         if (logits) std::memcpy(logits, d.hmlog, sizeof(float) * d.V);
         return true;
@@ -1237,7 +1237,14 @@ float Model::draft_margin(int token) const {
     const Impl& d = *d_;
     const int rows = d.V / d.S, owner = token / rows;
     float runner_up = -INFINITY;
-    for (int g = 0; g < d.S; ++g) if (g != owner) runner_up = std::max(runner_up, d.hmargv[g]);
+    for (int g = 0; g < d.S; ++g) if (g != owner) runner_up = std::max(runner_up, d.mtp_max(g));
+    if (d.compact_io && token == d.hmargi[owner])
+        return d.mtp_max(owner) - std::max(runner_up, d.hmargv[2 * owner + 1]);
+    if (!d.mtp_full_row) {
+        HY_CK(cudaSetDevice(d.sh[owner].dev));
+        HY_CK(cudaMemcpy(d.hmlog + (size_t)owner * rows, d.dsh[owner].logits,
+                         rows * sizeof(float), cudaMemcpyDeviceToHost));
+    }
     const float* logits = d.hmlog;
     const int begin = owner * rows, end = begin + rows;
     if (begin < token) runner_up = std::max(runner_up, *std::max_element(logits + begin, logits + token));
