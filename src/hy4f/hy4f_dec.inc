@@ -64,6 +64,9 @@ struct DecodeGraph {
 };
 
 struct DShard {
+    cudaStream_t side = nullptr;
+    cudaEvent_t fork = nullptr, projected = nullptr, shared_done = nullptr;
+    Q81* shq = nullptr;
     IoT *dio_v = nullptr, *dio_m = nullptr;
     float *X = nullptr, *x = nullptr, *h = nullptr, *post = nullptr, *hcp = nullptr, *hcs = nullptr, *ones = nullptr;
     float *xp = nullptr, *qr = nullptr, *qp = nullptr, *qabs = nullptr, *o = nullptr, *part = nullptr, *a = nullptr,
@@ -190,6 +193,13 @@ void dec_alloc(Shard& s, DShard& d) {
     d.xq = qa((size_t) DT * std::max({2 * E, Hmax / S * vh, n_ff / S, ncol * eg_D, latent}));
     d.xlq = qa((size_t) DT * K * latent);
     d.q16 = qa((size_t) DT * K * n_ffx);
+    if (std::getenv("HY4F_FFN_OVERLAP")) {
+        d.shq = qa((size_t)DT * (n_ffx / S));
+        HY_CK(cudaStreamCreateWithFlags(&d.side, cudaStreamNonBlocking));
+        HY_CK(cudaEventCreateWithFlags(&d.fork, cudaEventDisableTiming));
+        HY_CK(cudaEventCreateWithFlags(&d.projected, cudaEventDisableTiming));
+        HY_CK(cudaEventCreateWithFlags(&d.shared_done, cudaEventDisableTiming));
+    }
     for (int p = 0; p < 2; ++p) {
         d.ar_buf[p] = dalloc((size_t) S * DT * E);
         d.cb_buf[p] = dalloc((size_t) S * DT * (Hd / S) * CBW());
@@ -204,10 +214,10 @@ void dec_alloc(Shard& s, DShard& d) {
     d.arrive = ia(16);   // [0..4] all-reduce pushes / tail, [8..12] combine
 }
 
-void dec_mmvq(Shard& s, const std::string& n, const Q81* xq, float* y, int T) {
+void dec_mmvq(Shard& s, const std::string& n, const Q81* xq, float* y, int T, cudaStream_t stream = nullptr) {
     const DW& w = s.w.at(n);
     if (w.type != T_Q8_0) throw std::runtime_error("hy4f: " + n + " is not Q8_0");
-    kn::native_q8_0_mmvq(w.d, xq, y, (int) w.ne[0], (int) (w.ne[1] * w.ne[2]), T, s.st);
+    kn::native_q8_0_mmvq(w.d, xq, y, (int) w.ne[0], (int) (w.ne[1] * w.ne[2]), T, stream ? stream : s.st);
 }
 int rows_of(Shard& s, const std::string& n) {
     const DW& w = s.w.at(n);
@@ -449,6 +459,19 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     }
     const int K = n_used, e0 = ebound[s.g], e1 = ebound[s.g + 1], fl = n_ffx / S;
     const int xmc = rows_of(s, P + "xmoe");
+    const auto st = d.side ? d.side : s.st;
+    if (d.side) {
+        HY_CK(cudaEventRecord(d.fork, s.st));
+        HY_CK(cudaStreamWaitEvent(d.side, d.fork));
+        dec_mmvq(s, P + "xmoe", d.xq, d.xm, T, st);
+        kd_q8_slots<<<dim3(nb(latent), T * K), 256, 0, st>>>(d.xm, xmc, latent, K, d.xlq);
+        HY_CK(cudaEventRecord(d.projected, st));
+        // Shared projection only needs xmoe. Continue on the side stream
+        // while routed slots run on the capture's original stream.
+        kd_ffn_q8<<<dim3(nb(fl), T), 256, 0, st>>>(nullptr, nullptr, nullptr, K, 0, d.xm + latent, xmc, fl, nullptr, d.shq);
+        dec_mmvq(s, P + "ffn_down_shexp.weight", d.shq, d.sh, T, st);
+        HY_CK(cudaEventRecord(d.shared_done, st));
+    }
     kb_f32_gemv<<<dim3(nb(n_exp * 32), T), 256, 0, s.st>>>(f32(s, P + "ffn_gate_inp.weight"), d.x, E, d.lg, n_exp, E, n_exp,
                                                            1.0f);
     if (n_exp == 512 && K == 16 && !std::getenv("HY4F_OLD_ROUTER"))
@@ -457,8 +480,10 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         router(s, d.lg, f32(s, P + "exp_probs_b.bias"), T, d.eids, d.ew);
         kd_local_ids<<<1, 128, 0, s.st>>>(d.eids, d.eloc, T * K, e0, e1);
     }
-    dec_mmvq(s, P + "xmoe", d.xq, d.xm, T);
-    kd_q8_slots<<<dim3(nb(latent), T * K), 256, 0, s.st>>>(d.xm, xmc, latent, K, d.xlq);
+    if (!d.side) {
+        dec_mmvq(s, P + "xmoe", d.xq, d.xm, T);
+        kd_q8_slots<<<dim3(nb(latent), T * K), 256, 0, s.st>>>(d.xm, xmc, latent, K, d.xlq);
+    }
     const bool grouped = !std::getenv("HY4F_IDS_LOOP");
     const bool mp = T > 4;   // (more than 4 slots per expert possible: the multi-pass copy of the grouped kernel)
     if (grouped) kd_moe_groups<<<1, T * K <= 64 ? 64 : 128, 0, s.st>>>(d.eloc, T * K, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
@@ -478,15 +503,18 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         else if (w.type == T_Q4_K) kn::native_q4_k_mmvq_ids_loop(w.d, eb, d.eloc, T * K, xq, false, y, n_in, n_out, s.st);
         else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
     };
+    if (d.side) HY_CK(cudaStreamWaitEvent(s.st, d.projected));
     ids_mmvq(s.w.at(P + "ffn_gu_exps"), d.xlq, d.ga16, latent, 2 * n_ffx);
     k_swiglu_gu_q8<<<nb(T * K * n_ffx), 256, 0, s.st>>>(d.ga16, n_ffx, T * K * n_ffx, clampv, d.q16);
     ids_mmvq(s.w.at(P + "ffn_down_exps.weight"), d.q16, d.dn16, n_ffx, latent);
     // d.q16 is dead after the expert down projection. Reuse it for the
     // shorter shared-expert activation so both inputs survive concurrently.
-    kd_ffn_q8<<<dim3(nb(latent + fl), T), 256, 0, s.st>>>(d.dn16, d.ew, d.eloc, K, latent,
-                                                           d.xm + latent, xmc, fl, d.xq, d.q16);
+    const int fused_fl = d.side ? 0 : fl;
+    kd_ffn_q8<<<dim3(nb(latent + fused_fl), T), 256, 0, s.st>>>(d.dn16, d.ew, d.eloc, K, latent,
+                                                           d.xm + latent, xmc, fused_fl, d.xq, d.q16);
     dec_mmvq(s, P + "ffn_routed_up.weight", d.xq, d.mu, T);
-    dec_mmvq(s, P + "ffn_down_shexp.weight", d.q16, d.sh, T);
+    if (d.side) HY_CK(cudaStreamWaitEvent(s.st, d.shared_done));
+    else dec_mmvq(s, P + "ffn_down_shexp.weight", d.q16, d.sh, T);
     d_ar(s, d, d.mu, d.sh, P + "post_ffw_norm.weight", T, mtp, nx_after);
 }
 
