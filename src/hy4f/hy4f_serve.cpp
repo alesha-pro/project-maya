@@ -343,9 +343,30 @@ struct Sampler {
             for (auto& v : out) v.second *= inv;
         }
     }
+    static float max_logit(const float* lg, int n) {
+#if defined(__SSE2__)
+        // With lg[0] as the right operand, later NaNs leave the previous maximum alone.
+        if (!std::isnan(lg[0])) {
+            __m128 a = _mm_set1_ps(lg[0]), b = a, c = a, d = a;
+            int i = 0;
+            for (; i + 16 <= n; i += 16) {
+                a = _mm_max_ps(_mm_loadu_ps(lg + i), a);
+                b = _mm_max_ps(_mm_loadu_ps(lg + i + 4), b);
+                c = _mm_max_ps(_mm_loadu_ps(lg + i + 8), c);
+                d = _mm_max_ps(_mm_loadu_ps(lg + i + 12), d);
+            }
+            float lane[4];
+            _mm_storeu_ps(lane, _mm_max_ps(_mm_max_ps(a,b), _mm_max_ps(c,d)));
+            float best = *std::max_element(lane, lane + 4);
+            for (; i < n; ++i) best = std::max(best, lg[i]);
+            return best;
+        }
+#endif
+        return *std::max_element(lg, lg+n);
+    }
     void sparse_probs(const float* input, int V, const Req& r, const std::vector<int32_t>& hist, Sparse& out) {
         const float* lg = warp_row(input, V, r, hist);
-        const float mx = *std::max_element(lg, lg + V);
+        const float mx = max_logit(lg, V);
         const float inv = 1.f / r.temperature;
         const size_t k = (size_t)r.top_k;
         auto better = [](const auto& a, const auto& b) {
