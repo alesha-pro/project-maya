@@ -1217,6 +1217,18 @@ bool Model::load(const Options& o, std::string& err) {
     }
 }
 
+bool Model::warm_full_verify(std::string& err) {
+    try {
+        Impl& d=*d_;
+        if (!d.graphs || !d.ensure_full_storage()) return true;
+        for (int T=1; T<=DT; ++T) d.capture_full_verify(T);
+        return true;
+    } catch (const std::exception& e) {
+        err=e.what();
+        return false;
+    }
+}
+
 bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int chunk, std::string& err,
                     const std::vector<EmbdSpan>* spans) {
     try {

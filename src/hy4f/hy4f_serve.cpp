@@ -544,6 +544,10 @@ int serve(Model& m, const ServeOptions& so) {
             return 1;
         }
         m.reset();
+        if (std::getenv("HY4F_PRECAPTURE_DEEP") && !m.warm_full_verify(err)) {
+            std::fprintf(stderr, "maya-hy4f: deep graph warmup: %s\n", err.c_str());
+            return 1;
+        }
     }
     const char* host_setting = std::getenv("HY4F_HOST_PREFIX_SLOTS");
     const bool host_supported = CH == int(HostPrefixIndex::block);
