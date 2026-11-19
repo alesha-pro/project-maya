@@ -119,6 +119,8 @@ struct DShard {
     unsigned *sel_st = nullptr, *sel_hist = nullptr;
     int *mg_n = nullptr, *mg_exp = nullptr, *mg_off = nullptr, *mg_slot = nullptr;   // the step's expert groups
     unsigned long long* ne_ptr = nullptr;   // the groups' record addresses and the scratch of the native expert kernels
+    int *ha_n = nullptr, *ha_exp = nullptr, *ha_off = nullptr, *ha_slot = nullptr;   // hybrid: the hot groups
+    int *hb_n = nullptr, *hb_off = nullptr, *hb_slot = nullptr;                      // ... and the cold ones (ne_ptr)
     void* ne_scratch = nullptr;
     int* sel_bc = nullptr;
     KdCompactRow* sel_compact = nullptr;
@@ -244,6 +246,8 @@ void dec_alloc(Shard& s, DShard& d) {
     d.mg_off = ia(129);
     d.mg_slot = ia(128);
     HY_CK(cudaMalloc(&d.ne_ptr, sizeof(unsigned long long) * 128));
+    d.ha_n = ia(4), d.ha_exp = ia(128), d.ha_off = ia(129), d.ha_slot = ia(128);
+    d.hb_n = ia(4), d.hb_off = ia(129), d.hb_slot = ia(128);
     HY_CK(cudaMalloc(&d.ne_scratch, kn::native_expert_scratch_bytes((int64_t) DT * n_used, n_ffx)));
     d.lg = dalloc((size_t) DT * n_exp);
     d.ew = dalloc((size_t) DT * K);
@@ -940,7 +944,7 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     const char* setting = std::getenv("HY4F_EXPERT_PIPE");
     const int pipe_mode = setting ? std::atoi(setting) : 0;
     const bool pipeline = (pipe_mode == 1 || (pipe_mode == 2 && gu.type == T_Q4_K)) &&
-        !mtp && !q3_pair_layout && grouped && d.side && d.attention_side &&
+        !mtp && !q3_pair_layout && grouped && d.side && d.attention_side && !(offload && s.off.at(il).hybrid) &&
         T >= 2 && T <= 4 && K == 16 && latent == 1536 && n_ffx == 1536 &&
         (gu.type == T_Q3_K || gu.type == T_Q4_K) && down.type == T_Q4_K &&
         std::getenv("HY4F_GROUP_MATCH");
@@ -961,13 +965,15 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     if (offload) {   // the groups' local experts -> their places on the layer's weight lattice (VRAM or host)
         if (!grouped) throw std::runtime_error("hy4f: the expert offload needs the grouped expert kernels");
         const OffLayer& ol = s.off.at(il);
-        k_virt_groups<<<1, 128, 0, s.st>>>(d.mg_n, d.mg_exp, ol.vmap);
+        if (!ol.hybrid) k_virt_groups<<<1, 128, 0, s.st>>>(d.mg_n, d.mg_exp, ol.vmap);
     }
-    auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out) {
+    auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out, const int* g_n = nullptr,
+                        const int* g_exp = nullptr, const int* g_off = nullptr, const int* g_slot = nullptr) {
+        if (!g_n) g_n = d.mg_n, g_exp = d.mg_exp, g_off = d.mg_off, g_slot = d.mg_slot;
         const size_t eb = expert_stride(w);
         if (w.type == T_Q8_0) {
             if (grouped)
-                expert_q8::launch<true>(w.d, eb, d.mg_exp, 0, d.mg_n, d.mg_off, d.mg_slot, xq, false, y,
+                expert_q8::launch<true>(w.d, eb, g_exp, 0, g_n, g_off, g_slot, xq, false, y,
                                         n_in, n_out, 2 * moe_blocks, s.st);
             else
                 expert_q8::launch<false>(w.d, eb, d.eloc, T * K, nullptr, nullptr, nullptr, xq, false, y,
@@ -977,16 +983,16 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         }
         if (grouped) {
             if (q3_pair_layout && q3_eligible(w)) {
-                packed_q3::forward(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, xq, y, n_out, moe_blocks, s.st);
+                packed_q3::forward(w.d, eb, g_n, g_exp, g_off, g_slot, xq, y, n_out, moe_blocks, s.st);
                 return;
             }
             if (w.type == T_Q3_K)
-                (mp ? kn::native_q3_k_mmvq_grouped_mp : kn::native_q3_k_mmvq_grouped)(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot,
+                (mp ? kn::native_q3_k_mmvq_grouped_mp : kn::native_q3_k_mmvq_grouped)(w.d, eb, g_n, g_exp, g_off, g_slot,
                                                                                     xq, y, n_in, n_out, moe_blocks, s.st);
             else if (w.type == T_Q4_K) {
                 auto apply=mp ? kn::native_q4_k_mmvq_grouped_mp : q4_repeated ? kn::native_q4_k_mmvq_grouped_repeated
                                                                                : kn::native_q4_k_mmvq_grouped;
-                apply(w.d,eb,d.mg_n,d.mg_exp,d.mg_off,d.mg_slot,xq,y,n_in,n_out,moe_blocks,s.st);
+                apply(w.d,eb,g_n,g_exp,g_off,g_slot,xq,y,n_in,n_out,moe_blocks,s.st);
             }
             else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
             return;
@@ -1016,6 +1022,19 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         execute(d.attention_side,cut,d.mg_n+2);
         HY_CK(cudaEventRecord(d.attention_join,d.attention_side));
         HY_CK(cudaStreamWaitEvent(s.st,d.attention_join));
+    } else if (offload && s.off.at(il).hybrid) {
+        // hybrid: the hot groups through the tuned K-quant kernels, the cold ones through the IQ kernels; the two write
+        // disjoint slots of the same buffers
+        const OffLayer& ol = s.off.at(il);
+        if (!grouped || !kn::hy4_iq_supported(ol.cold_gu) || !kn::hy4_iq_supported(ol.cold_dn) || latent != 1536 || n_ffx != 1536 || T > 4)
+            throw std::runtime_error("hy4f: the hybrid experts need grouped kernels, IQ2 cold experts and at most 4 rows");
+        k_split_tiers<<<1, 32, 0, s.st>>>(d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, ol.n_hot, ol.cptr, d.ha_n, d.ha_exp, d.ha_off,
+                                          d.ha_slot, d.hb_n, d.ne_ptr, d.hb_off, d.hb_slot);
+        if (ol.n_hot) ids_mmvq(gu, d.xlq, d.ga16, latent, 2 * n_ffx, d.ha_n, d.ha_exp, d.ha_off, d.ha_slot);
+        kn::hy4_iq_grouped(ol.cold_gu, d.ne_ptr, 0, 2 * n_ffx, d.hb_n, d.hb_off, d.hb_slot, d.xlq, d.ga16, moe_blocks, s.st);
+        k_swiglu_gu_q8<<<nb(T*K*n_ffx),256,0,s.st>>>(d.ga16,n_ffx,T*K*n_ffx,clampv,d.q16);
+        if (ol.n_hot) ids_mmvq(down, d.q16, d.dn16, n_ffx, latent, d.ha_n, d.ha_exp, d.ha_off, d.ha_slot);
+        kn::hy4_iq_grouped(ol.cold_dn, d.ne_ptr, ol.cgu_bytes, latent, d.hb_n, d.hb_off, d.hb_slot, d.q16, d.dn16, moe_blocks, s.st);
     } else if (!tuned_expert_type(gu.type) || !tuned_expert_type(down.type)) {
         // (i-quant experts: Maya's native grouped expert kernels over the offload's [gate | up | down] records)
         if (!offload || !grouped) throw std::runtime_error("hy4f: expert type " + std::to_string(gu.type) + " needs the expert offload");

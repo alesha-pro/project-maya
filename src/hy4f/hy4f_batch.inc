@@ -765,7 +765,8 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
         }
     // expert offload: a range lies wholly in VRAM or wholly in host memory, and a host range fits the staging buffer
     const OffLayer* ol = offload ? &s.off.at(il) : nullptr;
-    const int stage_n = ol ? (int) std::max<size_t>(1, off_stage / ol->stride) : 0;
+    const bool hyb = ol && ol->hybrid;   // tiers: [0, n_hot) base in VRAM, [n_hot, n_res) cold in VRAM, the rest cold on the host
+    const int stage_n = ol ? (int) std::max<size_t>(1, off_stage / (hyb ? ol->cstride : ol->stride)) : 0;
     bool first = true;
     // the experts in ranges of at most cap rows (one range unless the routing piles onto this shard)
     for (int ea = 0; ea < nl;) {
@@ -773,7 +774,7 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
             ++ea;
             continue;
         }
-        const int elim = !ol ? nl : ea < ol->n_res ? ol->n_res : std::min(nl, ea + stage_n);
+        const int elim = !ol ? nl : hyb && ea < ol->n_hot ? ol->n_hot : ea < ol->n_res ? ol->n_res : std::min(nl, ea + stage_n);
         int eb = pad ? nl : ea;
         int64_t mx = pad ? T : 0;
         while (eb < elim && (eb == ea || b.hmb[eb + 1] - b.hmb[ea] <= b.cap)) {
@@ -791,34 +792,42 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
             bounds = b.mb2;
         }
         if (rows > 0) {
-            mq::quantize(b.xm, b.rows_tok + ra, b.xq, wgu.type, latent, (int64_t) xm_ld, rows, b.st);
+            const bool cold_tier = hyb && ea >= ol->n_hot;   // (the range lies in one tier)
+            mq::quantize(b.xm, b.rows_tok + ra, b.xq, cold_tier ? ol->cold_gu : wgu.type, latent, (int64_t) xm_ld, rows, b.st);
             mq::Product p{};
             const uint8_t* wg = static_cast<const uint8_t*>(wgu.d) + (size_t) ea * wgu.rb * (size_t) wgu.ne[1];
             const uint8_t* wdn = static_cast<const uint8_t*>(wd.d) + (size_t) ea * wd.rb * (size_t) wd.ne[1];
+            int type_gu = wgu.type, type_dn = wd.type;
+            size_t step_gu = expert_stride(wgu), step_dn = expert_stride(wd);
             if (ol) {
-                if (ea < ol->n_res) wg = ol->vram + (size_t) ea * ol->stride;
+                const bool cold = cold_tier;
+                const size_t st = cold ? ol->cstride : ol->stride;
+                if (cold) type_gu = ol->cold_gu, type_dn = ol->cold_dn, step_gu = step_dn = st;
+                if (ea < (hyb ? ol->n_hot : ol->n_res)) wg = ol->vram + (size_t) ea * st;
+                else if (ea < ol->n_res) wg = ol->cvram + (size_t) (ea - ol->n_hot) * st;
                 else {
+                    const uint8_t* host = hyb ? ol->chost : ol->host;
+                    const std::vector<int>& home = hyb ? ol->chome : ol->home;
                     for (int l = ea; l < eb;) {
                         if (b.hmb[l + 1] == b.hmb[l]) {   // (an idle expert's weights are never read)
                             ++l;
                             continue;
                         }
                         int m = l + 1;
-                        while (m < eb && b.hmb[m + 1] != b.hmb[m] && ol->home[m] == ol->home[m - 1] + 1) ++m;
-                        HY_CK(cudaMemcpyAsync(b.stage + (size_t) (l - ea) * ol->stride,
-                                              ol->host + (size_t) ol->home[l] * ol->stride, (size_t) (m - l) * ol->stride,
-                                              cudaMemcpyHostToDevice, b.st));
+                        while (m < eb && b.hmb[m + 1] != b.hmb[m] && home[m] == home[m - 1] + 1) ++m;
+                        HY_CK(cudaMemcpyAsync(b.stage + (size_t) (l - ea) * st, host + (size_t) home[l] * st,
+                                              (size_t) (m - l) * st, cudaMemcpyHostToDevice, b.st));
                         l = m;
                     }
                     wg = b.stage;
                 }
-                wdn = wg + ol->gu_bytes;
+                wdn = wg + (cold ? ol->cgu_bytes : ol->gu_bytes);
             }
             p.w = wg;
-            p.type = wgu.type;
+            p.type = type_gu;
             p.w_rows = 2 * n_ffx;
             p.w_cols = latent;
-            p.expert_bytes = expert_stride(wgu);
+            p.expert_bytes = step_gu;
             p.n = eb - ea;
             p.xq = b.xq;
             p.bounds = bounds;
@@ -829,12 +838,12 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
             p.ld_dst = n_ffx;   // (the fused product writes h = silu(g) * u, n_ff values per row)
             b.mmq->run_glu(p, clampv, b.st);
             if (pad) kb_zero_padded_rows<<<(unsigned)rows, 256, 0, b.st>>>(b.gu, n_ffx, b.mb + nl);
-            mq::quantize(b.gu, nullptr, b.xq2, wd.type, n_ffx, n_ffx, rows, b.st);
+            mq::quantize(b.gu, nullptr, b.xq2, type_dn, n_ffx, n_ffx, rows, b.st);
             p.w = wdn;
-            p.type = wd.type;
+            p.type = type_dn;
             p.w_rows = latent;
             p.w_cols = n_ffx;
-            p.expert_bytes = expert_stride(wd);
+            p.expert_bytes = step_dn;
             p.xq = b.xq2;
             p.dst = b.dn;
             p.ld_dst = latent;

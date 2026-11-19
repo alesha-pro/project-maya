@@ -139,6 +139,17 @@ struct OffLayer {
     uint8_t *vram = nullptr, *host = nullptr;
     std::vector<int> home;   // local expert -> its host record (the adaptation swaps experts without moving records)
     int* vmap = nullptr;     // device: local expert -> lattice index
+    bool base_type = false;  // the records are of a tuned type (Q3_K / Q4_K / Q8_0)
+    // A hybrid layer (HY4F_HOT_VRAM_MB): locals [0, n_hot) keep the base quantization in VRAM (`vram`, `stride`; no
+    // host copy - a promotion reads the GGUF); everyone has a cold record (HY4F_EXPERT_GGUF's quantization) in host
+    // memory, locals [n_hot, n_res) also in VRAM.  No lattice: the cold kernels take record addresses.
+    bool hybrid = false;
+    int n_hot = 0;
+    int cold_gu = -1, cold_dn = -1;
+    size_t cstride = 0, cgu_bytes = 0;
+    uint8_t *cvram = nullptr, *chost = nullptr;
+    std::vector<int> chome;               // local expert -> its cold host record
+    unsigned long long* cptr = nullptr;   // device: local expert -> the address of its cold record
 };
 
 struct Shard {
@@ -209,13 +220,21 @@ struct Model::Impl {
     size_t off_budget = 0, off_stage = 0;
     std::map<int, std::vector<int>> off_perm;    // layer -> [expert id in the engine] = the GGUF's expert
     std::vector<std::map<int, int>> off_res;     // [shard][layer] -> experts resident in VRAM
+    std::vector<std::map<int, int>> off_hot;     // ... of them in the hybrid's hot tier
+    bool hybrid = false;                         // HY4F_HOT_VRAM_MB + HY4F_EXPERT_GGUF: two quantizations of the experts
+    size_t hot_budget = 0;
+    std::map<std::string, std::pair<const strata::GgufFile*, const strata::TensorInfo*>> cold_tensors;
+    uint64_t st_hot = 0;
     std::string route_stats;
     // HY4F_EXPERT_ADAPT: the VRAM set follows the routing - a cold resident and a hot host expert trade places
     bool adapt = false;
     double adapt_horizon = 2048;                   // tokens after which an old pick weighs 1/e
     double adapt_pf_weight = 0;                    // (a prompt's routing does not predict the answer's: measured)
     int adapt_every = 16, adapt_step_swaps = 1024, adapt_pf_swaps = 2048, adapt_calls = 0;
-    uint64_t win_picks = 0, win_hits = 0;
+    uint64_t win_picks = 0, win_hits = 0, win_hot = 0;
+    std::vector<uint8_t> swap_rows;
+    uint8_t* swap_pinned = nullptr;   // one base record on its way into a hot slot
+    size_t swap_pinned_bytes = 0;
     std::map<int, std::vector<double>> off_score;  // layer -> [expert id in the engine] decayed picks
     std::vector<uint64_t> cum_dec, cum_rows, cum_touch;   // statistics [layer][GGUF expert]
     uint64_t st_picks = 0, st_hits = 0, st_pf = 0, st_pf_hit = 0, st_swaps = 0;
@@ -306,7 +325,9 @@ struct Model::Impl {
                 const auto* replacement = file->find(name);
                 if (!original || !replacement || original->shape != replacement->shape)
                     throw std::runtime_error("hy4f: incompatible expert tensor " + name + " in " + path);
-                draft_tensors[name] = {file.get(), replacement};
+                // (with HY4F_HOT_VRAM_MB the base experts stay as the hot tier and these are the cold one)
+                if (std::getenv("HY4F_HOT_VRAM_MB")) cold_tensors[name] = {file.get(), replacement};
+                else draft_tensors[name] = {file.get(), replacement};
             }
         draft_files.emplace_back(std::move(file));
     }
@@ -659,32 +680,70 @@ struct Model::Impl {
         plan_offload();
     }
 
-    // one expert's record in the offload stores: [gate | up | down] padded to whole blocks of both types
-    size_t expert_record(int il, size_t* gu_bytes = nullptr) const {
+    // the routed experts of a layer as one record per expert: [gate | up | down] padded to whole blocks of both types
+    struct ExpertSrc {
+        const uint8_t *gate = nullptr, *up = nullptr, *down = nullptr;
+        int gu_type = -1, dn_type = -1;
+        int64_t ne0 = 0, per = 0, ne0d = 0, perd = 0;
+        size_t rb = 0, rbd = 0, eb = 0, ebd = 0, gu_bytes = 0, stride = 0;
+    };
+    bool hybrid_layer(int il) const {
+        return hybrid && il < L && cold_tensors.count("blk." + std::to_string(il) + ".ffn_gate_exps.weight");
+    }
+    ExpertSrc expert_src(int il, bool cold) const {
         const std::string P = "blk." + std::to_string(il) + ".";
-        const strata::GgufFile* f = nullptr;
-        const strata::TensorInfo* tg = T(P + "ffn_gate_exps.weight", &f);
-        const strata::TensorInfo* td = T(P + "ffn_down_exps.weight", &f);
-        const size_t gu = 2 * row_bytes((int) tg->type, (int64_t) tg->shape[0]) * (size_t) tg->shape[1];
-        const size_t dn = row_bytes((int) td->type, (int64_t) td->shape[0]) * (size_t) td->shape[1];
-        const size_t bg = row_bytes((int) tg->type, block_elems((int) tg->type));
-        const size_t bd = row_bytes((int) td->type, block_elems((int) td->type));
+        std::pair<const strata::GgufFile*, const strata::TensorInfo*> g, u, d;
+        if (cold) {
+            g = cold_tensors.at(P + "ffn_gate_exps.weight");
+            u = cold_tensors.at(P + "ffn_up_exps.weight");
+            d = cold_tensors.at(P + "ffn_down_exps.weight");
+        } else {
+            g.second = T(P + "ffn_gate_exps.weight", &g.first);
+            u.second = T(P + "ffn_up_exps.weight", &u.first);
+            d.second = T(P + "ffn_down_exps.weight", &d.first);
+        }
+        if (g.second->type != u.second->type) throw std::runtime_error("hy4f: gate/up expert types differ in " + P);
+        ExpertSrc e;
+        e.gate = g.first->tensor_data(*g.second);
+        e.up = u.first->tensor_data(*u.second);
+        e.down = d.first->tensor_data(*d.second);
+        e.gu_type = (int) g.second->type;
+        e.dn_type = (int) d.second->type;
+        e.ne0 = (int64_t) g.second->shape[0], e.per = (int64_t) g.second->shape[1];
+        e.ne0d = (int64_t) d.second->shape[0], e.perd = (int64_t) d.second->shape[1];
+        e.rb = row_bytes(e.gu_type, e.ne0), e.eb = e.rb * (size_t) e.per;
+        e.rbd = row_bytes(e.dn_type, e.ne0d), e.ebd = e.rbd * (size_t) e.perd;
+        e.gu_bytes = 2 * e.eb;
+        const size_t bg = row_bytes(e.gu_type, block_elems(e.gu_type)), bd = row_bytes(e.dn_type, block_elems(e.dn_type));
         const size_t unit = bg / std::gcd(bg, bd) * bd;
-        if (gu_bytes) *gu_bytes = gu;
-        return (gu + dn + unit - 1) / unit * unit;
+        e.stride = (e.gu_bytes + e.ebd + unit - 1) / unit * unit;
+        return e;
+    }
+    static void fill_record(const ExpertSrc& e, size_t expert, uint8_t* rec) {
+        std::memcpy(rec, e.gate + e.eb * expert, e.eb);
+        std::memcpy(rec + e.eb, e.up + e.eb * expert, e.eb);
+        std::memcpy(rec + 2 * e.eb, e.down + e.ebd * expert, e.ebd);
+        std::memset(rec + 2 * e.eb + e.ebd, 0, e.stride - 2 * e.eb - e.ebd);
     }
 
     // HY4F_EXPERT_VRAM_MB=<MiB per GPU>: the expert offload.  Per MoE layer the experts are renumbered by heat (the
     // decode picks of HY4F_EXPERT_PROFILE, a HY4F_ROUTE_STATS file; the router rows move with them) and dealt
     // round-robin to the shards; each shard keeps its hottest ones in VRAM up to the budget.  The others stay in
     // pinned host memory: the decode kernels read them in place, the prefill fetches them into a staging buffer.
+    // With HY4F_HOT_VRAM_MB and HY4F_EXPERT_GGUF the layers are hybrid: the hottest experts in the base quantization
+    // up to that part of the budget, the next ones and the host ones in HY4F_EXPERT_GGUF's.
     void plan_offload() {
         if (const char* p = std::getenv("HY4F_ROUTE_STATS")) route_stats = p;
         const char* mb = std::getenv("HY4F_EXPERT_VRAM_MB");
-        if (!mb) return;
+        if (!mb) {
+            if (!cold_tensors.empty()) throw std::runtime_error("hy4f: HY4F_HOT_VRAM_MB needs HY4F_EXPERT_VRAM_MB");
+            return;
+        }
         if (std::getenv("HY4F_PACK_Q3")) throw std::runtime_error("hy4f: HY4F_PACK_Q3 does not combine with the expert offload");
         offload = true;
         off_budget = (size_t) std::atoll(mb) << 20;
+        hybrid = !cold_tensors.empty();
+        if (hybrid) hot_budget = (size_t) std::atoll(std::getenv("HY4F_HOT_VRAM_MB")) << 20;
         const char* sm = std::getenv("HY4F_OFFLOAD_STAGE_MB");
         off_stage = (size_t) (sm ? std::atoll(sm) : 256) << 20;
         if (const char* a = std::getenv("HY4F_EXPERT_ADAPT")) adapt = std::atoi(a) != 0;
@@ -717,8 +776,9 @@ struct Model::Impl {
             int il, l;
         };
         std::vector<std::vector<Item>> items(S);
-        std::map<int, size_t> stride;
+        std::map<int, size_t> stride, cstride;
         off_res.assign(S, {});
+        off_hot.assign(S, {});
         for (int il = dense_lead; il < last; ++il) {
             std::vector<double> c(n_exp, 1.0);
             if (heat.count(il)) c = heat[il];
@@ -733,6 +793,7 @@ struct Model::Impl {
             score.assign(n_exp, 0.0);
             for (int g = 0; g < S; ++g) {
                 off_res[g][il] = 0;
+                off_hot[g][il] = 0;
                 for (int l = 0; l < nl; ++l) {
                     perm[g * nl + l] = order[l * S + g];
                     // the profile counts as 256 tokens of history
@@ -740,105 +801,156 @@ struct Model::Impl {
                     items[g].push_back({sum > 0 ? c[order[l * S + g]] / sum : 0.0, il, l});
                 }
             }
-            stride[il] = expert_record(il);
+            stride[il] = expert_src(il, false).stride;
+            if (hybrid_layer(il)) cstride[il] = expert_src(il, true).stride;
         }
         for (int g = 0; g < S; ++g) {
             std::stable_sort(items[g].begin(), items[g].end(), [](const Item& a, const Item& b) {
                 return a.p != b.p ? a.p > b.p : a.l != b.l ? a.l < b.l : a.il < b.il;
             });
             size_t used = 0;
-            std::map<int, bool> closed;
-            double hit = 0, all = 0;
-            int kept = 0;
+            std::map<int, bool> closed_hot, closed;
+            double hit = 0, hot = 0, all = 0;
+            int kept = 0, kept_hot = 0;
+            if (hybrid)
+                for (const Item& it : items[g]) {
+                    if (!hybrid_layer(it.il) || closed_hot[it.il]) continue;
+                    if (used + stride[it.il] + 4096 > std::min(hot_budget, off_budget)) {
+                        closed_hot[it.il] = true;
+                        continue;
+                    }
+                    used += stride[it.il];
+                    ++off_hot[g][it.il];
+                    ++off_res[g][it.il];
+                    ++kept_hot;
+                    hot += it.p;
+                }
+            const size_t hot_used = used;
             for (const Item& it : items[g]) {
                 if (it.il < L) all += it.p;
-                if (closed[it.il]) continue;
-                if (used + stride[it.il] + 4096 > off_budget) {
+                const bool hyb = hybrid_layer(it.il);
+                if ((hyb && it.l < off_hot[g][it.il]) || closed[it.il]) continue;
+                const size_t cost = hyb ? cstride[it.il] : stride[it.il];
+                if (used + cost + 4096 > off_budget) {
                     closed[it.il] = true;
                     continue;
                 }
-                used += stride[it.il];
+                used += cost;
                 ++off_res[g][it.il];
                 ++kept;
                 if (it.il < L) hit += it.p;
             }
-            if (o.verbose)
-                std::fprintf(stderr, "hy4f: offload: shard %d keeps %d of %zu experts in VRAM (%.2f GiB), expected hits %.3f%s\n",
-                             g, kept, items[g].size(), used / 1073741824.0, all > 0 ? hit / all : 0.0,
-                             heat.empty() ? " (no profile)" : "");
+            if (o.verbose) {
+                if (hybrid)
+                    std::fprintf(stderr, "hy4f: offload: shard %d keeps %d hot (%.2f GiB) + %d cold (%.2f GiB) of %zu experts in VRAM, "
+                                         "expected picks hot %.3f, in VRAM %.3f%s\n",
+                                 g, kept_hot, hot_used / 1073741824.0, kept, (used - hot_used) / 1073741824.0, items[g].size(),
+                                 all > 0 ? hot / all : 0.0, all > 0 ? (hot + hit) / all : 0.0, heat.empty() ? " (no profile)" : "");
+                else
+                    std::fprintf(stderr, "hy4f: offload: shard %d keeps %d of %zu experts in VRAM (%.2f GiB), expected hits %.3f%s\n",
+                                 g, kept, items[g].size(), used / 1073741824.0, all > 0 ? hit / all : 0.0,
+                                 heat.empty() ? " (no profile)" : "");
+            }
         }
     }
 
     void load_offload_experts(Shard& s, int il, const std::string& P) {
-        const strata::GgufFile *fg = nullptr, *fu = nullptr, *fd = nullptr;
-        const strata::TensorInfo* tg = T(P + "ffn_gate_exps.weight", &fg);
-        const strata::TensorInfo* tu = T(P + "ffn_up_exps.weight", &fu);
-        const strata::TensorInfo* td = T(P + "ffn_down_exps.weight", &fd);
-        if (tg->type != tu->type) throw std::runtime_error("hy4f: gate/up expert types differ in " + P);
-        const size_t rb = row_bytes((int) tg->type, (int64_t) tg->shape[0]), eb = rb * (size_t) tg->shape[1];
-        const size_t rbd = row_bytes((int) td->type, (int64_t) td->shape[0]), ebd = rbd * (size_t) td->shape[1];
+        const ExpertSrc base = expert_src(il, false);
         OffLayer ol;
-        ol.stride = expert_record(il, &ol.gu_bytes);
+        ol.stride = base.stride;
+        ol.gu_bytes = base.gu_bytes;
         ol.n = n_exp / S;
         ol.n_res = off_res[s.g].at(il);
+        ol.hybrid = hybrid_layer(il);
+        ol.n_hot = ol.hybrid ? off_hot[s.g].at(il) : 0;
+        ol.base_type = tuned_expert_type(base.gu_type) && tuned_expert_type(base.dn_type);
         const size_t stride = ol.stride;
-        if (ol.n_res) ol.vram = static_cast<uint8_t*>(walloc((size_t) ol.n_res * stride));
-        const size_t host_bytes = (size_t) ol.n * stride + stride + 4096;
-        uint8_t* block = nullptr;
-        HY_CK(cudaHostAlloc((void**) &block, host_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
-        size_t shift = 0;
-        if (ol.vram)
-            shift = (reinterpret_cast<uintptr_t>(ol.vram) % stride + stride - reinterpret_cast<uintptr_t>(block) % stride) % stride;
-        ol.host = block + shift;
-        std::memset(ol.host + (size_t) ol.n * stride, 0, host_bytes - shift - (size_t) ol.n * stride);
-        const uint8_t *gsrc = fg->tensor_data(*tg), *usrc = fu->tensor_data(*tu), *dsrc = fd->tensor_data(*td);
         const auto& perm = off_perm.at(il);
-        const int workers = 8;
-        std::vector<std::thread> th;
-        for (int w = 0; w < workers; ++w)
-            th.emplace_back([&, w] {
-                for (int l = w; l < ol.n; l += workers) {
-                    const size_t e = (size_t) perm[(size_t) s.g * ol.n + l];
-                    uint8_t* rec = ol.host + (size_t) l * stride;
-                    std::memcpy(rec, gsrc + eb * e, eb);
-                    std::memcpy(rec + eb, usrc + eb * e, eb);
-                    std::memcpy(rec + 2 * eb, dsrc + ebd * e, ebd);
-                    std::memset(rec + 2 * eb + ebd, 0, stride - 2 * eb - ebd);
-                }
-            });
-        for (auto& t : th) t.join();
-        if (ol.n_res) HY_CK(cudaMemcpy(ol.vram, ol.host, (size_t) ol.n_res * stride, cudaMemcpyHostToDevice));
-        uint8_t* base = ol.host;
-        int64_t av = 0, ah = 0;
-        if (ol.vram && ol.host > ol.vram) {
-            base = ol.vram;
-            ah = (ol.host - ol.vram) / (int64_t) stride;
-        } else if (ol.vram) av = (ol.vram - ol.host) / (int64_t) stride;
-        if (av + ol.n >= INT_MAX || ah + ol.n >= INT_MAX) throw std::runtime_error("hy4f: the expert stores are too far apart");
-        ol.av = (int) av;
-        ol.ah = (int) ah;
-        ol.home.resize(ol.n);
-        std::iota(ol.home.begin(), ol.home.end(), 0);
-        std::vector<int> vm(ol.n);
-        for (int l = 0; l < ol.n; ++l) vm[l] = l < ol.n_res ? l + ol.av : l + ol.ah;
-        HY_CK(cudaMalloc(&ol.vmap, sizeof(int) * ol.n));
-        HY_CK(cudaMemcpy(ol.vmap, vm.data(), sizeof(int) * ol.n, cudaMemcpyHostToDevice));
+        // the records of the shard's locals [l0, l1) of `e` into dst
+        auto fill_all = [&](const ExpertSrc& e, uint8_t* dst, int l0, int l1) {
+            const int workers = 8;
+            std::vector<std::thread> th;
+            for (int w = 0; w < workers; ++w)
+                th.emplace_back([&, w] {
+                    for (int l = l0 + w; l < l1; l += workers)
+                        fill_record(e, (size_t) perm[(size_t) s.g * ol.n + l], dst + (size_t) (l - l0) * e.stride);
+                });
+            for (auto& t : th) t.join();
+        };
+        uint8_t* base_ptr = nullptr;
+        if (ol.hybrid) {
+            if (ol.n_hot) {
+                ol.vram = static_cast<uint8_t*>(walloc((size_t) ol.n_hot * stride));
+                std::vector<uint8_t> h((size_t) ol.n_hot * stride);
+                fill_all(base, h.data(), 0, ol.n_hot);
+                HY_CK(cudaMemcpy(ol.vram, h.data(), h.size(), cudaMemcpyHostToDevice));
+            }
+            base_ptr = ol.vram;
+            const ExpertSrc cold = expert_src(il, true);
+            ol.cold_gu = cold.gu_type, ol.cold_dn = cold.dn_type;
+            ol.cstride = cold.stride, ol.cgu_bytes = cold.gu_bytes;
+            const size_t host_bytes = (size_t) ol.n * cold.stride + 4096;
+            HY_CK(cudaHostAlloc((void**) &ol.chost, host_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
+            std::memset(ol.chost + (size_t) ol.n * cold.stride, 0, 4096);
+            fill_all(cold, ol.chost, 0, ol.n);
+            const int nb = ol.n_res - ol.n_hot;
+            if (nb) {
+                ol.cvram = static_cast<uint8_t*>(walloc((size_t) nb * cold.stride));
+                HY_CK(cudaMemcpy(ol.cvram, ol.chost + (size_t) ol.n_hot * cold.stride, (size_t) nb * cold.stride,
+                                 cudaMemcpyHostToDevice));
+            }
+            ol.chome.resize(ol.n);
+            std::iota(ol.chome.begin(), ol.chome.end(), 0);
+            std::vector<unsigned long long> ptr(ol.n);
+            for (int l = 0; l < ol.n; ++l)
+                ptr[l] = (unsigned long long) (l >= ol.n_hot && l < ol.n_res ? ol.cvram + (size_t) (l - ol.n_hot) * cold.stride
+                                                                              : ol.chost + (size_t) l * cold.stride);
+            HY_CK(cudaMalloc(&ol.cptr, sizeof(unsigned long long) * ol.n));
+            HY_CK(cudaMemcpy(ol.cptr, ptr.data(), sizeof(unsigned long long) * ol.n, cudaMemcpyHostToDevice));
+        } else {
+            if (ol.n_res) ol.vram = static_cast<uint8_t*>(walloc((size_t) ol.n_res * stride));
+            const size_t host_bytes = (size_t) ol.n * stride + stride + 4096;
+            uint8_t* block = nullptr;
+            HY_CK(cudaHostAlloc((void**) &block, host_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
+            size_t shift = 0;
+            if (ol.vram)
+                shift = (reinterpret_cast<uintptr_t>(ol.vram) % stride + stride - reinterpret_cast<uintptr_t>(block) % stride) % stride;
+            ol.host = block + shift;
+            std::memset(ol.host + (size_t) ol.n * stride, 0, host_bytes - shift - (size_t) ol.n * stride);
+            fill_all(base, ol.host, 0, ol.n);
+            if (ol.n_res) HY_CK(cudaMemcpy(ol.vram, ol.host, (size_t) ol.n_res * stride, cudaMemcpyHostToDevice));
+            base_ptr = ol.host;
+            int64_t av = 0, ah = 0;
+            if (ol.vram && ol.host > ol.vram) {
+                base_ptr = ol.vram;
+                ah = (ol.host - ol.vram) / (int64_t) stride;
+            } else if (ol.vram) av = (ol.vram - ol.host) / (int64_t) stride;
+            if (av + ol.n >= INT_MAX || ah + ol.n >= INT_MAX) throw std::runtime_error("hy4f: the expert stores are too far apart");
+            ol.av = (int) av;
+            ol.ah = (int) ah;
+            ol.home.resize(ol.n);
+            std::iota(ol.home.begin(), ol.home.end(), 0);
+            std::vector<int> vm(ol.n);
+            for (int l = 0; l < ol.n; ++l) vm[l] = l < ol.n_res ? l + ol.av : l + ol.ah;
+            HY_CK(cudaMalloc(&ol.vmap, sizeof(int) * ol.n));
+            HY_CK(cudaMemcpy(ol.vmap, vm.data(), sizeof(int) * ol.n, cudaMemcpyHostToDevice));
+        }
         DW w;
-        w.type = (int) tg->type;
-        w.ne[0] = (int64_t) tg->shape[0];
-        w.ne[1] = 2 * (int64_t) tg->shape[1];
+        w.type = base.gu_type;
+        w.ne[0] = base.ne0;
+        w.ne[1] = 2 * base.per;
         w.ne[2] = ol.n;
-        w.rb = rb;
-        w.d = base;
+        w.rb = base.rb;
+        w.d = base_ptr;
         w.stride = stride;
         s.w[P + "ffn_gu_exps"] = w;
         DW wd;
-        wd.type = (int) td->type;
-        wd.ne[0] = (int64_t) td->shape[0];
-        wd.ne[1] = (int64_t) td->shape[1];
+        wd.type = base.dn_type;
+        wd.ne[0] = base.ne0d;
+        wd.ne[1] = base.perd;
         wd.ne[2] = ol.n;
-        wd.rb = rbd;
-        wd.d = base + ol.gu_bytes;
+        wd.rb = base.rbd;
+        wd.d = base_ptr ? base_ptr + ol.gu_bytes : nullptr;
         wd.stride = stride;
         s.w[P + "ffn_down_exps.weight"] = wd;
         s.off[il] = ol;
@@ -893,9 +1005,11 @@ struct Model::Impl {
                     a[id] += (double) h[i] + adapt_pf_weight * (double) s.pf_rows[i];
                     if (il == dense_lead) tokens += ((double) h[i] + adapt_pf_weight * (double) s.pf_rows[i]) / n_used;
                     if (offload && il < L) {
-                        const bool res = l < s.off.at(il).n_res;
+                        const OffLayer& ol = s.off.at(il);
+                        const bool res = l < ol.n_res;
                         st_picks += h[i], st_pf += s.pf_touch[i], win_picks += h[i];
                         if (res) st_hits += h[i], st_pf_hit += s.pf_touch[i], win_hits += h[i];
+                        if (ol.hybrid ? l < ol.n_hot : (ol.base_type && res)) st_hot += h[i], win_hot += h[i];
                     }
                     s.pf_rows[i] = 0, s.pf_touch[i] = 0;
                 }
@@ -909,78 +1023,117 @@ struct Model::Impl {
         }
     }
 
-    // HY4F_EXPERT_ADAPT: up to max_swaps (cold resident, hot host expert) pairs of one layer and shard trade their
-    // expert ids, the largest score gaps first: the resident's VRAM slot takes the hot expert's weights, the two
-    // swap their host records (by index, nothing moves), the router rows and biases swap on every shard.
-    // Only between steps: nothing may be running on the devices.
-    void rebalance(int max_swaps) {
-        if (!adapt || !offload || max_swaps <= 0) return;
-        win_picks = win_hits = 0;
-        harvest_routes();
-        const auto t0 = std::chrono::steady_clock::now();
+    // HY4F_EXPERT_ADAPT.  A swap exchanges the expert ids of two locals of one layer and shard, `hi` in the better
+    // tier: its VRAM slot takes the other expert's weights, the router rows and biases swap on every shard, the
+    // host-record indices swap (no host record moves).
+    struct Swap {
+        double gain;
+        int il, g, hi, lo;
+    };
+    // pass 0: the best tier (the hybrid's hot one / the VRAM set) against everything below; pass 1: the hybrid's
+    // cold VRAM tier against the host
+    void plan_swaps(std::vector<Swap>& plan, int pass) const {
         const int nl = n_exp / S, last = L + (has_mtp ? 1 : 0);
-        struct Swap {
-            double gain;
-            int il, res, host;
-        };
-        std::vector<Swap> plan;
         std::vector<int> res, host;
         for (int il = dense_lead; il < last; ++il) {
             const auto& score = off_score.at(il);
             for (int g = 0; g < S; ++g) {
+                const OffLayer& ol = sh[g].off.at(il);
+                if (pass == 1 && !ol.hybrid) continue;
+                const int a0 = pass == 0 ? 0 : ol.n_hot, a1 = pass == 0 && ol.hybrid ? ol.n_hot : ol.n_res;
                 res.clear(), host.clear();
-                const int n_res = off_res[g].at(il);
-                for (int l = 0; l < nl; ++l) (l < n_res ? res : host).push_back(g * nl + l);
-                std::sort(res.begin(), res.end(), [&](int a, int b) { return score[a] < score[b]; });
-                std::sort(host.begin(), host.end(), [&](int a, int b) { return score[a] > score[b]; });
+                for (int l = a0; l < a1; ++l) res.push_back(l);
+                for (int l = a1; l < nl; ++l) host.push_back(l);
+                const int base = g * nl;
+                std::sort(res.begin(), res.end(), [&](int a, int b) { return score[base + a] < score[base + b]; });
+                std::sort(host.begin(), host.end(), [&](int a, int b) { return score[base + a] > score[base + b]; });
+                const bool hot_tier = pass == 0 && ol.hybrid;   // (a quality tier: a wider hysteresis)
                 for (size_t i = 0; i < res.size() && i < host.size(); ++i) {
-                    if (score[host[i]] <= 1.25 * score[res[i]] + 3.0) break;
-                    plan.push_back({score[host[i]] - score[res[i]], il, res[i], host[i]});
+                    if (score[base + host[i]] <= (hot_tier ? 1.5 : 1.25) * score[base + res[i]] + (hot_tier ? 8.0 : 3.0)) break;
+                    plan.push_back({score[base + host[i]] - score[base + res[i]], il, g, res[i], host[i]});
                 }
             }
         }
-        const size_t wanted = plan.size();
-        if (!plan.empty()) {
-            std::sort(plan.begin(), plan.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
-            if ((int) plan.size() > max_swaps) plan.resize(max_swaps);
-        }
-        std::vector<uint8_t> rows;
-        for (const Swap& sw : plan) {
-            const std::string P = "blk." + std::to_string(sw.il) + ".";
-            Shard& s = sh[sw.res / nl];
-            OffLayer& ol = s.off.at(sw.il);
-            const int lr = sw.res % nl, lh = sw.host % nl;
-            HY_CK(cudaSetDevice(s.dev));
-            HY_CK(cudaMemcpy(ol.vram + (size_t) lr * ol.stride, ol.host + (size_t) ol.home[lh] * ol.stride, ol.stride,
+    }
+    void do_swap(const Swap& sw) {
+        const int nl = n_exp / S, idh = sw.g * nl + sw.hi, idl = sw.g * nl + sw.lo;
+        const std::string P = "blk." + std::to_string(sw.il) + ".";
+        Shard& s = sh[sw.g];
+        OffLayer& ol = s.off.at(sw.il);
+        auto& perm = off_perm.at(sw.il);
+        HY_CK(cudaSetDevice(s.dev));
+        if (ol.hybrid) {
+            const size_t cs = ol.cstride;
+            if (sw.hi < ol.n_hot) {   // the hot slot takes the base weights of lo's expert, read from the GGUF
+                if (swap_pinned_bytes < ol.stride) {
+                    if (swap_pinned) HY_CK(cudaFreeHost(swap_pinned));
+                    swap_pinned_bytes = ol.stride + (1 << 20);
+                    HY_CK(cudaHostAlloc((void**) &swap_pinned, swap_pinned_bytes, cudaHostAllocPortable));
+                }
+                fill_record(expert_src(sw.il, false), (size_t) perm[idl], swap_pinned);
+                HY_CK(cudaMemcpy(ol.vram + (size_t) sw.hi * ol.stride, swap_pinned, ol.stride, cudaMemcpyHostToDevice));
+                if (sw.lo < ol.n_res)   // lo's cold VRAM slot: the cold weights of hi's expert
+                    HY_CK(cudaMemcpy(ol.cvram + (size_t) (sw.lo - ol.n_hot) * cs, ol.chost + (size_t) ol.chome[sw.hi] * cs, cs,
+                                     cudaMemcpyHostToDevice));
+            } else
+                HY_CK(cudaMemcpy(ol.cvram + (size_t) (sw.hi - ol.n_hot) * cs, ol.chost + (size_t) ol.chome[sw.lo] * cs, cs,
+                                 cudaMemcpyHostToDevice));
+            std::swap(ol.chome[sw.hi], ol.chome[sw.lo]);
+            if (sw.lo >= ol.n_res) {
+                const unsigned long long ptr = (unsigned long long) (ol.chost + (size_t) ol.chome[sw.lo] * cs);
+                HY_CK(cudaMemcpy(ol.cptr + sw.lo, &ptr, sizeof(ptr), cudaMemcpyHostToDevice));
+            }
+        } else {
+            HY_CK(cudaMemcpy(ol.vram + (size_t) sw.hi * ol.stride, ol.host + (size_t) ol.home[sw.lo] * ol.stride, ol.stride,
                              cudaMemcpyHostToDevice));
-            std::swap(ol.home[lr], ol.home[lh]);
-            const int v = ol.home[lh] + ol.ah;
-            HY_CK(cudaMemcpy(ol.vmap + lh, &v, sizeof(int), cudaMemcpyHostToDevice));
-            for (const char* name : {"ffn_gate_inp.weight", "exp_probs_b.bias"}) {
-                const bool bias = name[0] == 'e';
-                const size_t rb = bias ? sizeof(float) : sh[0].w.at(P + name).rb;
-                rows.resize(2 * rb);
-                HY_CK(cudaSetDevice(sh[0].dev));
-                uint8_t* w0 = static_cast<uint8_t*>(sh[0].w.at(P + name).d);
-                HY_CK(cudaMemcpy(rows.data(), w0 + rb * sw.res, rb, cudaMemcpyDeviceToHost));
-                HY_CK(cudaMemcpy(rows.data() + rb, w0 + rb * sw.host, rb, cudaMemcpyDeviceToHost));
-                for (auto& t : sh) {
-                    HY_CK(cudaSetDevice(t.dev));
-                    uint8_t* w = static_cast<uint8_t*>(t.w.at(P + name).d);
-                    HY_CK(cudaMemcpy(w + rb * sw.res, rows.data() + rb, rb, cudaMemcpyHostToDevice));
-                    HY_CK(cudaMemcpy(w + rb * sw.host, rows.data(), rb, cudaMemcpyHostToDevice));
-                }
-            }
-            std::swap(off_perm.at(sw.il)[sw.res], off_perm.at(sw.il)[sw.host]);
-            std::swap(off_score.at(sw.il)[sw.res], off_score.at(sw.il)[sw.host]);
+            std::swap(ol.home[sw.hi], ol.home[sw.lo]);
+            const int v = ol.home[sw.lo] + ol.ah;
+            HY_CK(cudaMemcpy(ol.vmap + sw.lo, &v, sizeof(int), cudaMemcpyHostToDevice));
         }
-        st_swaps += plan.size();
+        for (const char* name : {"ffn_gate_inp.weight", "exp_probs_b.bias"}) {
+            const bool bias = name[0] == 'e';
+            const size_t rb = bias ? sizeof(float) : sh[0].w.at(P + name).rb;
+            swap_rows.resize(2 * rb);
+            HY_CK(cudaSetDevice(sh[0].dev));
+            uint8_t* w0 = static_cast<uint8_t*>(sh[0].w.at(P + name).d);
+            HY_CK(cudaMemcpy(swap_rows.data(), w0 + rb * idh, rb, cudaMemcpyDeviceToHost));
+            HY_CK(cudaMemcpy(swap_rows.data() + rb, w0 + rb * idl, rb, cudaMemcpyDeviceToHost));
+            for (auto& t : sh) {
+                HY_CK(cudaSetDevice(t.dev));
+                uint8_t* w = static_cast<uint8_t*>(t.w.at(P + name).d);
+                HY_CK(cudaMemcpy(w + rb * idh, swap_rows.data() + rb, rb, cudaMemcpyHostToDevice));
+                HY_CK(cudaMemcpy(w + rb * idl, swap_rows.data(), rb, cudaMemcpyHostToDevice));
+            }
+        }
+        std::swap(perm[idh], perm[idl]);
+        std::swap(off_score.at(sw.il)[idh], off_score.at(sw.il)[idl]);
+    }
+    // Only between steps: nothing may be running on the devices.
+    void rebalance(int max_swaps) {
+        if (!adapt || !offload || max_swaps <= 0) return;
+        win_picks = win_hits = win_hot = 0;
+        harvest_routes();
+        const auto t0 = std::chrono::steady_clock::now();
+        size_t wanted = 0, done = 0;
+        std::vector<Swap> plan;
+        for (int pass = 0; pass < 2; ++pass) {
+            plan.clear();
+            plan_swaps(plan, pass);
+            wanted += plan.size();
+            std::sort(plan.begin(), plan.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+            size_t left = (size_t) max_swaps - done;
+            if (pass == 0 && hybrid) left = std::min<size_t>(left, std::max(16, max_swaps / 8));   // (hot swaps read the GGUF)
+            if (plan.size() > left) plan.resize(left);
+            for (const Swap& sw : plan) do_swap(sw);
+            done += plan.size();
+        }
+        st_swaps += done;
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
         st_swap_s += dt;
         if (std::getenv("HY4F_ADAPT_LOG"))
-            std::fprintf(stderr, "hy4f: adapt: window picks %llu in VRAM %.3f; %zu swaps of %zu wanted, %.1f ms\n",
-                         (unsigned long long) win_picks, win_picks ? (double) win_hits / win_picks : 0.0, plan.size(),
-                         wanted, dt * 1e3);
+            std::fprintf(stderr, "hy4f: adapt: window picks %llu in VRAM %.3f hot %.3f; %zu swaps of %zu wanted, %.1f ms\n",
+                         (unsigned long long) win_picks, win_picks ? (double) win_hits / win_picks : 0.0,
+                         win_picks ? (double) win_hot / win_picks : 0.0, done, wanted, dt * 1e3);
     }
 
     void dump_route_stats() {
@@ -992,11 +1145,11 @@ struct Model::Impl {
         }
         const int last = L + (has_mtp ? 1 : 0);
         if (offload)
-            std::fprintf(stderr, "hy4f: offload: decode picks %llu, in VRAM %.3f; prefill expert uses %llu, in VRAM %.3f; "
+            std::fprintf(stderr, "hy4f: offload: decode picks %llu, in VRAM %.3f, hot %.3f; prefill expert uses %llu, in VRAM %.3f; "
                                  "%llu swaps in %.2f s\n",
                          (unsigned long long) st_picks, st_picks ? (double) st_hits / st_picks : 0.0,
-                         (unsigned long long) st_pf, st_pf ? (double) st_pf_hit / st_pf : 0.0,
-                         (unsigned long long) st_swaps, st_swap_s);
+                         st_picks ? (double) st_hot / st_picks : 0.0, (unsigned long long) st_pf,
+                         st_pf ? (double) st_pf_hit / st_pf : 0.0, (unsigned long long) st_swaps, st_swap_s);
         if (route_stats.empty()) return;
         std::FILE* f = std::fopen(route_stats.c_str(), "w");
         if (!f) return;
@@ -1393,6 +1546,7 @@ struct Model::Impl {
         const int* eidx = s.eloc;
         if (offload) {
             const OffLayer& ol = s.off.at(il);
+            if (ol.hybrid) throw std::runtime_error("hy4f: the hybrid experts need the CUDA graphs' step");
             k_virt_ids<<<1, 32, 0, s.st>>>(s.eloc, s.evirt, n_used, ol.vmap);
             eidx = s.evirt;
         }

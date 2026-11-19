@@ -497,6 +497,31 @@ __global__ void k_group_ptrs(const int* ng, const int* experts, const uint8_t* b
     const int i = threadIdx.x;
     if (i < *ng) ptrs[i] = (unsigned long long) (base + (size_t) experts[i] * stride);
 }
+// hybrid experts: the step's groups split into the hot ones (local expert < n_hot: the base quantization, VRAM slot =
+// local index) and the cold ones (their record addresses); each list gets its own compact slot list
+__global__ void k_split_tiers(const int* ng, const int* experts, const int* off, const int* slots, int n_hot,
+                              const unsigned long long* cptr, int* an, int* aexp, int* aoff, int* aslot, int* bn,
+                              unsigned long long* bptr, int* boff, int* bslot) {
+    if (threadIdx.x) return;
+    int na = 0, nb = 0, sa = 0, sb = 0;
+    const int n = *ng;
+    for (int g = 0; g < n; ++g) {
+        const int e = experts[g], s0 = off[g], s1 = off[g + 1];
+        if (e < n_hot) {
+            aexp[na] = e;
+            aoff[na++] = sa;
+            for (int i = s0; i < s1; ++i) aslot[sa++] = slots[i];
+        } else {
+            bptr[nb] = cptr[e];
+            boff[nb++] = sb;
+            for (int i = s0; i < s1; ++i) bslot[sb++] = slots[i];
+        }
+    }
+    aoff[na] = sa;
+    boff[nb] = sb;
+    *an = na;
+    *bn = nb;
+}
 // HY4F_ROUTE_STATS: the picks per local expert
 __global__ void k_route_hist(const int* loc, int n, unsigned* count) {
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x)
