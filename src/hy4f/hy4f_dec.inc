@@ -1362,27 +1362,38 @@ void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
     change_q3_layout(true);
     // Capture every participating device before the first one launches this
     // topology. Its peer exchanges use the same ordering as the CP graph.
-    if (mode == 3) {
-        for (auto& s : sh) {
-            auto& d = dsh[s.g];
-            auto& graph = d.gv[T];
-            if (graph.shape[3]) continue;
-            HY_CK(cudaSetDevice(s.dev));
-            cudaGraph_t topology = nullptr;
-            HY_CK(cudaStreamBeginCapture(s.st,cudaStreamCaptureModeThreadLocal));
-            kn::native_mmvq_set_multi_exact(T >= 5 && !std::getenv("HY4F_FAST_T56"));
-            try {
-                verify_ops(s,d,T,false,false,std::getenv("HY4F_INDEX_INPUT") && std::getenv("HY4F_INDEX_OVERLAP"),true);
-            } catch (...) {
-                kn::native_mmvq_set_multi_exact(false);
-                cudaStreamEndCapture(s.st,&topology);
-                if (topology) cudaGraphDestroy(topology);
-                throw;
-            }
+    if (mode == 3 && !dsh.front().gv[T].shape[3]) {
+        // MMVQ shares its layout selector between host threads. Publish it once
+        // for the whole capture, then restore after all devices have finished.
+        kn::native_mmvq_set_multi_exact(T >= 5 && !std::getenv("HY4F_FAST_T56"));
+        const auto capture_started=std::chrono::steady_clock::now();
+        try {
+            auto capture=[&](Shard& s) {
+                DShard& d=dsh[s.g];
+                if (d.gv[T].shape[3]) return;
+                HY_CK(cudaSetDevice(s.dev));
+                cudaGraph_t topology=nullptr;
+                HY_CK(cudaStreamBeginCapture(s.st,cudaStreamCaptureModeThreadLocal));
+                try {
+                    verify_ops(s,d,T,false,false,std::getenv("HY4F_INDEX_INPUT") && std::getenv("HY4F_INDEX_OVERLAP"),true);
+                } catch (...) {
+                    cudaStreamEndCapture(s.st,&topology);
+                    if (topology) cudaGraphDestroy(topology);
+                    throw;
+                }
+                HY_CK(cudaStreamEndCapture(s.st,&topology));
+                d.gv[T].capture(topology,3,true);
+            };
+            if (std::getenv("HY4F_PARALLEL_DEEP_CAPTURE")) launch_parallel(capture);
+            else for (auto& s : sh) capture(s);
+        } catch (...) {
             kn::native_mmvq_set_multi_exact(false);
-            HY_CK(cudaStreamEndCapture(s.st,&topology));
-            graph.capture(topology,3,true);
+            throw;
         }
+        kn::native_mmvq_set_multi_exact(false);
+        if (std::getenv("HY4F_GRAPH_TIMES"))
+            std::fprintf(stderr,"hy4f: deep graph capture T=%d wall_ms=%.3f\n",T,
+                         std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-capture_started).count());
     }
     launch_parallel([&](Shard& s) {
         DShard& d = dsh[s.g];
