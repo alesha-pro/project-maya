@@ -683,6 +683,9 @@ int serve(Model& m, const ServeOptions& so) {
         // Changing pixels can leave a common text prefix ending in the middle
         // of a prefill chunk. Replay that chunk with the new image's rows.
         if (turn_mark && from < shared_tokens) from -= from % CH;
+        // Two unrelated chats often share the template's first few tokens.
+        // A cold start here gives the new branch a reproducible host checkpoint.
+        if (wide_text && from < 256 && n > 2 * HostPrefixIndex::block) from = 0;
         const bool full_hit = turn_mark && saved_prompt == n && from == n;
         if (!full_hit) {
             saved_prompt = 0;
