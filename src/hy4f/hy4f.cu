@@ -17,6 +17,7 @@
 #include "hy4f_select.cuh"
 #include "hy4f_bkern.cuh"
 #include "hy4f_mqa.cuh"
+#include "hy4f_index_packed.cuh"
 #include "hy4f_swa_prefill.cuh"
 #include "hy4f_dsa_prefill.cuh"
 #include "hy4f_dkern.cuh"
@@ -43,6 +44,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1076,6 +1078,7 @@ struct Model::Impl {
             if (d.cert.rank_hist) cudaFree(d.cert.rank_hist);
             if (d.cert.rank_cut) cudaFree(d.cert.rank_cut);
             if (d.packed_query) cudaFree(d.packed_query);
+            if (d.index_cache) cudaFree(d.index_cache);
             if (d.rank_tiles) cudaFree(d.rank_tiles);
             if (d.rank_final) cudaFree(d.rank_final);
         }
@@ -1205,6 +1208,7 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
     try {
         Impl& d = *d_;
         if (pos > d.pos_next) throw std::runtime_error("hy4f: prefill out of order");
+        d.packed_index_groups = -1;
         if (pos < prefix_pos_) prefix_pos_=-1;
         if (pos + n > d.o.max_context) throw std::runtime_error("hy4f: context full");
         if (d.sparse_limit) {
@@ -1518,6 +1522,7 @@ bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
     try {
         Impl& d = *d_;
         if (pos > d.pos_next) throw std::runtime_error("hy4f: step out of order");
+        d.packed_index_groups = -1;
         if (pos >= d.o.max_context) throw std::runtime_error("hy4f: context full");
         d.hio->pos = (int) pos;
         d.change_q3_layout(false);
@@ -1783,6 +1788,7 @@ bool Model::load_host_prefix(int i, int64_t pos, std::string& err) {
             d_->sparse_valid = false;
             d_->sparse_high = 0;
         }
+        d_->packed_index_groups = -1;
         transfer_host_prefix(*host_prefixes_[i], pos, false);
         d_->pos_next = hw_ = pos;
         d_->sparse_high = (int)std::min<int64_t>(pos,d_->sparse_limit);

@@ -109,6 +109,7 @@ struct DShard {
     cudaEvent_t fork = nullptr, projected = nullptr, shared_done = nullptr;
     Q81* shq = nullptr;
     __half* packed_query = nullptr;
+    packed_index::Cache* index_cache = nullptr;
     IoT *dio_v = nullptr, *dio_m = nullptr;
     float *X = nullptr, *x = nullptr, *h = nullptr, *post = nullptr, *hcp = nullptr, *hcs = nullptr, *ones = nullptr;
     float *xp = nullptr, *qr = nullptr, *qp = nullptr, *qabs = nullptr, *o = nullptr, *part = nullptr, *a = nullptr,
@@ -174,6 +175,9 @@ float* hmlog = nullptr;    // [V] pinned: the MTP head's logits row (for drafts 
 int* hmargi = nullptr;
 int64_t m_next = 0;        // next MTP position
 
+bool packed_index_dispatch = std::getenv("HY4F_DEC_PACKED_INDEX") != nullptr;
+int packed_index_groups = -1, packed_index_next = 0;
+
 void dec_alloc(Shard& s, DShard& d) {
     HY_CK(cudaSetDevice(s.dev));
     const int K = n_used, QH = nope + rope, Hmax = std::max(Hd, Hs), ncol = (eg_ngram - 1) * eg_heads;
@@ -197,6 +201,10 @@ void dec_alloc(Shard& s, DShard& d) {
     HY_CK(cudaMalloc(&d.dio_m, sizeof(IoT)));
     HY_CK(cudaMemset(d.dio_v, 0, sizeof(IoT)));
     HY_CK(cudaMemset(d.dio_m, 0, sizeof(IoT)));
+    if (packed_index_dispatch && IH==16 && IK==128 && top_k==2048 && kpool==4) {
+        HY_CK(cudaMalloc(&d.index_cache, L*sizeof(packed_index::Cache)));
+        HY_CK(cudaMemset(d.index_cache,0,L*sizeof(packed_index::Cache)));
+    }
     d.X = dalloc((size_t) DT * hc * E);
     d.x = dalloc((size_t) DT * E);
     d.h = dalloc((size_t) DT * E);
@@ -483,7 +491,11 @@ void d_indexer_select(Shard& s, DShard& d, const std::string& P, int il, const i
         d_indexer_weights(s,d,P,T,st);
     }
     const int ld_sc = (int) (o.max_context / kpool + 1);
-    if (IH == 16 && IK == 128 && T <= 4 && std::getenv("HY4F_DEC_SCORE_TILE")) {
+    if (d.index_cache && packed_index_dispatch && il<L && T>=2 && T<=4) {
+        const auto kernel = T==2 ? packed_index::score<2,2> :
+                            T==3 ? packed_index::score<3,4> : packed_index::score<4,4>;
+        kernel<<<T==2?256:512,128,0,st>>>(iq,qpc,s.pooled[il],d.index_cache+il,d.iw,pp,ld_sc-1,d.score,ld_sc);
+    } else if (IH == 16 && IK == 128 && T <= 4 && std::getenv("HY4F_DEC_SCORE_TILE")) {
         const auto kernel = T == 1 ? kd_score_tile<1> : T == 2 ? kd_score_tile<2> : kd_score_tile<4>;
         kernel<<<dec_score_blocks,256,0,st>>>(iq,qpc,s.pooled[il],d.iw,IH,kpool,top_k,pp,0,T,ld_sc-1,d.score,ld_sc);
     } else if (IH == 16 && IK == 128 && !std::getenv("HY4F_OLD_SCORE"))   // (grid for the whole context: the graph is fixed)
@@ -1199,7 +1211,33 @@ void dec_setup() {
 
 float mtp_max(int rank) const { return hmargv[rank * (compact_io ? 2 : 1)]; }
 
+// Keep the canonical pooled rows usable by prefill, MTP and host checkpoints.
+// Speculative rows and the open 8-group tile are always read from that storage.
+void prepare_packed_index(int pos, int T) {
+    const int stable = (pos/32)*8;
+    if (stable < packed_index_groups) packed_index_groups = -1;
+    if (T<2 || T>4 || pos+T<=top_k || (packed_index_groups>=0 && stable<packed_index_next)) return;
+    int count=0;
+    for (int il=0;il<L;++il) count+=!swa[il];
+    if (!count) return;
+    size_t bytes=bsh.empty()?0:bsh.front().arena_bytes;
+    for (const auto& b : bsh) bytes=std::min(bytes,b.arena_bytes);
+    const int fit=int(std::min<size_t>(bytes/(size_t(count)*256),o.max_context/4))/8*8;
+    const int groups=std::min(fit,stable);
+    launch_parallel([&](Shard& s) {
+        int slab=0;
+        for (int il=0;il<L;++il) if (!swa[il]) {
+            auto* dest=groups?reinterpret_cast<uint4*>(bsh[s.g].arena_base)+size_t(slab)*groups*16:nullptr;
+            packed_index::pack_keys<<<std::max(1,(groups+15)/16),256,0,s.st>>>(s.pooled.at(il),dest,groups,dsh[s.g].index_cache+il);
+            ++slab;
+        }
+    });
+    packed_index_groups=groups;
+    packed_index_next=groups==fit?INT_MAX:groups+2048;
+}
+
 void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
+    if (!mtp && dsh.front().index_cache) prepare_packed_index(hio_v->pos,T);
     const bool ranked=cert_ranked && rank_active && !full_logits;
     const bool narrow=greedy_draft_head && !full_logits && !rank_active;
     rank_from_mtp=mtp;
