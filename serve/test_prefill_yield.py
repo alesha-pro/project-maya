@@ -80,10 +80,12 @@ class PrefillYield(unittest.TestCase):
             fifo.leave(older)
             fifo.leave(later)
 
-    def exercise(self, abort=False, enabled=True, short_limit=32, warm=False, hit=True):
+    def exercise(self, abort=False, enabled=True, short_limit=32, warm=False, hit=True, decode_slice="0"):
         tok = ByteTokenizer()
         engine = CheckpointEngine(tok)
         engine.can_prefill_yield = enabled
+        if decode_slice != "0":
+            engine.delay = .004
         engine.can_warm_prefill_yield, engine.warm_hit = warm, hit
         svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         output, errors = {}, []
@@ -102,7 +104,7 @@ class PrefillYield(unittest.TestCase):
                 errors.append(exc)
         a = threading.Thread(target=turn, args=("a", "long request " + "x" * 16000, 48, cancel))
         b = threading.Thread(target=turn, args=("b", "short request" + ("y" * 12000 if warm else ""), short_limit, threading.Event()))
-        with patch.dict(os.environ, {"MAYA_FAIR_SLICE_S": "0"}):
+        with patch.dict(os.environ, {"MAYA_FAIR_SLICE_S": decode_slice}):
             a.start()
             self.assertTrue(engine.reading.wait(3))
             b.start()
@@ -146,6 +148,11 @@ class PrefillYield(unittest.TestCase):
                 self.assertEqual(eng.warm_queries, [next(ids for long, _, ids, _ in eng.attempts if not long)])
             else:
                 self.assertEqual(eng.warm_queries, [])
+
+    def test_granted_bounded_turn_finishes_even_when_decode_slicing_is_also_enabled(self):
+        engine, output = self.exercise(decode_slice="0.005")
+        self.assertEqual((output["a"], output["b"]), ("long result", "short result"))
+        self.assertEqual([(x[0], x[1]) for x in engine.attempts], [(True, None), (False, None), (True, 37)])
 
     def test_abort_while_queued_does_not_resume(self):
         eng, _ = self.exercise(abort=True)

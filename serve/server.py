@@ -336,7 +336,10 @@ class FairLock:
                 self._queue.append(me)
             else:
                 # A cancelled short waiter must not give an unrelated request this reader's turn.
-                self._queue.insert(int(bool(self._queue and self._queue[0] is after_waiter)), me)
+                first = bool(self._queue and self._queue[0] is after_waiter)
+                if first:
+                    after_waiter.append(True)   # the bounded short turn completes before this reader resumes
+                self._queue.insert(int(first), me)
             self._used -= min(k, self._used)
             self._yields = max(0, self._yields - 1)
             self._cv.notify_all()
@@ -4022,6 +4025,8 @@ class Service:
             while not cancel.is_set():
                 if self.fifo.wait_turn(place, timeout=0.05):
                     hold[0] = True
+                    if short_prefill and len(place) > 5 and place[5]:
+                        hold.append(True)
                     return
                 if time.monotonic() - last >= every:
                     last = time.monotonic()
@@ -4350,7 +4355,7 @@ class Service:
                         break                           # (gen.close(): STOP + drain, still holding the FIFO)
                     if t0 is None:
                         t0 = time.monotonic()
-                    if slice_s > 0 and not claimed and not pausing and not emb and not self.stopping and len(produced) < max_new \
+                    if slice_s > 0 and len(hold) < 3 and not claimed and not pausing and not emb and not self.stopping and len(produced) < max_new \
                             and self.fifo.waiting() and time.monotonic() - t0 >= slice_s \
                             and self.fifo.claim_yield(slice_s):     # (one runner a waiter, not every runner)
                         claimed = True
