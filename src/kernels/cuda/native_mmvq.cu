@@ -1458,6 +1458,82 @@ __global__ void __launch_bounds__(128) hy4_q80_rows(const Q80Block* __restrict__
 // Keep lane assignments, K traversal and four-warp accumulation identical
 // while amortizing activation loads over more output rows in each block.
 namespace {
+// The release52 4-warp decomposition, specialized for fixed multiples of 1024.
+// The eight signed weights stay at their original GGUF block offsets.
+template<bool Wide>
+__device__ __forceinline__ int2 q80_octet(const signed char* q, int b) {
+    if constexpr (!Wide) return make_int2(load_int_b2(q,0),load_int_b2(q,1));
+    // A GGUF Q8_0 block is 34 bytes; every second qs payload is two bytes
+    // off a 32-bit boundary. Neighbor words cover all eight original bytes.
+    const auto* u=reinterpret_cast<const unsigned*>((uintptr_t)q & ~uintptr_t(3));
+    const unsigned a=u[0],c=u[1];
+    if (b%2) return make_int2(a,c);
+    const unsigned d=u[2];
+    return make_int2(__byte_perm(a,c,0x5432),__byte_perm(c,d,0x5432));
+}
+template<int K,int T,int R,bool Wide>
+__global__ __launch_bounds__(128) void hy4_q80_static(const Q80Block* __restrict__ w,const Q81Block* __restrict__ x,
+                                                float* __restrict__ y,int rows) {
+    constexpr int Nb=K/32;
+    const int tid=threadIdx.x, lane=tid%32, warp=tid/32, row0=blockIdx.x*R;
+    const int octet=tid%4;
+    float acc[R][T]={};
+#pragma unroll
+    for(int seg=0;seg<Nb/32;++seg) {
+        const int b=tid/4+32*seg;
+        int2 input[T];float scale[T];
+#pragma unroll
+        for(int t=0;t<T;++t) {
+            const Q81Block& v=x[t*Nb+b];
+            input[t]=make_int2(reinterpret_cast<const int*>(v.qs)[octet*2],reinterpret_cast<const int*>(v.qs)[octet*2+1]);
+            scale[t]=__low2float(v.ds);
+        }
+#pragma unroll
+        for(int rr=0;rr<R;++rr) {
+            const Q80Block& wr=w[(row0+rr)*Nb+b];
+            const int2 v=q80_octet<Wide>(wr.qs+octet*8,b);
+            const float d=__half2float(wr.d);
+#pragma unroll
+            for(int t=0;t<T;++t) {
+                int dot=__dp4a(v.y,input[t].y,__dp4a(v.x,input[t].x,0));
+                acc[rr][t]=fmaf(d*scale[t],float(dot),acc[rr][t]);
+            }
+        }
+    }
+    __shared__ float partial[3][R][T][32];
+    if(warp)
+#pragma unroll
+        for(int rr=0;rr<R;++rr)
+#pragma unroll
+            for(int t=0;t<T;++t)partial[warp-1][rr][t][lane]=acc[rr][t];
+    __syncthreads();
+    if(warp)return;
+#pragma unroll
+    for(int rr=0;rr<R;++rr)
+#pragma unroll
+        for(int t=0;t<T;++t) {
+            float sum=acc[rr][t];
+#pragma unroll
+            for(int j=0;j<3;++j)sum+=partial[j][rr][t][lane];
+#pragma unroll
+            for(int skip=16;skip;skip/=2)sum+=__shfl_xor_sync(~0u,sum,skip);
+            if(lane==rr)y[t*rows+row0+rr]=sum;
+        }
+}
+
+// Each shape uses the best geometry measured on release52 for its exact four-warp reduction.
+template<int T> bool q80_static_shape(const Q80Block* w,const Q81Block* x,float* y,int k,int rows,cudaStream_t st) {
+    if (k == 1024 && (rows == 4096 || rows == 8192)) {
+        hy4_q80_static<1024,T,2,true><<<rows/2,128,0,st>>>(w,x,y,rows);
+    } else if (k == 4096 && rows == 3072) {
+        hy4_q80_static<4096,T,1,T==3><<<rows,128,0,st>>>(w,x,y,rows);
+    } else if (k == 3072 && rows == 2624) {
+        constexpr int r=T==3?2:1;
+        hy4_q80_static<3072,T,r,true><<<rows/r,128,0,st>>>(w,x,y,rows);
+    } else return false;
+    return true;
+}
+
 template<int T> void q8_tiled(int tile, const Q80Block* w, const Q81Block* x, float* y, int n, int rows, cudaStream_t st) {
     using F = SmallTraits<Q80Block, 8>;
     const dim3 threads(32, 4);
@@ -1471,6 +1547,21 @@ template<int T> void q8_tiled(int tile, const Q80Block* w, const Q81Block* x, fl
 }
 void native_q8_0_mmvq(const void* weights, const void* x_q8_1, float* y,
                        int n_in, int n_out, int ncols, void* stream) {
+    const char* fixed = std::getenv("HY4F_Q8_STATIC");
+    if (fixed && fixed[0]=='1' && !fixed[1] && (ncols==2 || ncols==3) && !(reinterpret_cast<uintptr_t>(weights)&3u)
+        && !std::getenv("HY4F_Q8_TILE") && !std::getenv("HY4F_Q80_ROWS")) {
+        validate_pointer(weights);
+        validate_pointer(x_q8_1);
+        validate_pointer(y);
+        validate_stream(stream);
+        const auto w=static_cast<const Q80Block*>(weights);
+        const auto x=static_cast<const Q81Block*>(x_q8_1);
+        const auto st=static_cast<cudaStream_t>(stream);
+        if (ncols==2 ? q80_static_shape<2>(w,x,y,n_in,n_out,st) : q80_static_shape<3>(w,x,y,n_in,n_out,st)) {
+            launch_check();
+            return;
+        }
+    }
     const bool automatic = std::getenv("HY4F_Q8_AUTO") != nullptr;
     const char* requested = std::getenv("HY4F_Q8_TILE");
     if (!requested && automatic && n_in == 3072 && (n_out == 2304 || n_out == 5696) && (ncols == 2 || ncols == 3))
