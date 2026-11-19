@@ -76,6 +76,12 @@ int peer_of(int g, int r) const { return paired && (S & (S - 1)) == 0 ? (g ^ r) 
 int cap_num = 3, cap_den = 2;   // expert rows buffered per shard: cap_num/cap_den x the even share (ranges past it)
 bool compact_arena = std::getenv("HY4F_PF_COMPACT") != nullptr;
 int attn_tile = 512;
+// Split the head groups and token scratch independently of the expert prefill chunk.
+int single_prefill_mode() const {
+    const char* setting=std::getenv("HY4F_SINGLE_PF");
+    if (S!=1 || !setting) return 0;
+    return !std::strcmp(setting,"mqa") ? 2 : !std::strcmp(setting,"exact") ? 1 : 0;
+}
 bool direct_dsa = std::getenv("HY4F_DIRECT_DSA") != nullptr;
 int mqa_opt = std::getenv("HY4F_PF_MQA") ? std::atoi(std::getenv("HY4F_PF_MQA")) : 0;
 int64_t idx_split_from = std::getenv("HY4F_IDX_SPLIT_FROM") ? std::atoll(std::getenv("HY4F_IDX_SPLIT_FROM")) : 16384;   // indexer split by tokens from this depth   // tokens per attention tile (q_abs / o / partials / cells / the combine are tile-sized)
@@ -113,7 +119,7 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         for (auto& e : b.ag_slice) HY_CK(cudaEventCreateWithFlags(&e, cudaEventDisableTiming));
         HY_CK(cudaEventCreateWithFlags(&b.ag_complete, cudaEventDisableTiming));
     }
-    if (S == 1) attn_tile = Tmax;   // (the single-GPU attention falls back to kb_attn2 over the whole chunk)
+    if (S == 1 && !single_prefill_mode()) attn_tile = Tmax;
     const int T = Tmax, K = n_used, QH = nope + rope, Hmax = std::max(Hd, Hs);
     const int64_t C = o.max_context;
     b.mmq = new strata::prefill::mmq::Context();
@@ -125,6 +131,11 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_CK(cudaHostAlloc((void**) &b.hb, sizeof(int) * 4, cudaHostAllocPortable));
     HY_CK(cudaHostAlloc((void**) &b.hmb, sizeof(int) * (nl_max + 1), cudaHostAllocPortable));
     b.cap = std::min((int64_t) T * K, std::max<int64_t>((int64_t) cap_num * T * K / (cap_den * S), 2 * T));
+    if (offload && single_prefill_mode()) {
+        // Each expert occurs at most once per token. b_ffn already splits a range
+        // by its actual routed row count before launching either of its matrices.
+        b.cap=T;
+    }
     if (offload) {
         for (int i = 0; i < 2; ++i) {
             HY_CK(cudaMalloc(&b.stage[i], off_stage / 2 + 4096));
@@ -529,8 +540,9 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
     const DW& vb = s.w.at(P + "attn_v_b.weight");
     const float scale = 1.0f / std::sqrt((float) QH);
     const int Ha = sw ? Hl : Hd;   // heads absorbed / attended on this shard
-    const bool mqa = sw ? (Hl == 16 || Hl == 32) : (Hd == 32 && S > 1);
-    const int TA = mqa ? std::min(T, attn_tile) : T;
+    const int single=single_prefill_mode();
+    const bool mqa = sw ? (Hl == 16 || Hl == 32 || (single==2 && Hl==64)) : (Hd == 32 && (S>1 || single==2));
+    const int TA = mqa || single ? std::min(T, attn_tile) : T;
     float* iq = b.qp + (size_t) Hd * QH;
     const int64_t ld_sc = o.max_context / kpool + 1;
     if (!sw) {   // the indexer: pooled keys of the groups completed in the chunk (selection per tile below)
@@ -597,9 +609,12 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                 kb_mqa_attn<32><<<tt, 256, mqa_smem<32>(), b.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk_cur,
                                                                  nullptr, 0, b.pp_attn, b.toff + t0, win, 1, 0, sinks + s.g * Hl, scale,
                                                                  b.o, b.part, CBW(), expanded, first_row, (mqa_opt & 1) && Hd >= Hl);
+            else if (single==2 && Hl==64)
+                kb_mqa_attn<32,2><<<dim3(tt,2),256,mqa_smem<32>(),b.st>>>(b.qabs,qt,(int)qp_ld,QH,nope,th,s.kv[il],
+                    b.chunk_cur,nullptr,0,b.pp_attn,b.toff+t0,win,1,0,sinks,scale,b.o,nullptr,CBW(),expanded,first_row);
             else
-                kb_attn2<<<dim3(Hl, T), 256, 0, b.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk, nullptr, 0,
-                                                        b.pp, win, 1, 0, sinks + s.g * Hl, scale, b.o, nullptr, Hl);
+                kb_attn2<<<dim3(Hl,tt),256,0,b.st>>>(b.qabs,qt,(int)qp_ld,QH,nope,th,s.kv[il],b.chunk_cur,nullptr,0,
+                    b.pp_attn,win,1,0,sinks+s.g*Hl,scale,b.o,nullptr,Hl,b.toff+t0);
         } else {
             // the indexer split (deep prompts): shard g scores / selects rows [g*q, (g+1)*q) of the tile, the cells are
             // all-gathered (one peer at a time) - the score is O(depth) and was computed by all four GPUs
@@ -672,7 +687,10 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                 }
                 kb_wait_k<<<1, 32, 0, b.st>>>(b.cl, s.g, S, b.step);
             }
-            if (mqa) {
+            if (mqa && S==1) {
+                kb_mqa_attn<32><<<tt,256,mqa_smem<32>(),b.st>>>(b.qabs,qt,(int)qp_ld,QH,nope,th,s.kv[il],
+                        nullptr,cells,n_cap,b.pp,t0,win,1,0,sinks,scale,b.o,nullptr,CBW());
+            } else if (mqa) {
                 if ((mqa_opt & 8) && direct && n_cap <= 2048 && std::max(Hd,Hs)/S >= 16 && mbs.empty()) {
                     auto* qh = reinterpret_cast<__half*>(b.part);
                     auto* ph = reinterpret_cast<__half*>(b.o);
@@ -718,8 +736,8 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                 push(s, b, b.part, per, 1, Hl, CBW(), b.cb, b.ctr + 4);
                 kb_combine<<<T, 512, 0, b.st>>>(kvl, CBW(), s.g * Hl, Hl, sinks, b.cb, s.g, S, b.step, per, b.o);
             } else {
-                kb_attn2<<<dim3(Hd, T), 256, 0, b.st>>>(b.qabs, b.qp, (int) qp_ld, QH, nope, th, s.kv[il], nullptr, b.cells,
-                                                        n_cap, b.pp, win, 1, 0, sinks, scale, b.o, nullptr, Hd);
+                kb_attn2<<<dim3(Hd,tt),256,0,b.st>>>(b.qabs,qt,(int)qp_ld,QH,nope,th,s.kv[il],nullptr,b.cells,
+                    n_cap,b.pp,win,1,0,sinks,scale,b.o,nullptr,Hd,t0);
             }
         }
         // a[t][h] = v_b_h o[t][h] (v_b_h [vh][kvl] row-major), then the sigmoid gate

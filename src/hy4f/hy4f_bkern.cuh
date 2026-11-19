@@ -296,10 +296,10 @@ __global__ void kb_absorb_bf16(const uint16_t* kb, const float* q, int ldq, int 
 __global__ void __launch_bounds__(256) kb_attn2(const float* qabs, const float* q, int ldq, int qs, int nope, float theta,
                                                 const uint8_t* kv, const uint8_t* chunk, const int* cells, int n_cap,
                                                 const int* pos0p, int win, int n_shards, int shard, const float* sinks,
-                                                float scale, float* o, float* part, int H) {
+                                                float scale, float* o, float* part, int H, int t0 = 0) {
     const int pos0 = *pos0p;
     constexpr int KVL = 512, ROPE = 64, NW = 8;
-    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5, pos = pos0 + t;
+    const int h = blockIdx.x, t = blockIdx.y, lane = threadIdx.x & 31, w = threadIdx.x >> 5, pos = pos0 + t0 + t;
     float qa[16];
     {
         const float4* qa4 = reinterpret_cast<const float4*>(qabs + ((size_t) t * H + h) * KVL + lane * 16);

@@ -56,7 +56,7 @@ __device__ __forceinline__ int grouped_kv_row(int row, int pos, int top_k, int g
     return wire ? (int)wire[row] : cells[4 * row] / 4;
 }
 
-template <int H>
+template <int H, int HeadGroups = 1>
 __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qabs, const float* __restrict__ q, int ldq,
                                                    int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                    const uint8_t* __restrict__ chunk, const int* __restrict__ cells,
@@ -84,14 +84,16 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
     __shared__ int wtot[8], s_n;
 
     const int t = blockIdx.x, pos = pos0 + t0 + t, tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
+    constexpr int head_stride = H * HeadGroups;
+    const int head_base = HeadGroups == 1 ? 0 : H * int(blockIdx.y);
     // Q tile: scale * [q_abs | RoPE(q_pe)] as fp16
     for (int i = tid; i < H * D; i += 256) {
         const int h = i / D, c = i % D;
         float v;
-        if (c < KVL) v = qabs[((size_t) t * H + h) * KVL + c];
+        if (c < KVL) v = qabs[((size_t) t * head_stride + head_base + h) * KVL + c];
         else {
             const int j = c - KVL, jj = j >> 1;
-            const float* qp = q + (size_t) t * ldq + (size_t) h * qs + nope + 2 * jj;
+            const float* qp = q + (size_t) t * ldq + (size_t) (head_base + h) * qs + nope + 2 * jj;
             float sn, cs;
             sincosf((float) pos * powf(theta, -2.0f * jj / ROPE), &sn, &cs);
             v = (j & 1) ? qp[0] * sn + qp[1] * cs : qp[0] * cs - qp[1] * sn;
@@ -269,7 +271,7 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
                 if (partial) {
                     sm_i[tid] = 1.0f;   // unnormalized; M, L exported
                 } else {
-                    const float m = sm_m[tid], sk = sinks[tid], mf = fmaxf(m, sk);
+                    const float m = sm_m[tid], sk = sinks[head_base + tid], mf = fmaxf(m, sk);
                     const float l = sm_l[tid] * (m == -INFINITY ? 0.0f : __expf(m - mf)) + __expf(sk - mf);
                     sm_m[tid] = mf;
                     sm_i[tid] = 1.0f / l;
@@ -285,7 +287,7 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
         if (partial)
             wmma::store_matrix_sync(part + ((size_t) t * H + hi * 16) * W + nj * 16, acc[i], W, wmma::mem_row_major);
         else
-            wmma::store_matrix_sync(o + ((size_t) t * H + hi * 16) * KVL + nj * 16, acc[i], KVL, wmma::mem_row_major);
+            wmma::store_matrix_sync(o + ((size_t) t * head_stride + head_base + hi * 16) * KVL + nj * 16, acc[i], KVL, wmma::mem_row_major);
     }
     if (partial && tid < H) {
         part[((size_t) t * H + tid) * W + KVL] = sm_m[tid];
