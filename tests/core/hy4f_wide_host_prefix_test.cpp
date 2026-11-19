@@ -9,8 +9,28 @@ static void check(bool condition) {
     }
 }
 
+// every checkpoint of a grain is a chunk boundary below the prompt's end; one block keeps the original positions
+static void grains() {
+    using strata::hy4f::HostPrefixIndex;
+    for (size_t grain : {2048u, 4096u}) {
+        check(HostPrefixIndex::grain_supported(grain));
+        const HostPrefixIndex keys(2, true, true, grain);
+        check(keys.max_delta(262144) == 8192 - grain);
+        for (size_t n = 0; n <= 262144; ++n) {
+            const size_t a = keys.shallow_checkpoint(n), b = keys.deep_checkpoint(n), c = keys.fine_checkpoint(n);
+            check(a % grain == 0 && b % grain == 0 && c % grain == 0);
+            check((!a || a < n) && (!b || b < n) && (!c || c < n));
+            check(a <= 32768 && (!b || b > 32768) && (!c || (c > 32768 && c - c / 8192 * 8192 <= keys.max_delta(262144))));
+            if (grain == 2048) check(a == HostPrefixIndex::checkpoint(n));
+            if (n > 4096) check(n - std::max({a, b, c}) <= (n > 32768 ? grain : std::max<size_t>(grain, n - 32768)));
+        }
+    }
+    check(!HostPrefixIndex::grain_supported(1024) && !HostPrefixIndex::grain_supported(57600));
+}
+
 int main() {
     using strata::hy4f::WidePrefixGrid;
+    grains();
     const WidePrefixGrid profile(57600);
     check(profile.shallow(4096) == 0 && profile.shallow(4097) == 4096);
     check(profile.shallow(32768) == 4096 && profile.shallow(32769) == 32768);

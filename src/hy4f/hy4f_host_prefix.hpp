@@ -12,9 +12,16 @@ public:
     static constexpr size_t limit = 32768;
 
     static constexpr unsigned fine_slots = 2;
-    explicit HostPrefixIndex(unsigned slots, bool deep = false, bool fine = false)
+    // grain: the prefill chunk. A cold prompt only stops on its multiples, so every checkpoint is one of them
+    // (one block, or two: the 4096-token chunk of the offload profiles).
+    explicit HostPrefixIndex(unsigned slots, bool deep = false, bool fine = false, size_t grain = block)
         : short_slots_(slots), anchor_slots_(deep ? 2 * slots : slots),
-          entries_(anchor_slots_ + (deep && fine && slots ? fine_slots : 0)) {}
+          entries_(anchor_slots_ + (deep && fine && slots ? fine_slots : 0)), grain_(grain) {}
+    static bool grain_supported(size_t chunk) { return chunk == block || chunk == 2 * block; }
+    size_t shallow_checkpoint(size_t prompt_size) const {
+        if (prompt_size <= 2 * block) return 0;
+        return std::min(limit, prompt_size - 1) / grain_ * grain_;
+    }
     bool enabled() const { return !entries_.empty(); }
     static size_t checkpoint(size_t prompt_size) {
         if (prompt_size <= 2 * block) return 0;
@@ -29,12 +36,12 @@ public:
     }
     size_t fine_checkpoint(size_t prompt_size) const {
         if (entries_.size() == anchor_slots_ || prompt_size <= limit) return 0;
-        const size_t pos = (prompt_size - 1) / block * block;
+        const size_t pos = (prompt_size - 1) / grain_ * grain_;
         return pos > limit && pos % (4 * block) ? pos : 0;
     }
     size_t max_delta(size_t ctx) const {
         if (entries_.size() == anchor_slots_ || ctx <= limit + block) return 0;
-        return std::min(3 * block, (ctx - 1) / block * block - limit);
+        return std::min(4 * block - grain_, (ctx - 1) / grain_ * grain_ - limit);
     }
     int fine_parent(const Key& key) const {
         const size_t boundary = key.size() / (4 * block) * (4 * block);
@@ -107,6 +114,7 @@ private:
     size_t short_slots_, anchor_slots_;
     std::vector<Entry> entries_;
     uint64_t tick_ = 0;
+    size_t grain_ = block;
 };
 
 // A long transfer-efficient chunk still needs repeatable split points for an

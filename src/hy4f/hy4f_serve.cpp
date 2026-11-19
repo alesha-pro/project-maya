@@ -553,19 +553,20 @@ int serve(Model& m, const ServeOptions& so) {
     const char* wide_setting = std::getenv("HY4F_LARGE_HOST_PREFIX");
     const bool wide_host = CH >= int(HostPrefixIndex::limit) && wide_setting && std::strcmp(wide_setting, "1") == 0;
     const WidePrefixGrid grid(CH);
-    const bool host_supported = CH == int(HostPrefixIndex::block) || wide_host;
+    const bool host_supported = HostPrefixIndex::grain_supported((size_t) CH) || wide_host;
     const int host_slots = host_setting && host_supported &&
         (std::strcmp(host_setting, "2") == 0 || std::strcmp(host_setting, "3") == 0) ? host_setting[0] - '0' : 0;
     const char* fine_setting = std::getenv("HY4F_FINE_HOST_PREFIX");
     HostPrefixIndex host_keys(host_slots, std::getenv("HY4F_DEEP_HOST_PREFIX") != nullptr,
-                              !wide_host && fine_setting && std::strcmp(fine_setting, "1") == 0);
-    const auto shallow_at = [&](size_t n) { return wide_host ? grid.shallow(n) : HostPrefixIndex::checkpoint(n); };
+                              !wide_host && fine_setting && std::strcmp(fine_setting, "1") == 0,
+                              wide_host ? HostPrefixIndex::block : (size_t) CH);
+    const auto shallow_at = [&](size_t n) { return wide_host ? grid.shallow(n) : host_keys.shallow_checkpoint(n); };
     const auto deep_at = [&](size_t n) {
         const size_t pos = host_keys.deep_checkpoint(n);
         return wide_host && pos ? grid.deep(n) : pos;
     };
     if (host_setting && !host_slots)
-        std::fprintf(stderr, "maya hy4f serve: host prefix cache needs 2 or 3 slots and chunk 2048 or an enabled large-chunk grid\n");
+        std::fprintf(stderr, "maya hy4f serve: host prefix cache needs 2 or 3 slots and chunk 2048 or 4096, or an enabled large-chunk grid\n");
     const char* reserve = std::getenv("HY4F_HOST_PREFIX_PREALLOC");
     if (host_slots && reserve && std::strcmp(reserve, "1") == 0) {
         const double started = now_ms();
