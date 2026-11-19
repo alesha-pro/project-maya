@@ -923,6 +923,8 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         dec_mmvq(s, P + "xmoe", d.xq, d.xm, T);
         kd_q8_slots<<<dim3(nb(latent), T * K), 256, 0, s.st>>>(d.xm, xmc, latent, K, d.xlq);
     }
+    const char* repeated_value=std::getenv("HY4F_Q4_REPEATED");
+    const bool q4_repeated=T>=2 && T<=4 && repeated_value && std::atoi(repeated_value)!=0;
     const bool mp = T > 4;   // (more than 4 slots per expert possible: the multi-pass copy of the grouped kernel)
     const auto& gu = s.w.at(P + "ffn_gu_exps");
     const auto& down = s.w.at(P + "ffn_down_exps.weight");
@@ -967,9 +969,11 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
             if (w.type == T_Q3_K)
                 (mp ? kn::native_q3_k_mmvq_grouped_mp : kn::native_q3_k_mmvq_grouped)(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot,
                                                                                     xq, y, n_in, n_out, moe_blocks, s.st);
-            else if (w.type == T_Q4_K)
-                (mp ? kn::native_q4_k_mmvq_grouped_mp : kn::native_q4_k_mmvq_grouped)(w.d, eb, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot,
-                                                                                    xq, y, n_in, n_out, moe_blocks, s.st);
+            else if (w.type == T_Q4_K) {
+                auto apply=mp ? kn::native_q4_k_mmvq_grouped_mp : q4_repeated ? kn::native_q4_k_mmvq_grouped_repeated
+                                                                               : kn::native_q4_k_mmvq_grouped;
+                apply(w.d,eb,d.mg_n,d.mg_exp,d.mg_off,d.mg_slot,xq,y,n_in,n_out,moe_blocks,s.st);
+            }
             else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
             return;
         }

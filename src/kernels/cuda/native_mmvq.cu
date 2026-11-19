@@ -2041,6 +2041,91 @@ __global__ void __launch_bounds__(128) hy4_q4_cache(const Q4KBlock* w, size_t eb
         }
     }
 }
+// Each half warp owns one original 144-byte Q4_K block. Repeated slots
+// share its weights, and two neighboring output rows share the Q8 operands.
+template<int Slots, int Rows>
+__device__ __forceinline__ void q4_repeated_pair(const Q4KBlock* expert, const Q81Block* x,
+                                                const int* slots, float* y, int row) {
+    const int lane=threadIdx.x&31;
+    const int group=(lane&15)/4, part=lane&3;
+    int id[Slots];
+    float accum[2][Slots]{};
+#pragma unroll
+    for (int s=0;s<Slots;++s) id[s]=slots[s];
+#pragma unroll
+    for (int k=0;k<3;++k) {
+        const int block=2*k+(lane>>4);
+        int low[Slots][2], high[Slots][2], sums[Slots][2];
+        float scales[Slots][2];
+#pragma unroll
+        for (int s=0;s<Slots;++s) {
+            const auto* act=x+48*id[s]+8*block+2*group;
+#pragma unroll
+            for (int i=0;i<2;++i) {
+                const auto* qs=reinterpret_cast<const int*>(act[i].qs);
+                low[s][i]=qs[part];
+                high[s][i]=qs[part+4];
+                sums[s][i]=__dp4a(0x01010101,high[s][i],__dp4a(0x01010101,low[s][i],0));
+                scales[s][i]=__low2float(act[i].ds);
+            }
+        }
+#pragma unroll
+        for (int r=0;r<2;++r) {
+            const auto& w=expert[(row+4*r)*6+block];
+            uint4 h;
+            asm("ld.global.v4.u32 {%0,%1,%2,%3},[%4];"
+                : "=r"(h.x),"=r"(h.y),"=r"(h.z),"=r"(h.w) : "l"(&w));
+            const int shift=16*(group&1);
+            const unsigned s0=h.y>>shift,m0=h.z>>shift,top=h.w>>shift;
+            const unsigned sc=group<2 ? s0&0x3f3f : (top&0x0f0f)|((s0&0xc0c0)>>2);
+            const unsigned mn=group<2 ? m0&0x3f3f : ((top>>4)&0x0f0f)|((m0&0xc0c0)>>2);
+            const float dw=__half2float(__ushort_as_half(h.x));
+            const float dm=__half2float(__ushort_as_half(h.x>>16));
+            const auto* qs=reinterpret_cast<const int*>(w.qs)+8*group+part;
+            const int a=qs[0], b=qs[4];
+#pragma unroll
+            for (int s=0;s<Slots;++s) {
+                float d=0.f,m=0.f;
+#pragma unroll
+                for (int i=0;i<2;++i) {
+                    const int v0=(a>>(4*i))&0x0f0f0f0f, v1=(b>>(4*i))&0x0f0f0f0f;
+                    const int dot=__dp4a(v1,high[s][i],__dp4a(v0,low[s][i],0));
+                    d+=scales[s][i]*float(dot*int((sc>>(8*i))&255));
+                    m+=scales[s][i]*float(sums[s][i]*int((mn>>(8*i))&255));
+                }
+                accum[r][s]+=dw*d-dm*m;
+            }
+        }
+    }
+#pragma unroll
+    for (int r=0;r<2;++r) {
+#pragma unroll
+        for (int s=0;s<Slots;++s) {
+            const float v=warp_sum(accum[r][s]);
+            if (!lane) y[id[s]*Rows+row+4*r]=v;
+        }
+    }
+}
+
+template<int Rows>
+__global__ __launch_bounds__(128) void hy4_q4_repeated(const Q4KBlock* w,size_t eb,const int* ng,
+        const int* gexp,const int* goff,const int* gslot,const Q81Block* x,float* y) {
+    const int tiles=Rows/4, limit=(*ng)*tiles;
+    for (int tile=blockIdx.x;tile<limit;tile+=gridDim.x) {
+        const int g=tile/tiles, local=tile%tiles;
+        const int row=4*local+(threadIdx.x>>5);
+        const auto* expert=w+size_t(gexp[g])*eb;
+        const int first=goff[g], count=goff[g+1]-first;
+        const int* slots=gslot+first;
+        if (count==1) {
+            grouped_row1536<Q4KTraits,1>(expert+6*row,x,slots,y,row,Rows);
+        } else if (!(local&1)) {
+            if (count==2) q4_repeated_pair<2,Rows>(expert,x,slots,y,row);
+            else if (count==3) q4_repeated_pair<3,Rows>(expert,x,slots,y,row);
+            else if (count==4) q4_repeated_pair<4,Rows>(expert,x,slots,y,row);
+        }
+    }
+}
 template<class F> bool try_grouped1536(const void* weights, size_t expert_bytes, const int* ng, const int* gexp,
                                        const int* goff, const int* gslot, const void* x, float* y,
                                        int n_in, int n_out, int blocks, void* stream) {
@@ -2171,6 +2256,23 @@ void native_q4_k_mmvq_grouped(const void* weights, std::size_t expert_bytes, con
                               int blocks, void* stream) {
     if (try_grouped1536<Q4KTraits>(weights, expert_bytes, ng, gexp, goff, gslot, x_q8_1, y, n_in, n_out, blocks, stream)) return;
     launch_grouped<Q4KBlock, q4_q8_dot, VDR>(weights, expert_bytes, ng, gexp, goff, gslot, x_q8_1, y, n_in, n_out, blocks, stream);
+}
+
+void native_q4_k_mmvq_grouped_repeated(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp,
+                                       const int* goff, const int* gslot, const void* x_q8_1, float* y, int n_in, int n_out,
+                                       int blocks, void* stream) {
+    if (n_in!=1536 || (n_out!=1536 && n_out!=3072) || (reinterpret_cast<uintptr_t>(weights)&15u) ||
+        expert_bytes%sizeof(Q4KBlock) || std::getenv("HY4F_GROUP_REFERENCE")) {
+        native_q4_k_mmvq_grouped(weights,expert_bytes,ng,gexp,goff,gslot,x_q8_1,y,n_in,n_out,blocks,stream);
+        return;
+    }
+    const auto* w=static_cast<const Q4KBlock*>(weights);
+    const size_t eb=expert_bytes/sizeof(Q4KBlock);
+    const auto* q=static_cast<const Q81Block*>(x_q8_1);
+    const auto st=static_cast<cudaStream_t>(stream);
+    if (n_out==3072) hy4_q4_repeated<3072><<<blocks*2,128,0,st>>>(w,eb,ng,gexp,goff,gslot,q,y);
+    else hy4_q4_repeated<1536><<<blocks*2,128,0,st>>>(w,eb,ng,gexp,goff,gslot,q,y);
+    launch_check();
 }
 
 void native_q3_k_mmvq_grouped_mp(const void* weights, std::size_t expert_bytes, const int* ng, const int* gexp,
