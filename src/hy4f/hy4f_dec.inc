@@ -953,7 +953,7 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     if (offload) {   // the groups' local experts -> their places on the layer's weight lattice (VRAM or host)
         if (!grouped) throw std::runtime_error("hy4f: the expert offload needs the grouped expert kernels");
         const OffLayer& ol = s.off.at(il);
-        if (ol.av || ol.ah) k_virt_groups<<<1, 128, 0, s.st>>>(d.mg_n, d.mg_exp, ol.n_res, ol.av, ol.ah);
+        k_virt_groups<<<1, 128, 0, s.st>>>(d.mg_n, d.mg_exp, ol.vmap);
     }
     auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out) {
         const size_t eb = expert_stride(w);

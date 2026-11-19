@@ -798,8 +798,18 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
             if (ol) {
                 if (ea < ol->n_res) wg = ol->vram + (size_t) ea * ol->stride;
                 else {
-                    HY_CK(cudaMemcpyAsync(b.stage, ol->host + (size_t) ea * ol->stride, (size_t) (eb - ea) * ol->stride,
-                                          cudaMemcpyHostToDevice, b.st));
+                    for (int l = ea; l < eb;) {
+                        if (b.hmb[l + 1] == b.hmb[l]) {   // (an idle expert's weights are never read)
+                            ++l;
+                            continue;
+                        }
+                        int m = l + 1;
+                        while (m < eb && b.hmb[m + 1] != b.hmb[m] && ol->home[m] == ol->home[m - 1] + 1) ++m;
+                        HY_CK(cudaMemcpyAsync(b.stage + (size_t) (l - ea) * ol->stride,
+                                              ol->host + (size_t) ol->home[l] * ol->stride, (size_t) (m - l) * ol->stride,
+                                              cudaMemcpyHostToDevice, b.st));
+                        l = m;
+                    }
                     wg = b.stage;
                 }
                 wdn = wg + ol->gu_bytes;

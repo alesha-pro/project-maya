@@ -484,13 +484,13 @@ __global__ void k_engram_mix(float* X, float* R, const float* kv, const float* k
 // ------------------------------------------------------------------------------------------------ MoE (expert parallel)
 // local ids: the experts this shard owns (e0 <= id < e1) keep their local index, the others -1
 // expert offload: a shard's local expert index -> the index on its weight lattice (VRAM slots / pinned host records)
-__global__ void k_virt_ids(const int* loc, int* virt, int n, int n_res, int av, int ah) {
+__global__ void k_virt_ids(const int* loc, int* virt, int n, const int* vmap) {
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x)
-        virt[k] = loc[k] < 0 ? -1 : loc[k] + (loc[k] < n_res ? av : ah);
+        virt[k] = loc[k] < 0 ? -1 : vmap[loc[k]];
 }
-__global__ void k_virt_groups(const int* ng, int* experts, int n_res, int av, int ah) {
+__global__ void k_virt_groups(const int* ng, int* experts, const int* vmap) {
     const int i = threadIdx.x;
-    if (i < *ng) experts[i] += experts[i] < n_res ? av : ah;
+    if (i < *ng) experts[i] = vmap[experts[i]];
 }
 // HY4F_ROUTE_STATS: the picks per local expert
 __global__ void k_route_hist(const int* loc, int n, unsigned* count) {

@@ -120,9 +120,11 @@ inline size_t expert_stride(const DW& w) { return w.stride ? w.stride : w.rb * (
 // kernel finds an expert at base + index * stride whichever store holds it.
 struct OffLayer {
     int n = 0, n_res = 0;
-    int av = 0, ah = 0;   // lattice index = local index + (local < n_res ? av : ah)
+    int av = 0, ah = 0;   // lattice index = VRAM slot + av, or host record + ah
     size_t stride = 0, gu_bytes = 0;
     uint8_t *vram = nullptr, *host = nullptr;
+    std::vector<int> home;   // local expert -> its host record (the adaptation swaps experts without moving records)
+    int* vmap = nullptr;     // device: local expert -> lattice index
 };
 
 struct Shard {
@@ -194,6 +196,16 @@ struct Model::Impl {
     std::map<int, std::vector<int>> off_perm;    // layer -> [expert id in the engine] = the GGUF's expert
     std::vector<std::map<int, int>> off_res;     // [shard][layer] -> experts resident in VRAM
     std::string route_stats;
+    // HY4F_EXPERT_ADAPT: the VRAM set follows the routing - a cold resident and a hot host expert trade places
+    bool adapt = false;
+    double adapt_horizon = 2048;                   // tokens after which an old pick weighs 1/e
+    double adapt_pf_weight = 0;                    // (a prompt's routing does not predict the answer's: measured)
+    int adapt_every = 16, adapt_step_swaps = 1024, adapt_pf_swaps = 2048, adapt_calls = 0;
+    uint64_t win_picks = 0, win_hits = 0;
+    std::map<int, std::vector<double>> off_score;  // layer -> [expert id in the engine] decayed picks
+    std::vector<uint64_t> cum_dec, cum_rows, cum_touch;   // statistics [layer][GGUF expert]
+    uint64_t st_picks = 0, st_hits = 0, st_pf = 0, st_pf_hit = 0, st_swaps = 0;
+    double st_swap_s = 0;
     std::vector<Shard> sh;
     Io* hio = nullptr;
     float* hlogits = nullptr;
@@ -644,6 +656,12 @@ struct Model::Impl {
         off_budget = (size_t) std::atoll(mb) << 20;
         const char* sm = std::getenv("HY4F_OFFLOAD_STAGE_MB");
         off_stage = (size_t) (sm ? std::atoll(sm) : 256) << 20;
+        if (const char* a = std::getenv("HY4F_EXPERT_ADAPT")) adapt = std::atoi(a) != 0;
+        if (const char* a = std::getenv("HY4F_ADAPT_HORIZON")) adapt_horizon = std::max(1.0, std::atof(a));
+        if (const char* a = std::getenv("HY4F_ADAPT_PF_WEIGHT")) adapt_pf_weight = std::atof(a);
+        if (const char* a = std::getenv("HY4F_ADAPT_EVERY")) adapt_every = std::max(1, std::atoi(a));
+        if (const char* a = std::getenv("HY4F_ADAPT_STEP_SWAPS")) adapt_step_swaps = std::atoi(a);
+        if (const char* a = std::getenv("HY4F_ADAPT_PF_SWAPS")) adapt_pf_swaps = std::atoi(a);
         const int nl = n_exp / S, last = L + (has_mtp ? 1 : 0);
         for (int g = 0; g <= S; ++g) ebound[g] = g * nl;
         mtp_ebound = ebound;
@@ -680,10 +698,14 @@ struct Model::Impl {
             std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return c[a] > c[b]; });
             auto& perm = off_perm[il];
             perm.resize(n_exp);
+            auto& score = off_score[il];
+            score.assign(n_exp, 0.0);
             for (int g = 0; g < S; ++g) {
                 off_res[g][il] = 0;
                 for (int l = 0; l < nl; ++l) {
                     perm[g * nl + l] = order[l * S + g];
+                    // the profile counts as 256 tokens of history
+                    if (heat.count(il) && sum > 0) score[g * nl + l] = c[order[l * S + g]] / sum * n_used * 256.0;
                     items[g].push_back({sum > 0 ? c[order[l * S + g]] / sum : 0.0, il, l});
                 }
             }
@@ -764,6 +786,12 @@ struct Model::Impl {
         if (av + ol.n >= INT_MAX || ah + ol.n >= INT_MAX) throw std::runtime_error("hy4f: the expert stores are too far apart");
         ol.av = (int) av;
         ol.ah = (int) ah;
+        ol.home.resize(ol.n);
+        std::iota(ol.home.begin(), ol.home.end(), 0);
+        std::vector<int> vm(ol.n);
+        for (int l = 0; l < ol.n; ++l) vm[l] = l < ol.n_res ? l + ol.av : l + ol.ah;
+        HY_CK(cudaMalloc(&ol.vmap, sizeof(int) * ol.n));
+        HY_CK(cudaMemcpy(ol.vmap, vm.data(), sizeof(int) * ol.n, cudaMemcpyHostToDevice));
         DW w;
         w.type = (int) tg->type;
         w.ne[0] = (int64_t) tg->shape[0];
@@ -807,43 +835,146 @@ struct Model::Impl {
         s.w[name] = w;
     }
 
-    void dump_route_stats() {
-        if (route_stats.empty() || sh.empty() || !sh[0].rstat) return;
+    // the routing counts since the last call go to the cumulative statistics and the adaptation scores
+    void harvest_routes() {
+        if (sh.empty() || !sh[0].rstat) return;
         const int last = L + (has_mtp ? 1 : 0);
-        std::vector<uint64_t> dec((size_t) (L + 1) * n_exp, 0), rows(dec.size(), 0), touch(dec.size(), 0);
+        const size_t all = (size_t) (L + 1) * n_exp;
+        if (cum_dec.empty()) cum_dec.assign(all, 0), cum_rows.assign(all, 0), cum_touch.assign(all, 0);
         std::vector<unsigned> h((size_t) (L + 1) * nl_max);
-        uint64_t picks = 0, hits = 0, pf_all = 0, pf_hit = 0;   // trunk layers: decode picks / prefill expert fetches
+        std::map<int, std::vector<double>> add;
+        double tokens = 0;
         for (auto& s : sh) {
-            if (cudaSetDevice(s.dev) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) return;
-            if (cudaMemcpy(h.data(), s.rstat, h.size() * sizeof(unsigned), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+            HY_CK(cudaSetDevice(s.dev));
+            HY_CK(cudaDeviceSynchronize());
+            HY_CK(cudaMemcpy(h.data(), s.rstat, h.size() * sizeof(unsigned), cudaMemcpyDeviceToHost));
+            HY_CK(cudaMemset(s.rstat, 0, h.size() * sizeof(unsigned)));
             for (int il = dense_lead; il < last; ++il) {
                 const auto& own = expert_bounds(il);
+                auto& a = add[il];
+                if (a.empty()) a.assign(n_exp, 0.0);
                 for (int l = 0; l < own[s.g + 1] - own[s.g]; ++l) {
-                    const int e = offload ? off_perm.at(il)[own[s.g] + l] : own[s.g] + l;
+                    const int id = own[s.g] + l, e = offload ? off_perm.at(il)[id] : id;
                     const size_t i = (size_t) il * nl_max + l, k = (size_t) il * n_exp + e;
-                    dec[k] += h[i];
-                    rows[k] += s.pf_rows[i];
-                    touch[k] += s.pf_touch[i];
+                    cum_dec[k] += h[i];
+                    cum_rows[k] += s.pf_rows[i];
+                    cum_touch[k] += s.pf_touch[i];
+                    a[id] += (double) h[i] + adapt_pf_weight * (double) s.pf_rows[i];
+                    if (il == dense_lead) tokens += ((double) h[i] + adapt_pf_weight * (double) s.pf_rows[i]) / n_used;
                     if (offload && il < L) {
                         const bool res = l < s.off.at(il).n_res;
-                        picks += h[i], pf_all += s.pf_touch[i];
-                        if (res) hits += h[i], pf_hit += s.pf_touch[i];
+                        st_picks += h[i], st_pf += s.pf_touch[i], win_picks += h[i];
+                        if (res) st_hits += h[i], st_pf_hit += s.pf_touch[i], win_hits += h[i];
                     }
+                    s.pf_rows[i] = 0, s.pf_touch[i] = 0;
                 }
             }
         }
+        if (!adapt) return;
+        const double decay = std::exp(-tokens / adapt_horizon);
+        for (auto& [il, score] : off_score) {
+            const auto& a = add[il];
+            for (int id = 0; id < n_exp; ++id) score[id] = score[id] * decay + a[id];
+        }
+    }
+
+    // HY4F_EXPERT_ADAPT: up to max_swaps (cold resident, hot host expert) pairs of one layer and shard trade their
+    // expert ids, the largest score gaps first: the resident's VRAM slot takes the hot expert's weights, the two
+    // swap their host records (by index, nothing moves), the router rows and biases swap on every shard.
+    // Only between steps: nothing may be running on the devices.
+    void rebalance(int max_swaps) {
+        if (!adapt || !offload || max_swaps <= 0) return;
+        win_picks = win_hits = 0;
+        harvest_routes();
+        const auto t0 = std::chrono::steady_clock::now();
+        const int nl = n_exp / S, last = L + (has_mtp ? 1 : 0);
+        struct Swap {
+            double gain;
+            int il, res, host;
+        };
+        std::vector<Swap> plan;
+        std::vector<int> res, host;
+        for (int il = dense_lead; il < last; ++il) {
+            const auto& score = off_score.at(il);
+            for (int g = 0; g < S; ++g) {
+                res.clear(), host.clear();
+                const int n_res = off_res[g].at(il);
+                for (int l = 0; l < nl; ++l) (l < n_res ? res : host).push_back(g * nl + l);
+                std::sort(res.begin(), res.end(), [&](int a, int b) { return score[a] < score[b]; });
+                std::sort(host.begin(), host.end(), [&](int a, int b) { return score[a] > score[b]; });
+                for (size_t i = 0; i < res.size() && i < host.size(); ++i) {
+                    if (score[host[i]] <= 1.25 * score[res[i]] + 3.0) break;
+                    plan.push_back({score[host[i]] - score[res[i]], il, res[i], host[i]});
+                }
+            }
+        }
+        const size_t wanted = plan.size();
+        if (!plan.empty()) {
+            std::sort(plan.begin(), plan.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
+            if ((int) plan.size() > max_swaps) plan.resize(max_swaps);
+        }
+        std::vector<uint8_t> rows;
+        for (const Swap& sw : plan) {
+            const std::string P = "blk." + std::to_string(sw.il) + ".";
+            Shard& s = sh[sw.res / nl];
+            OffLayer& ol = s.off.at(sw.il);
+            const int lr = sw.res % nl, lh = sw.host % nl;
+            HY_CK(cudaSetDevice(s.dev));
+            HY_CK(cudaMemcpy(ol.vram + (size_t) lr * ol.stride, ol.host + (size_t) ol.home[lh] * ol.stride, ol.stride,
+                             cudaMemcpyHostToDevice));
+            std::swap(ol.home[lr], ol.home[lh]);
+            const int v = ol.home[lh] + ol.ah;
+            HY_CK(cudaMemcpy(ol.vmap + lh, &v, sizeof(int), cudaMemcpyHostToDevice));
+            for (const char* name : {"ffn_gate_inp.weight", "exp_probs_b.bias"}) {
+                const bool bias = name[0] == 'e';
+                const size_t rb = bias ? sizeof(float) : sh[0].w.at(P + name).rb;
+                rows.resize(2 * rb);
+                HY_CK(cudaSetDevice(sh[0].dev));
+                uint8_t* w0 = static_cast<uint8_t*>(sh[0].w.at(P + name).d);
+                HY_CK(cudaMemcpy(rows.data(), w0 + rb * sw.res, rb, cudaMemcpyDeviceToHost));
+                HY_CK(cudaMemcpy(rows.data() + rb, w0 + rb * sw.host, rb, cudaMemcpyDeviceToHost));
+                for (auto& t : sh) {
+                    HY_CK(cudaSetDevice(t.dev));
+                    uint8_t* w = static_cast<uint8_t*>(t.w.at(P + name).d);
+                    HY_CK(cudaMemcpy(w + rb * sw.res, rows.data() + rb, rb, cudaMemcpyHostToDevice));
+                    HY_CK(cudaMemcpy(w + rb * sw.host, rows.data(), rb, cudaMemcpyHostToDevice));
+                }
+            }
+            std::swap(off_perm.at(sw.il)[sw.res], off_perm.at(sw.il)[sw.host]);
+            std::swap(off_score.at(sw.il)[sw.res], off_score.at(sw.il)[sw.host]);
+        }
+        st_swaps += plan.size();
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        st_swap_s += dt;
+        if (std::getenv("HY4F_ADAPT_LOG"))
+            std::fprintf(stderr, "hy4f: adapt: window picks %llu in VRAM %.3f; %zu swaps of %zu wanted, %.1f ms\n",
+                         (unsigned long long) win_picks, win_picks ? (double) win_hits / win_picks : 0.0, plan.size(),
+                         wanted, dt * 1e3);
+    }
+
+    void dump_route_stats() {
+        if (sh.empty() || !sh[0].rstat) return;
+        try {
+            harvest_routes();
+        } catch (const std::exception&) {
+            return;
+        }
+        const int last = L + (has_mtp ? 1 : 0);
         if (offload)
-            std::fprintf(stderr, "hy4f: offload: decode picks %llu, in VRAM %.3f; prefill expert uses %llu, in VRAM %.3f\n",
-                         (unsigned long long) picks, picks ? (double) hits / picks : 0.0, (unsigned long long) pf_all,
-                         pf_all ? (double) pf_hit / pf_all : 0.0);
+            std::fprintf(stderr, "hy4f: offload: decode picks %llu, in VRAM %.3f; prefill expert uses %llu, in VRAM %.3f; "
+                                 "%llu swaps in %.2f s\n",
+                         (unsigned long long) st_picks, st_picks ? (double) st_hits / st_picks : 0.0,
+                         (unsigned long long) st_pf, st_pf ? (double) st_pf_hit / st_pf : 0.0,
+                         (unsigned long long) st_swaps, st_swap_s);
+        if (route_stats.empty()) return;
         std::FILE* f = std::fopen(route_stats.c_str(), "w");
         if (!f) return;
         for (int il = dense_lead; il < last; ++il)
             for (int e = 0; e < n_exp; ++e) {
                 const size_t k = (size_t) il * n_exp + e;
-                if (dec[k]) std::fprintf(f, "D %d %d %llu\n", il, e, (unsigned long long) dec[k]);
-                if (rows[k]) std::fprintf(f, "P %d %d %llu\n", il, e, (unsigned long long) rows[k]);
-                if (touch[k]) std::fprintf(f, "T %d %d %llu\n", il, e, (unsigned long long) touch[k]);
+                if (cum_dec[k]) std::fprintf(f, "D %d %d %llu\n", il, e, (unsigned long long) cum_dec[k]);
+                if (cum_rows[k]) std::fprintf(f, "P %d %d %llu\n", il, e, (unsigned long long) cum_rows[k]);
+                if (cum_touch[k]) std::fprintf(f, "T %d %d %llu\n", il, e, (unsigned long long) cum_touch[k]);
             }
         std::fclose(f);
     }
@@ -1010,7 +1141,7 @@ struct Model::Impl {
         HY_CK(cudaMalloc(&s.eids, sizeof(int) * n_used));
         HY_CK(cudaMalloc(&s.eloc, sizeof(int) * n_used));
         HY_CK(cudaMalloc(&s.evirt, sizeof(int) * n_used));
-        if (!route_stats.empty()) {
+        if (!route_stats.empty() || adapt) {
             const size_t n = (size_t) (L + 1) * nl_max;
             HY_CK(cudaMalloc(&s.rstat, sizeof(unsigned) * n));
             HY_CK(cudaMemset(s.rstat, 0, sizeof(unsigned) * n));
@@ -1228,7 +1359,7 @@ struct Model::Impl {
         const int* eidx = s.eloc;
         if (offload) {
             const OffLayer& ol = s.off.at(il);
-            k_virt_ids<<<1, 32, 0, s.st>>>(s.eloc, s.evirt, n_used, ol.n_res, ol.av, ol.ah);
+            k_virt_ids<<<1, 32, 0, s.st>>>(s.eloc, s.evirt, n_used, ol.vmap);
             eidx = s.evirt;
         }
         mmvq(s, P + "xmoe", s.xq, s.xm);
@@ -1607,6 +1738,7 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
         if (d.full_batch_writes) std::fill_n(d.full_prefix,d.full_count,progressive_end);
         d.full_batch_writes = false;
         d.pos_next = pos + n;
+        d.rebalance(d.adapt_pf_swaps);
         if (d.o.verbose)
             std::fprintf(stderr, "hy4f: prefill %d tokens: %.1f ms (%.1f tok/s, setup excluded)\n", n,
                          1e3 * std::chrono::duration<double>(std::chrono::steady_clock::now() - t_start).count(),
@@ -1638,6 +1770,7 @@ bool Model::verify(const int32_t* toks, int T, int64_t pos, float* logits, int32
         for (int t = 0; t < T; ++t) d.hio_v->toks[t] = toks[t];
         d.dec_launch(false, T, false, logits != nullptr);
         d.pos_next = pos + T;
+        if (d.adapt && ++d.adapt_calls % d.adapt_every == 0) d.rebalance(d.adapt_step_swaps);
         if (logits) std::memcpy(logits, d.hlogT, sizeof(float) * T * d.V);
         if (argmax)
             for (int t = 0; t < T; ++t) {
