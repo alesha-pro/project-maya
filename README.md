@@ -1,4 +1,4 @@
-> **This is a fork.** Branch `hy4-flash` is [mw00/project-maya](https://github.com/mw00/project-maya) v1.1.66 plus `maya-hy4f`, an engine that runs Tencent Hy4-flash on 4, 2 or 1 RTX 3090. See [docs/HY4-FLASH.md](docs/HY4-FLASH.md). The text below is the upstream README, unchanged. For Maya itself use upstream.
+> **This is a fork.** Branch `hy4-flash` is [mw00/project-maya](https://github.com/mw00/project-maya) v1.1.66 plus `maya-hy4f`, an engine that runs Tencent Hy4-flash on 4, 2 or 1 RTX 3090, with an optional uncensored refusal vector. See [docs/HY4-FLASH.md](docs/HY4-FLASH.md); weights at [alesha-pro/Hy4-flash-Uncensored-GGUF](https://huggingface.co/alesha-pro/Hy4-flash-Uncensored-GGUF). The text below is the upstream README, unchanged. For Maya itself use upstream.
 
 <p align="center">English | <a href="README.ja.md">日本語</a> | <a href="README.zh-CN.md">简体中文</a> | <a href="README.pt-BR.md">Português</a></p>
 

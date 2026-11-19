@@ -2,7 +2,7 @@
  "exe": "/opt/project-maya/build/maya-hy4f",
  "args": [
   "--gguf",
-  "/models/Hy4-flash-Q3_K-MTP-GGUF/Hy4-flash-IQ2-00001-of-00002.gguf",
+  "/models/Hy4-flash-Uncensored-GGUF/Hy4-flash-IQ2-00001-of-00002.gguf",
   "--gguf",
   "/nvme/hy4-flash/Hy4-flash-Q3_K-00002-of-00002.gguf",
   "--max-context",
@@ -12,10 +12,10 @@
   "--spec-k",
   "auto",
   "--mmproj",
-  "/models/Hy4-flash-Q3_K-MTP-GGUF/mmproj-Hy4-flash-bf16.gguf"
+  "/models/Hy4-flash-Uncensored-GGUF/mmproj-Hy4-flash-bf16.gguf"
  ],
  "cwd": "/opt/project-maya",
- "tokenizer": "/models/Hy4-flash-Q3_K-MTP-GGUF/tokenizer",
+ "tokenizer": "/models/Hy4-flash-Uncensored-GGUF/tokenizer",
  "model_name": "hy4-flash",
  "gpu": [
   0
@@ -94,7 +94,7 @@
   "HY4F_FULL_DSA_LAYERS": "2",
   "HY4F_PARALLEL_DEEP_CAPTURE": "1",
   "HY4F_PRECAPTURE_DEEP": "1",
-  "HY4F_EXPERT_PROFILE": "/models/Hy4-flash-Q3_K-MTP-GGUF/routing-profile-1gpu.txt",
+  "HY4F_EXPERT_PROFILE": "/models/Hy4-flash-Uncensored-GGUF/routing-profile-1gpu.txt",
   "HY4F_EXPERT_ADAPT": "1",
   "HY4F_CPU_LANE": "1",
   "HY4F_EXPERT_VRAM_MB": "auto",
@@ -110,7 +110,8 @@
   "HY4F_SINGLE_SHORT_VERIFY": "128",
   "HY4F_SINGLE_COMBINE": "1",
   "HY4F_LARGE_HOST_PREFIX": "1",
-  "HY4F_ROUTE_STATS": "/models/Hy4-flash-Q3_K-MTP-GGUF/routing-profile-1gpu.txt",
-  "HY4F_ENGRAM_IO": "direct"
+  "HY4F_ROUTE_STATS": "/models/Hy4-flash-Uncensored-GGUF/routing-profile-1gpu.txt",
+  "HY4F_ENGRAM_IO": "direct",
+  "HY4F_ABLATE": "/models/Hy4-flash-Uncensored-GGUF/Hy4-flash-refusal-directions.bin"
  }
 }
