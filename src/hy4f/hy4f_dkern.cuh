@@ -1350,9 +1350,15 @@ __device__ __forceinline__ int art_g(int s, int s2) {   // index of G[s][s2] (s 
 }
 // Split the 32 independent HC reduction columns into four CTA groups. In a
 // single-row decode the original twelve CTAs leave most SMs idle.
-__global__ void kd_art_columns(const float* x1,const float* x2,int T,int n,PeersD P,int me,int ranks,
+template<int LL, int Mix>
+__device__ __forceinline__ void art_columns(const float* x1,const float* x2,int T,int n,PeersD P,int me,int ranks,
                                int* counter,int* arrive,const float* nw,const float* X,const float* post,
-                               int hc,HcNext nx,float* Y,float* part,float* ppost) {
+                               int hc,HcNext nx,float* Y,float* part,float* ppost, const float* even, const float* odd) {
+    if constexpr (LL) {
+        ranks = 4;
+        hc = 4;
+        nx.n_mix = Mix;
+    }
     const int t=blockIdx.y,b=blockIdx.x,g=blockIdx.z,tid=threadIdx.x,i=b*256+tid;
     const int step=*counter+1,lane=tid&31,w=tid/32;
     float xs[4],pp[4],a[10]={},fw[4][4];
@@ -1380,7 +1386,9 @@ __global__ void kd_art_columns(const float* x1,const float* x2,int T,int n,Peers
             for(int j=h;j<4;++j) a[art_g(h,j)]=xs[h]*xs[j];
     } else count=6;
     if(g!=2) {
-        const int tn=T*n; const float* rv=P.buf[me][step&1];
+        const int tn=T*n; const float* rv;
+        if constexpr (LL) rv=(step&1) ? odd : even;
+        else rv=P.buf[me][step&1];
         float v=0.f;
         for(int j=0;j<ranks;++j)
             v+=j==me?ar_own(P,x1[(size_t)t*n+i]+(x2?x2[(size_t)t*n+i]:0.f)):
@@ -1420,6 +1428,23 @@ __global__ void kd_art_columns(const float* x1,const float* x2,int T,int n,Peers
     if(tid==0 && atomicAdd(arrive,1)==(int)(gridDim.x*gridDim.y*gridDim.z)-1) {
         *arrive=0; *counter=step;
     }
+}
+__global__ void kd_art_columns(const float* x1,const float* x2,int T,int n,PeersD P,int me,int ranks,
+                               int* counter,int* arrive,const float* nw,const float* X,const float* post,
+                               int hc,HcNext nx,float* Y,float* part,float* ppost) {
+    art_columns<0,0>(x1,x2,T,n,P,me,ranks,counter,arrive,nw,X,post,hc,nx,Y,part,ppost,nullptr,nullptr);
+}
+// The fixed packet formats address this rank's published rows through two pointers.
+// Passing the entire peer table to these kernels forces local memory on sm_86.
+template<int LL, int Mix>
+__global__ void kd_art_columns_fixed(const float* x1, const float* x2, int T, int n, const float* even,
+                                     const float* odd, int exception_stride, int me, int* counter, int* arrive,
+                                     const float* nw, const float* X, const float* post, HcNext nx,
+                                     float* Y, float* part, float* ppost) {
+    PeersD P{};
+    P.bf = LL;
+    P.exception_stride = exception_stride;
+    art_columns<LL, Mix>(x1,x2,T,n,P,me,4,counter,arrive,nw,X,post,4,nx,Y,part,ppost,even,odd);
 }
 // The existing X-dependent HC partials can run alongside the sublayer.
 __global__ void kd_art_prepare(const float* X, int n, int hc, HcNext nx, float* part) {
@@ -1603,6 +1628,73 @@ __global__ void __launch_bounds__(256) kd_art_b(int n, const float* __restrict__
         for (int s2 = 0; s2 < 4; ++s2) sc[1 + s2] = pre[s2], sc[8 + s2] = p[s2];
         sc[5] = c;
         sc[6] = rsqrtf(cc / n + eps);
+    }
+    __syncthreads();
+    const float r = sc[0], yp = Y[(size_t) t * n + i] * nw[i];
+    float cur = 0.0f;
+#pragma unroll
+    for (int s2 = 0; s2 < 4; ++s2)
+        if (s2 < hc) {
+            float* xp = X + ((size_t) t * hc + s2) * n + i;
+            const float xn = *xp + sc[8 + s2] * r * yp;
+            *xp = xn;
+            cur += sc[1 + s2] * xn;
+        }
+    const float v = cur * sc[6] * nx.nw[i];
+    xo[(size_t) t * n + i] = v;
+    q81_store(xq + ((size_t) t * n + i) / 32, v);
+}
+
+// E=3072: lanes sum the twelve tiles in their original order before independent
+// mix scalars run in parallel. Lane 0 retains the two serial HC reductions.
+template<int Mix> __global__ void __launch_bounds__(256) kd_art_post_fixed(int n, const float* __restrict__ nw, float eps, float* X, float* post,
+                                                HcNext nx, float hc_eps, const float* __restrict__ Y,
+                                                const float* __restrict__ part, const float* __restrict__ ppost,
+                                                float* __restrict__ xo, Q81* __restrict__ xq) {
+    constexpr int hc=4,nbk=12;
+    const int t = blockIdx.y, tid = threadIdx.x, i = blockIdx.x * blockDim.x + tid;
+    __shared__ float tot[32], sc[12];   // sc: r, pre[4], c, r2, p[4]
+    if (tid < 32) {
+        float w = 0.0f;
+#pragma unroll
+        for (int k = 0; k < nbk; ++k) w += part[((size_t) t * nbk + k) * 32 + tid];
+        tot[tid] = w;
+        __syncwarp();
+        float r=0.f,inv=0.f;
+        float p[4];
+        if (tid==0) {
+            r=rsqrtf(tot[0]/n+eps);
+            const float K=tot[31];
+            float ss=0.f;
+            for(int h=0;h<hc;++h) {
+                p[h]=ppost[t*4+h];
+                ss+=tot[17+art_g(h,h)]+2.f*r*p[h]*tot[27+h]+r*r*p[h]*p[h]*K;
+            }
+            inv=rsqrtf(ss/(float)(n*hc)+eps);
+        }
+        r=__shfl_sync(0xffffffffu,r,0);
+        inv=__shfl_sync(0xffffffffu,inv,0);
+        if(tid<Mix) {
+            const float m=(tot[1+tid]+r*tot[9+tid])*inv;
+            if(tid<hc)sc[1+tid]=sigm(m*nx.scale[0]+nx.base[tid])+hc_eps;
+            else if(!blockIdx.x)post[t*8+tid-hc]=sigm(m*nx.scale[1]+nx.base[tid])*nx.mag+hc_eps;
+        }
+        __syncwarp();
+        if(tid==0) {
+            const float* pre=sc+1;
+            const float K=tot[31];
+            float c = 0.0f, gh = 0.0f, gg = 0.0f;
+            for (int s2 = 0; s2 < hc; ++s2) {
+                c += pre[s2] * p[s2];
+                gh += pre[s2] * tot[27 + s2];
+                for (int s3 = 0; s3 < hc; ++s3) gg += pre[s2] * pre[s3] * tot[17 + (s2 <= s3 ? art_g(s2, s3) : art_g(s3, s2))];
+            }
+            const float cc = fmaxf(gg + 2.0f * r * c * gh + r * r * c * c * K, 0.0f);
+            sc[0] = r;
+            for (int s2 = 0; s2 < 4; ++s2) sc[8 + s2] = p[s2];
+            sc[5] = c;
+            sc[6] = rsqrtf(cc / n + eps);
+        }
     }
     __syncthreads();
     const float r = sc[0], yp = Y[(size_t) t * n + i] * nw[i];

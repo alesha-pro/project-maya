@@ -15,6 +15,7 @@ static constexpr int DT = 4;   // (6 costs ~40 MB per GPU and ~3% of prefill / T
 #endif
 static constexpr int NSP = 16;
 bool fuse_rms_q81 = std::getenv("HY4F_RMS_Q81") && std::atoi(std::getenv("HY4F_RMS_Q81")) != 0;
+bool hc_fixed_post = std::getenv("HY4F_HC_FIXED_POST") && std::atoi(std::getenv("HY4F_HC_FIXED_POST")) == 1;
 bool short_graphs = std::getenv("HY4F_SHORT_GRAPH") != nullptr;
 bool q3_pair_layout = DT == 4 && std::getenv("HY4F_PACK_Q3") && !std::getenv("HY4F_IDS_LOOP")
                       && !std::getenv("HY4F_DEC_EAGER");
@@ -413,7 +414,22 @@ void d_ar(Shard& s, DShard& d, const float* x1, const float* x2, const std::stri
         for (int r = 1; r < S; ++r)
             kd_push1<<<ar_push_blocks, 256, 0, s.st>>>(x1, x2, tn, 0, T, 0, 0, 0, ar, s.g, (s.g + r) % S, counter, d.arrive);
     if (nx && !mtp && E % 256 == 0 && E / 256 <= 16 && !tail_old) {   // (two wide kernels)
-        if (!overlap && !d.hc_side && ar.bf>=2 && std::getenv("HY4F_HC_COLUMNS"))
+        const bool columns = !overlap && !d.hc_side && ar.bf >= 2 && std::getenv("HY4F_HC_COLUMNS");
+        const bool tested_packet_shape = (ar.bf == 2 && T == 2) || (ar.bf == 4 && (T == 3 || T == 4));
+        if (hc_fixed_post && columns && tested_packet_shape && S == 4 && E == 3072 && hc == 4 &&
+            (nx->n_mix == 4 || nx->n_mix == 8)) {
+            const bool pre_only = nx->n_mix == 4;
+            auto partial = ar.bf == 2 ? (pre_only ? kd_art_columns_fixed<2,4> : kd_art_columns_fixed<2,8>)
+                                       : (pre_only ? kd_art_columns_fixed<4,4> : kd_art_columns_fixed<4,8>);
+            auto finish = pre_only ? kd_art_post_fixed<4> : kd_art_post_fixed<8>;
+            partial<<<dim3(E / 256, T, 4), 256, 0, s.st>>>(x1, x2, T, E, ar.buf[s.g][0], ar.buf[s.g][1],
+                    ar.exception_stride, s.g, counter, d.arrive + 4, f32(s, norm), d.X, d.post, *nx,
+                    d.ysc, d.tpart, d.tppost);
+            finish<<<dim3(E / 256, T), 256, 0, s.st>>>(E, f32(s, norm), eps, d.X, d.post, *nx, hc_eps,
+                    d.ysc, d.tpart, d.tppost, d.x, d.xq);
+            return;
+        }
+        if (columns)
             kd_art_columns<<<dim3(E/256,T,4),256,0,s.st>>>(x1,x2,T,E,ar,s.g,S,counter,d.arrive+4,
                 f32(s,norm),d.X,d.post,hc,*nx,d.ysc,d.tpart,d.tppost);
         else if (!overlap) (d.hc_side ? kd_art_a<false,true> : scatter ? kd_art_a<false,false,true> : kd_art_a<false,false>)<<<dim3(E / 256, T), 256, 0, s.st>>>(x1, x2, T, E, ar, s.g, S, counter, d.arrive + 4, f32(s, norm), d.X, d.post,
