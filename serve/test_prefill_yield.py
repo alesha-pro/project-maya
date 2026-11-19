@@ -89,6 +89,10 @@ class PrefillYield(unittest.TestCase):
                                                 {"enable_thinking": False}, limit)
                 events = list(svc.run(ids, think, None, limit, {"seed": 19}, stop))
                 output[tag] = "".join(e.text for kind, e in events if kind == "event" and e.kind == "content")
+                if tag == "a" and enabled and not abort and short_limit <= 256:
+                    progress = [pp for kind, pp in events if kind == "ping" and pp]
+                    assert all(pp["cache"] == 0 for pp in progress)
+                    assert progress[-1]["processed"] == len(ids) and progress[-1]["time_ms"] == 140
             except BaseException as exc:
                 errors.append(exc)
         a = threading.Thread(target=turn, args=("a", "long request " + "x" * 16000, 48, cancel))

@@ -4295,8 +4295,14 @@ class Service:
             slice_s, t0, cut, pausing, claimed = fair_slice_seconds(), None, False, False, False
             short_waiter, prefill_order = None, None
             act, got, closed = None, 0, False           # the loop guard's action; this call's tokens; a soft close
+            stat.prefill_progress = None
             try:
                 for t in gen:
+                    if t is None and (smp_call or {}).get("_resume_prefill") and segments:
+                        pp = getattr(self.engine, "progress", None)
+                        if pp and pp[1] == len(cur):
+                            stat.prefill_progress = (pp[0], pp[1], segments[0].get("reused", 0),
+                                                     segments[0]["prompt_ms"] + pp[3])
                     if t is not None and t in self.stop_ids:   # (the caller may stop reading right at it)
                         self._note_written(ids, produced + [t], emb)   # (Qwen3.x: the next history in these ids)
                     if guard is None:
@@ -4683,7 +4689,8 @@ class Service:
                         if t is None:                   # heartbeat while the engine is quiet
                             if hold[0]:
                                 last_print = self._progress(last_print)
-                            pr = getattr(self.engine, "progress", None) if hold[0] else None   # (read, total, reuse, ms), the PP parse
+                            pr = (getattr(stat, "prefill_progress", None) or
+                                  getattr(self.engine, "progress", None)) if hold[0] else None   # (read, total, reuse, ms), the PP parse
                             yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
                                             "time_ms": round(pr[3])} if pr and len(pr) >= 4 else None)
                             continue
