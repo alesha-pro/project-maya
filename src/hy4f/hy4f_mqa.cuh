@@ -778,10 +778,18 @@ __global__ void __launch_bounds__(256) kb_score_prefill(const float* iq, int ldq
 
 // Decode index scores share a coalesced key tile across one to four queries.
 // Keep the same WMMA operations and head reduction as kb_score_tc.
-template<int Rows>
-__global__ void __launch_bounds__(256) kd_score_tile(const float* iq, int ldq, const __half* pooled,
+// A monotone 9-bit bucket of the exact hy4f_key ordering, including signed zeros and NaN payloads.
+__device__ __forceinline__ unsigned kd_score_coarse(float value) {
+    const unsigned raw = __float_as_uint(value);
+    const int exp_mantissa = (int)((raw & 0x7fffffffu) >> 19);
+    const unsigned mag = (unsigned)max(0, min(255, exp_mantissa - (127 - 8) * 16));
+    return raw >> 31 ? 255 - mag : 256 + mag;
+}
+
+template<int Rows, bool Histogram>
+__device__ __forceinline__ void kd_score_tile_impl(const float* iq, int ldq, const __half* pooled,
         const float* weights, int stride_w, int kpool, int top_k, const int* pos0p,
-        int t0, int nt, int capacity, float* score, int ld_score) {
+        int t0, int nt, int capacity, float* score, int ld_score, unsigned* global_hist) {
     using namespace nvcuda;
     constexpr int D=128, LD=136, H=16, KeyWarps=8/Rows, Groups=16*KeyWarps;
     __shared__ __align__(32) __half qs[Rows][H][LD], keys[Groups][LD];
@@ -791,6 +799,11 @@ __global__ void __launch_bounds__(256) kd_score_tile(const float* iq, int ldq, c
     const int pos0=*pos0p+t0;
     const int groups=min(capacity,(pos0+nt-1)/kpool);
     if ((int)blockIdx.x*Groups>=groups || pos0+nt<=top_k) return;
+    // At most 65536 pools in 256 CTAs. Neither half of a packed counter can carry.
+    __shared__ unsigned packed_hist[Histogram ? Rows : 1][Histogram ? 256 : 1];
+    if constexpr (Histogram) {
+        for (int row = 0; row < Rows; ++row) packed_hist[row][tid] = 0;
+    }
     const int token=warp/KeyWarps, key_start=16*(warp%KeyWarps);
     for (int i=tid; i<Rows*H*D; i+=256) {
         const int row=i/(H*D), h=i/D%H, d=i%D;
@@ -825,10 +838,36 @@ __global__ void __launch_bounds__(256) kd_score_tile(const float* iq, int ldq, c
 #pragma unroll
                 for (int h=0; h<H; ++h) value+=fmaxf(dots[warp][h][lane],0.f)*weight[token][h];
                 score[(size_t)token*ld_score+g]=value;
+                if constexpr (Histogram) {
+                    const unsigned bin = kd_score_coarse(value);
+                    atomicAdd(&packed_hist[token][bin >> 1], 1u << ((bin & 1u) * 16));
+                }
             }
         }
         __syncthreads();
     }
+    if constexpr (Histogram) {
+        for (int row = 0; row < nt; ++row) {
+            const unsigned counts = packed_hist[row][tid];
+            unsigned* pair = global_hist + row * 512 + 2 * tid;
+            if (counts & 65535u) atomicAdd(pair, counts & 65535u);
+            if (counts >> 16) atomicAdd(pair + 1, counts >> 16);
+        }
+    }
+}
+
+template<int Rows>
+__global__ void __launch_bounds__(256) kd_score_tile(const float* iq, int ldq, const __half* pooled,
+        const float* weights, int stride_w, int kpool, int top_k, const int* pos0p,
+        int t0, int nt, int capacity, float* score, int ld_score) {
+    kd_score_tile_impl<Rows, false>(iq, ldq, pooled, weights, stride_w, kpool, top_k, pos0p, t0, nt, capacity, score, ld_score, nullptr);
+}
+
+template<int Rows>
+__global__ void __launch_bounds__(256) kd_score_hist_tile(const float* iq, int ldq, const __half* pooled,
+        const float* weights, int stride_w, int kpool, int top_k, const int* pos0p,
+        int t0, int nt, int capacity, float* score, int ld_score, unsigned* histogram) {
+    kd_score_tile_impl<Rows, true>(iq, ldq, pooled, weights, stride_w, kpool, top_k, pos0p, t0, nt, capacity, score, ld_score, histogram);
 }
 
 // (the few-token form of kb_score_tc: every warp a group sub-range for ALL the NT >= tt_n tokens, each key tile read once)

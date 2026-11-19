@@ -18,6 +18,7 @@
 #include "hy4f_bkern.cuh"
 #include "hy4f_mqa.cuh"
 #include "hy4f_index_packed.cuh"
+#include "hy4f_score_select.cuh"
 #include "hy4f_swa_prefill.cuh"
 #include "hy4f_dsa_prefill.cuh"
 #include "hy4f_dkern.cuh"

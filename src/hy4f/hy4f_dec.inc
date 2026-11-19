@@ -119,6 +119,7 @@ struct DShard {
     unsigned *sel_st = nullptr, *sel_hist = nullptr;
     int *mg_n = nullptr, *mg_exp = nullptr, *mg_off = nullptr, *mg_slot = nullptr;   // the step's expert groups
     int* sel_bc = nullptr;
+    KdCompactRow* sel_compact = nullptr;
     float *lg = nullptr, *ew = nullptr, *xm = nullptr, *ga16 = nullptr, *dn16 = nullptr, *moe = nullptr, *mu = nullptr,
           *shh = nullptr, *sh = nullptr, *ga = nullptr, *ffo = nullptr;
     int64_t* eg_ids = nullptr;
@@ -233,6 +234,9 @@ void dec_alloc(Shard& s, DShard& d) {
     d.sel_st = (unsigned*) ia((size_t) DT * 4);
     d.sel_hist = (unsigned*) ia((size_t) DT * 2048);
     d.sel_bc = ia((size_t) DT * SEL_NB * 2);
+    // Presence reserves the scratch so graph recapture can switch between 0 and 1.
+    if (std::getenv("HY4F_DEC_SCORE_SELECT") && o.max_context / kpool <= 65536)
+        d.sel_compact = reinterpret_cast<KdCompactRow*>(ia(size_t(DT) * sizeof(KdCompactRow) / sizeof(int)));
     d.mg_n = ia(4);
     d.mg_exp = ia(128);
     d.mg_off = ia(129);
@@ -507,6 +511,17 @@ void d_indexer_select(Shard& s, DShard& d, const std::string& P, int il, const i
         d_indexer_weights(s,d,P,T,st);
     }
     const int ld_sc = (int) (o.max_context / kpool + 1);
+    const char* selected = std::getenv("HY4F_DEC_SCORE_SELECT");
+    const int tp = top_k / kpool - tail;
+    if (d.sel_compact && selected && std::strcmp(selected, "1") == 0 && IH == 16 && IK == 128 && T <= 4 &&
+        dec_score_blocks == 256 && tp > 0 && tp <= KD_CANDIDATES && !std::getenv("HY4F_OLD_SELECT")) {
+        kd_score_select_init<<<T,256,0,st>>>(d.sel_hist,d.sel_compact);
+        const auto kernel = T == 1 ? kd_score_hist_tile<1> : T == 2 ? kd_score_hist_tile<2> : kd_score_hist_tile<4>;
+        kernel<<<256,256,0,st>>>(iq,qpc,s.pooled[il],d.iw,IH,kpool,top_k,pp,0,T,ld_sc-1,d.score,ld_sc,d.sel_hist);
+        kd_score_compact<<<dim3(64,T),256,0,st>>>(d.score,ld_sc,pp,kpool,top_k,tp,d.sel_hist,d.sel_compact);
+        kd_score_finish<<<T,256,0,st>>>(d.score,ld_sc,pp,kpool,top_k,tp,n_cap,d.sel_compact,d.cells);
+        return;
+    }
     if (d.index_cache && packed_index_dispatch && il<L && T>=2 && T<=4) {
         const auto kernel = T==2 ? packed_index::score<2,2> :
                             T==3 ? packed_index::score<3,4> : packed_index::score<4,4>;
