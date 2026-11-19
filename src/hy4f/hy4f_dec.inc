@@ -96,6 +96,9 @@ struct DecodeGraph {
 };
 
 struct DShard {
+    cudaStream_t engram_side = nullptr;
+    cudaEvent_t engram_fork = nullptr, engram_ready = nullptr;
+    Q81* engram_q = nullptr;
     cudaStream_t hc_side = nullptr;
     cudaEvent_t hc_fork = nullptr, hc_join = nullptr;
     cudaStream_t attention_side = nullptr;
@@ -232,6 +235,12 @@ void dec_alloc(Shard& s, DShard& d) {
     d.ffo = dalloc((size_t) DT * E);
     HY_CK(cudaMalloc(&d.eg_ids, sizeof(int64_t) * DT * ncol));
     d.eg_r = dalloc((size_t) DT * ncol * eg_D);
+    if (std::getenv("HY4F_ENGRAM_AHEAD") && !eg_layers.empty()) {
+        HY_CK(cudaMalloc(&d.engram_q, sizeof(Q81) * DT * ((ncol * eg_D + 31) / 32)));
+        HY_CK(cudaStreamCreateWithFlags(&d.engram_side, cudaStreamNonBlocking));
+        HY_CK(cudaEventCreateWithFlags(&d.engram_fork, cudaEventDisableTiming));
+        HY_CK(cudaEventCreateWithFlags(&d.engram_ready, cudaEventDisableTiming));
+    }
     d.eg_kv = dalloc((size_t) DT * (hc + 1) * E);
     d.logits = dalloc((size_t) DT * (V / S));
     if (cert_head) {
@@ -404,16 +413,30 @@ void d_norm_in(Shard& s, DShard& d, const std::string& P, const std::string& k, 
                                            f32(s, norm), E, hc, n_mix, eps, hc_eps, mag, d.x, d.post);
 }
 
-void d_engram(Shard& s, DShard& d, int e, int il, const int* pp, int T) {
+void d_engram_prepare(Shard& s, DShard& d, int e, int il, const int* pp, int T, cudaStream_t stream, Q81* q) {
     const int ng = eg_ngram, nh = eg_heads, ncol = (ng - 1) * nh;
     const std::string P = "blk." + std::to_string(il) + ".";
-    kb_engram_hash<<<T, 32, 0, s.st>>>(s.hist, pp, s.eg_map, (int64_t) eg_map.size(), eg_pad, s.eg_mult + (size_t) e * ng,
+    kb_engram_hash<<<T, 32, 0, stream>>>(s.hist, pp, s.eg_map, (int64_t) eg_map.size(), eg_pad, s.eg_mult + (size_t) e * ng,
                                        s.eg_vsz + (size_t) e * ncol, s.eg_off + (size_t) e * ncol, ng, nh, d.eg_ids);
-    kb_engram_rows<<<dim3(ncol, T), 128, 0, s.st>>>(eg_table, d.eg_ids, f32(s, P + "engram_lookup_norm.weight"), d.eg_r,
+    kb_engram_rows<<<dim3(ncol, T), 128, 0, stream>>>(eg_table, d.eg_ids, f32(s, P + "engram_lookup_norm.weight"), d.eg_r,
                                                     eg_D, ncol, 1.1920929e-07f);
-    k_q8<<<nb(T * ncol * eg_D), 256, 0, s.st>>>(d.eg_r, T * ncol * eg_D, d.xq);
-    dec_mmvq(s, P + "engram_kv.weight", d.xq, d.eg_kv, T);
-    kb_engram_mix<<<T, 1024, 0, s.st>>>(d.X, d.X, d.eg_kv, f32(s, P + "engram_kv_b.weight"), f32(s, P + "engram_gate.weight"),
+    k_q8<<<nb(T * ncol * eg_D), 256, 0, stream>>>(d.eg_r, T * ncol * eg_D, q);
+    dec_mmvq(s, P + "engram_kv.weight", q, d.eg_kv, T, stream);
+}
+
+// Engram hashes and projections depend only on the speculative token history.
+// Wait for the preceding Engram mix before reusing its temporary storage.
+void d_engram_fork(Shard& s, DShard& d, int e, int il, const int* pp, int T) {
+    HY_CK(cudaEventRecord(d.engram_fork, s.st));
+    HY_CK(cudaStreamWaitEvent(d.engram_side, d.engram_fork));
+    d_engram_prepare(s, d, e, il, pp, T, d.engram_side, d.engram_q);
+    HY_CK(cudaEventRecord(d.engram_ready, d.engram_side));
+}
+
+void d_engram_mix(Shard& s, DShard& d, int il, int T, bool split_hc) {
+    const std::string P = "blk." + std::to_string(il) + ".";
+    const dim3 grid(T, split_hc ? hc : 1);
+    kb_engram_mix<<<grid, 1024, 0, s.st>>>(d.X, d.X, d.eg_kv, f32(s, P + "engram_kv_b.weight"), f32(s, P + "engram_gate.weight"),
                                         f32(s, P + "engram_hc_scale.weight"), f32(s, P + "engram_pre_gamma.weight"), E, hc,
                                         1.1920929e-07f, nullptr);
 }
@@ -893,8 +916,21 @@ void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_
     const bool fuse = fuse_ok();
     bool ready = false;   // the next sublayer's x / xq / post already made by the previous all-reduce tail
     for (int il = 0; il < L; ++il) {
-        for (size_t e = 0; e < eg_layers.size(); ++e)
-            if (eg_layers[e] == il) d_engram(s, d, (int) e, il, pp, T);
+        // A single set of scratch buffers suffices even for adjacent Engram layers.
+        for (size_t e = 0; e < eg_layers.size(); ++e) {
+            if (eg_layers[e] != il) continue;
+            if (d.engram_side) {
+                if (il == 0) d_engram_fork(s, d, (int)e, il, pp, T);
+                HY_CK(cudaStreamWaitEvent(s.st, d.engram_ready));
+            } else {
+                d_engram_prepare(s, d, (int)e, il, pp, T, s.st, d.xq);
+            }
+            d_engram_mix(s, d, il, T, d.engram_side != nullptr);
+        }
+        if (d.engram_side) {
+            for (size_t e = 0; e < eg_layers.size(); ++e)
+                if (eg_layers[e] == il + 1) d_engram_fork(s, d, (int)e, il + 1, pp, T);
+        }
         d_attention(s, d, il, pp, T, false, ready, dense_dsa, nullptr, sparse_dsa);
         HcNext nx;
         const HcNext* nxp = nullptr;

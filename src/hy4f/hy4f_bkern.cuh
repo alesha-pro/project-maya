@@ -63,7 +63,7 @@ __global__ void kb_engram_mix(float* X, float* R, const float* kv, const float* 
         s += v * v;
     }
     const float kv_ = rsqrtf(block_sum(s) / E + eps);
-    for (int i = 0; i < hc; ++i) {
+    for (int i = blockIdx.y; i < hc; i += gridDim.y) {
         float* x = X + (size_t) i * E;
         const float* k = kv + (size_t) i * E;
         const float* kb = kvb + (size_t) i * E;

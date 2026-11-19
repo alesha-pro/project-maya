@@ -1064,6 +1064,10 @@ struct Model::Impl {
             d.gc.clear();
             for (auto& graph : d.mtp_heads) graph.clear();
             for (auto& pair : d.verify_heads) for (auto& graph : pair) graph.clear();
+            if (d.engram_side) cudaStreamDestroy(d.engram_side);
+            if (d.engram_fork) cudaEventDestroy(d.engram_fork);
+            if (d.engram_ready) cudaEventDestroy(d.engram_ready);
+            if (d.engram_q) cudaFree(d.engram_q);
             if (d.cert.input) cudaFree(d.cert.input);
             if (d.cert.lower) cudaFree(d.cert.lower);
             if (d.cert.upper) cudaFree(d.cert.upper);
