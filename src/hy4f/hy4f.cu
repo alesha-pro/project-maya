@@ -1373,7 +1373,7 @@ bool Model::set_ranked_output(bool enabled) {
 bool Model::ranked_row(int row, int k, float inv_temp, std::vector<HeadValue>& values, float* fallback) {
     Impl& d=*d_;
     const int n=d.V/d.S;
-    bool ambiguous=false;
+    bool ambiguous=!(inv_temp>0.f && std::isfinite(inv_temp));
     const HeadValue* ranks=d.rank_host+(size_t)row*d.S*head_candidates;
     for (int g=0; g<d.S; ++g) {
         const auto* v=ranks+g*head_candidates;
