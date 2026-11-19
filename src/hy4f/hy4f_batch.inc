@@ -125,6 +125,8 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     b.mmq = new strata::prefill::mmq::Context();
     HY_CK(cudaFuncSetAttribute(kb_mqa_attn<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqa_smem<16>()));
     HY_CK(cudaFuncSetAttribute(kb_mqa_attn<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqa_smem<32>()));
+    if (single_prefill_mode()==2)
+        HY_CK(cudaFuncSetAttribute((kb_mqa_attn<32, 2>), cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqa_smem<32>()));
     HY_BL(cublasCreate(&b.blas));
     HY_BL(cublasSetStream(b.blas, b.st));
     HY_BL(cublasSetMathMode(b.blas, CUBLAS_DEFAULT_MATH));
