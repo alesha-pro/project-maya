@@ -701,7 +701,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     const float scale = 1.0f / std::sqrt((float) QH);
     const bool split = !std::getenv("HY4F_DEC_ATTN2");
     const bool pack_query = std::getenv("HY4F_PACK_QUERY") && split && kb.type==T_Q8_0 && kvl==512 && rope==64
-        && ((sw && Hl==16) || (!sw && S>1 && Hd==32)) && (size_t)Ha*576<=size_t(n_used)*2*n_ffx*2;
+        && ((sw && (Hl==16 || Hl==32)) || (!sw && S>1 && Hd==32)) && (size_t)Ha*576<=size_t(n_used)*2*n_ffx*2;
     __half* qh = pack_query ? d.packed_query : nullptr;
     if (kb.packed_projection) {
         ProjectionArgs args{(const uint8_t*)kb.d, d.qp, Ha, qpc, QH, d.qabs, nullptr, pp, th, scale};
@@ -735,8 +735,12 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     if (side || early) HY_CK(cudaStreamWaitEvent(s.st, d.attention_join));
     const int value_groups = T<=2 && std::getenv("HY4F_VALUE_GROUPS") ? 4 : 1;
     if (sw) {
-        if (split && Hl == 16) {
-            (value_groups==4 ? kd_mqa_dec<16,false,4> : kd_mqa_dec<16>)<<<dim3(NSP*value_groups, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
+        if (split && (Hl == 16 || Hl == 32)) {   // (32 heads a card: two GPUs)
+            if (Hl == 16)
+                (value_groups==4 ? kd_mqa_dec<16,false,4> : kd_mqa_dec<16>)<<<dim3(NSP*value_groups, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
+                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh, false, 0, 0, nullptr, 0, nullptr);
+            else
+                (value_groups==4 ? kd_mqa_dec<32,false,4> : kd_mqa_dec<32>)<<<dim3(NSP*value_groups, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
                                                                        win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh, false, 0, 0, nullptr, 0, nullptr);
             if (std::getenv("HY4F_MQA_FOLD"))
                 kd_mqa_fold<false><<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hl,
@@ -1015,9 +1019,16 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     } else if (!tuned_expert_type(gu.type) || !tuned_expert_type(down.type)) {
         // (i-quant experts: Maya's native grouped expert kernels over the offload's [gate | up | down] records)
         if (!offload || !grouped) throw std::runtime_error("hy4f: expert type " + std::to_string(gu.type) + " needs the expert offload");
-        k_group_ptrs<<<1, 128, 0, s.st>>>(d.mg_n, d.mg_exp, static_cast<const uint8_t*>(gu.d), s.off.at(il).stride, d.ne_ptr);
+        const OffLayer& ol = s.off.at(il);
+        k_group_ptrs<<<1, 128, 0, s.st>>>(d.mg_n, d.mg_exp, static_cast<const uint8_t*>(gu.d), ol.stride, d.ne_ptr);
         const kn::NativeExpertLayout layout = kn::native_expert_layout(gu.type, down.type, latent, n_ffx);
-        if (!kn::native_expert_grouped(layout, d.ne_ptr, d.mg_off, d.mg_n, d.mg_slot, d.mg_slot, T * K, T * K, d.xlq,
+        if (kn::hy4_iq_supported(gu.type) && kn::hy4_iq_supported(down.type) && latent == 1536 && n_ffx == 1536 && T <= 4 &&
+            !std::getenv("HY4F_IQ_GENERIC")) {
+            // (the Hy4 kernels: gate | up as one 3072-row matrix, SwiGLU, down - the K-quant path's three stages)
+            kn::hy4_iq_grouped(gu.type, d.ne_ptr, 0, 2 * n_ffx, d.mg_n, d.mg_off, d.mg_slot, d.xlq, d.ga16, moe_blocks, s.st);
+            k_swiglu_gu_q8<<<nb(T*K*n_ffx),256,0,s.st>>>(d.ga16,n_ffx,T*K*n_ffx,clampv,d.q16);
+            kn::hy4_iq_grouped(down.type, d.ne_ptr, ol.gu_bytes, latent, d.mg_n, d.mg_off, d.mg_slot, d.q16, d.dn16, moe_blocks, s.st);
+        } else if (!kn::native_expert_grouped(layout, d.ne_ptr, d.mg_off, d.mg_n, d.mg_slot, d.mg_slot, T * K, T * K, d.xlq,
                                        d.ne_scratch, d.dn16, s.st, clampv))
             throw std::runtime_error("hy4f: no native kernel for expert type " + std::to_string(gu.type));
     } else {

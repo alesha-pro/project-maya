@@ -91,4 +91,13 @@ bool native_expert_grouped(const NativeExpertLayout& L, const unsigned long long
                            int64_t cap_entries, const void* x_q8_1, void* scratch, float* out, void* stream,
                            float swiglu_limit = std::numeric_limits<float>::infinity());
 
+/// Hy4's grouped expert products for the 2-bit i-quants (IQ2_XXS, IQ2_S), 1536 inputs.  Group g's matrix - `rows`
+/// (3072 or 1536) rows of 1536 values of `ggml_type` - starts `offset` bytes into the record at grp_ptr[g]; the group's
+/// slots gslot[goff[g] .. goff[g+1]) (at most 4) read the q8_1 activation x_q8_1 + slot * 48 blocks and write
+/// y[slot * rows + r].  A weight sub-block is decoded once for all the group's slots; each sub-block's integer sum
+/// and scaling are llama.cpp's.  false (nothing launched) for another type or shape.
+bool hy4_iq_supported(int ggml_type) noexcept;
+bool hy4_iq_grouped(int ggml_type, const unsigned long long* grp_ptr, size_t offset, int rows, const int* ng,
+                    const int* goff, const int* gslot, const void* x_q8_1, float* y, int blocks, void* stream);
+
 }  // namespace strata::kernels

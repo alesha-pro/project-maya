@@ -1112,6 +1112,135 @@ void iq_dequant_gu_f16_mixed(int gate_type, int up_type, const void* gate, const
     check("iq_dequant_gu_f16_mixed");
 }
 
+namespace {
+// ---------------------------------------------------------------- Hy4's grouped IQ2 experts (1536 inputs)
+// One 32-value sub-block of a weight row, decoded to its eight words of signed magnitudes.
+template<int TY> struct Hy4Unit;
+template<> struct Hy4Unit<16> {   // IQ2_XXS
+    static constexpr int block_bytes = sizeof(block_iq2_xxs);
+    int g[8], ls;
+    float d;
+    __device__ __forceinline__ void load(const uint8_t* row, int sub) {
+        const block_iq2_xxs* b = (const block_iq2_xxs*) row + (sub >> 3);
+        const int ib = sub & 7;
+        const int q2 = get_int_b2(b->qs, 2 * ib);
+        const uint8_t* aux8 = (const uint8_t*) &q2;
+        const uint32_t aux32 = get_int_b2(b->qs, 2 * ib + 1);
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint2 grid_pos = ((const uint2*) iq2xxs_grid)[aux8[k]];
+            const uint32_t signs = unpack_ksigns(aux32 >> (7 * k));
+            const int s0 = __vcmpne4(signs & 0x08040201, 0), s1 = __vcmpne4(signs & 0x80402010, 0);
+            g[2 * k] = __vsub4(grid_pos.x ^ s0, s0);
+            g[2 * k + 1] = __vsub4(grid_pos.y ^ s1, s1);
+        }
+        ls = aux32 >> 27 | 1;
+        d = __half2float(b->d);
+    }
+    __device__ __forceinline__ float dot(const block_q8_1* x) const {
+        int sumi = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) sumi = ggml_cuda_dp4a(g[i], get_int_b4(x->qs, i), sumi);
+        sumi = sumi * ls / 8;
+        return d * __low2float(x->ds) * sumi;
+    }
+};
+template<> struct Hy4Unit<22> {   // IQ2_S
+    static constexpr int block_bytes = sizeof(block_iq2_s);
+    int g[8], ls0, ls1;
+    float d;
+    __device__ __forceinline__ void load(const uint8_t* row, int sub) {
+        const block_iq2_s* b = (const block_iq2_s*) row + (sub >> 3);
+        const int ib = sub & 7;
+        const int qs_packed = get_int_b2(b->qs, ib);
+        const uint8_t* qs = (const uint8_t*) &qs_packed;
+        const int qh = b->qh[ib];
+        const int signs_packed_32 = get_int_b2(b->qs, QK_K / 32 + ib);
+        const uint8_t* sp = (const uint8_t*) &signs_packed_32;
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int* grid_pos = (const int*) (iq2s_grid + (qs[l] | ((qh << (8 - 2 * l)) & 0x300)));
+            const int s0 = __vcmpne4(((sp[l] & 0x03) << 7) | ((sp[l] & 0x0C) << 21), 0x00000000);
+            const int s1 = __vcmpne4(((sp[l] & 0x30) << 3) | ((sp[l] & 0xC0) << 17), 0x00000000);
+            g[2 * l] = __vsub4(grid_pos[0] ^ s0, s0);
+            g[2 * l + 1] = __vsub4(grid_pos[1] ^ s1, s1);
+        }
+        ls0 = b->scales[ib] & 0x0F;
+        ls1 = b->scales[ib] >> 4;
+        d = __half2float(b->d);
+    }
+    __device__ __forceinline__ float dot(const block_q8_1* x) const {
+        int sumi0 = 0, sumi1 = 0;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            sumi0 = ggml_cuda_dp4a(g[i], get_int_b4(x->qs, i), sumi0);
+            sumi1 = ggml_cuda_dp4a(g[4 + i], get_int_b4(x->qs, 4 + i), sumi1);
+        }
+        const int sumi = (sumi0 * ls0 + sumi1 * ls1 + (sumi0 + sumi1) / 2) / 4;
+        return d * __low2float(x->ds) * sumi;
+    }
+};
+
+// A warp takes two neighbouring rows: 96 sub-blocks, three per lane.  Four warps and two row pairs each make a tile
+// of 16 rows; a block walks the (group, tile) list.
+template<int TY, int Rows>
+__global__ void __launch_bounds__(128) hy4_iq_grouped_kernel(const unsigned long long* __restrict__ grp_ptr, size_t offset,
+                                                             const int* __restrict__ ng, const int* __restrict__ goff,
+                                                             const int* __restrict__ gslot,
+                                                             const block_q8_1* __restrict__ x, float* __restrict__ y) {
+    constexpr int RB = 1536 / 256 * Hy4Unit<TY>::block_bytes, PAIRS = 2, TILE = 4 * 2 * PAIRS;
+    const int tiles = Rows / TILE, total = *ng * tiles;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int tile = blockIdx.x; tile < total; tile += gridDim.x) {
+        const int g = tile / tiles;
+        const uint8_t* w = (const uint8_t*) grp_ptr[g] + offset;
+        const int off = goff[g], ns = min(goff[g + 1] - off, 4);
+        const int* slots = gslot + off;
+#pragma unroll 1
+        for (int p = 0; p < PAIRS; ++p) {
+            const int r0 = (tile % tiles) * TILE + (warp * PAIRS + p) * 2;
+            float a0[4] = {}, a1[4] = {};
+#pragma unroll
+            for (int j = 0; j < 3; ++j) {
+                const int u = lane + 32 * j, second = u >= 48, sub = u - 48 * second;
+                Hy4Unit<TY> unit;
+                unit.load(w + (size_t) (r0 + second) * RB, sub);
+                for (int t = 0; t < ns; ++t) {
+                    const float v = unit.dot(x + (size_t) slots[t] * 48 + sub);
+                    if (second) a1[t] += v;
+                    else a0[t] += v;
+                }
+            }
+            for (int t = 0; t < ns; ++t) {
+                const float v0 = warp_sum(a0[t]), v1 = warp_sum(a1[t]);
+                if (!lane) {
+                    y[(size_t) slots[t] * Rows + r0] = v0;
+                    y[(size_t) slots[t] * Rows + r0 + 1] = v1;
+                }
+            }
+        }
+    }
+}
+}  // namespace
+
+bool hy4_iq_supported(int ggml_type) noexcept { return ggml_type == 16 || ggml_type == 22; }
+
+bool hy4_iq_grouped(int ggml_type, const unsigned long long* grp_ptr, size_t offset, int rows, const int* ng,
+                    const int* goff, const int* gslot, const void* x_q8_1, float* y, int blocks, void* stream) {
+    if (!hy4_iq_supported(ggml_type) || (rows != 3072 && rows != 1536) || blocks <= 0) return false;
+    cudaStream_t s = (cudaStream_t) stream;
+    const auto* X = (const block_q8_1*) x_q8_1;
+    const unsigned grid = (unsigned) blocks * 2;
+    if (ggml_type == 16) {
+        if (rows == 3072) hy4_iq_grouped_kernel<16, 3072><<<grid, 128, 0, s>>>(grp_ptr, offset, ng, goff, gslot, X, y);
+        else hy4_iq_grouped_kernel<16, 1536><<<grid, 128, 0, s>>>(grp_ptr, offset, ng, goff, gslot, X, y);
+    } else {
+        if (rows == 3072) hy4_iq_grouped_kernel<22, 3072><<<grid, 128, 0, s>>>(grp_ptr, offset, ng, goff, gslot, X, y);
+        else hy4_iq_grouped_kernel<22, 1536><<<grid, 128, 0, s>>>(grp_ptr, offset, ng, goff, gslot, X, y);
+    }
+    return true;
+}
+
 size_t native_expert_scratch_bytes(int64_t cap, int64_t n_ff) {
     const size_t f = (size_t) cap * (size_t) n_ff * sizeof(float);
     return 3 * ((f + 255) & ~(size_t) 255) + (((size_t) cap * (size_t) (n_ff / 32) * sizeof(block_q8_1) + 255) & ~(size_t) 255);
