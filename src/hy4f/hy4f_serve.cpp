@@ -550,19 +550,27 @@ int serve(Model& m, const ServeOptions& so) {
         }
     }
     const char* host_setting = std::getenv("HY4F_HOST_PREFIX_SLOTS");
-    const bool host_supported = CH == int(HostPrefixIndex::block);
+    const char* wide_setting = std::getenv("HY4F_LARGE_HOST_PREFIX");
+    const bool wide_host = CH >= int(HostPrefixIndex::limit) && wide_setting && std::strcmp(wide_setting, "1") == 0;
+    const WidePrefixGrid grid(CH);
+    const bool host_supported = CH == int(HostPrefixIndex::block) || wide_host;
     const int host_slots = host_setting && host_supported &&
         (std::strcmp(host_setting, "2") == 0 || std::strcmp(host_setting, "3") == 0) ? host_setting[0] - '0' : 0;
     const char* fine_setting = std::getenv("HY4F_FINE_HOST_PREFIX");
     HostPrefixIndex host_keys(host_slots, std::getenv("HY4F_DEEP_HOST_PREFIX") != nullptr,
-                              fine_setting && std::strcmp(fine_setting, "1") == 0);
+                              !wide_host && fine_setting && std::strcmp(fine_setting, "1") == 0);
+    const auto shallow_at = [&](size_t n) { return wide_host ? grid.shallow(n) : HostPrefixIndex::checkpoint(n); };
+    const auto deep_at = [&](size_t n) {
+        const size_t pos = host_keys.deep_checkpoint(n);
+        return wide_host && pos ? grid.deep(n) : pos;
+    };
     if (host_setting && !host_slots)
-        std::fprintf(stderr, "maya hy4f serve: host prefix cache requires slots 2 or 3 and chunk 2048\n");
+        std::fprintf(stderr, "maya hy4f serve: host prefix cache needs 2 or 3 slots and chunk 2048 or an enabled large-chunk grid\n");
     const char* reserve = std::getenv("HY4F_HOST_PREFIX_PREALLOC");
     if (host_slots && reserve && std::strcmp(reserve, "1") == 0) {
         const double started = now_ms();
-        const bool ok = m.preallocate_host_prefixes(host_slots, HostPrefixIndex::checkpoint(C),
-                                                    host_keys.deep_checkpoint(C), err, host_keys.max_delta(C));
+        const bool ok = m.preallocate_host_prefixes(host_slots, shallow_at(C),
+                                                    deep_at(C), err, host_keys.max_delta(C));
         std::fprintf(stderr, "maya hy4f serve: host prefix prealloc before READY ms=%.1f status=%s\n",
                      now_ms() - started, ok ? "ready" : "on-demand");
         if (!ok) std::fprintf(stderr, "maya hy4f serve: host prefix prealloc failed (%s)\n", err.c_str());
@@ -662,6 +670,8 @@ int serve(Model& m, const ServeOptions& so) {
         size_t from = 0;
         while (from < state.size() && from < n && state[from] == r.ids[from]) ++from;
         const size_t shared_tokens = from;
+        const bool wide_text = wide_host && host_keys.enabled() && r.file.empty();
+        const auto boundary = [&](size_t pos) { return wide_text ? grid.floor(pos) == pos : pos % CH == 0; };
         for (const Held& q : held)
             if (q.start < (long long) from && std::none_of(pics.begin(), pics.end(), [&](const Pic& x) {
                     return x.start == q.start && x.hash == q.hash; }))
@@ -715,10 +725,10 @@ int serve(Model& m, const ServeOptions& so) {
                 from = 0;
             }
         }
-        // Capture only a lineage that used the same 2048-token chunk boundaries as a cold prefill.
+        // Capture only a lineage that used the same chunk boundaries as a cold text prefill.
         const bool cold_aligned = from == 0 || host_restored || ring_cold_aligned;
-        const size_t host_checkpoint = text_cache && cold_aligned ? HostPrefixIndex::checkpoint(n) : 0;
-        const size_t deep_checkpoint = text_cache && cold_aligned ? host_keys.deep_checkpoint(n) : 0;
+        const size_t host_checkpoint = text_cache && cold_aligned ? shallow_at(n) : 0;
+        const size_t deep_checkpoint = text_cache && cold_aligned ? deep_at(n) : 0;
         const size_t fine_checkpoint = text_cache && cold_aligned ? host_keys.fine_checkpoint(n) : 0;
         state.resize(from);
         held.erase(std::remove_if(held.begin(), held.end(), [&](const Held& q) { return q.start + q.n > (long long) from; }),
@@ -767,7 +777,8 @@ int serve(Model& m, const ServeOptions& so) {
         };
         if (full_hit && from == n) pp_line(n);
         for (size_t a = from; a < n;) {
-            const int T = (int) std::min<size_t>((size_t) CH, n - a);
+            const size_t stop = wide_text ? grid.next(a) : a + CH;
+            const int T = (int)(std::min(n, stop) - a);
             const bool last = a + (size_t) T == n;
             std::vector<EmbdSpan> cs;   // (the spans relative to this call's tokens; prefill clips them)
             for (const EmbdSpan& e : spans) cs.push_back({e.offset - (int) a, e.n, e.rows});
@@ -792,7 +803,7 @@ int serve(Model& m, const ServeOptions& so) {
                     }
                 }
             }
-            if (prefix_mark && a >= 2*(size_t)CH && a%CH == 0 && a<n && n-a <= (size_t)CH) {
+            if (prefix_mark && a >= (wide_text ? 2*HostPrefixIndex::block : 2*size_t(CH)) && boundary(a) && a<n && n-a <= (size_t)CH) {
                 if (!m.mark_prefix(err, cold_aligned)) {
                     std::fprintf(stderr,"maya hy4f serve: prefix checkpoint unavailable (%s)\n",err.c_str());
                     prefix_mark=false;
@@ -810,7 +821,7 @@ int serve(Model& m, const ServeOptions& so) {
                 if (!waiter.empty())
                     std::fprintf(stderr, "maya hy4f serve: warm waiter rows=%zu guaranteed_reuse=%zu eligible=%d\n",
                                  waiter.size(), reuse, int(fits));
-                if (!text_cache || !cold_aligned || resume_order || a < 2 * size_t(CH) || a % CH ||
+                if (!text_cache || !cold_aligned || resume_order || a < 2 * size_t(CH) || !boundary(a) ||
                     n - a < 2 * size_t(CH) || !fits) {
                     std::puts("YIELD_DECLINED");
                     std::fflush(stdout);
@@ -849,7 +860,7 @@ int serve(Model& m, const ServeOptions& so) {
             std::fflush(stdout);
             continue;
         }
-        if (mark_ok && !full_hit && !m.mark(err, from % CH == 0 && n % CH == 0, cold_aligned && n % CH == 0)) {   // (the rings at the prompt's end: the next turn may go back here)
+        if (mark_ok && !full_hit && !m.mark(err, boundary(from) && boundary(n), cold_aligned && boundary(n))) {   // (the rings at the prompt's end: the next turn may go back here)
             std::fprintf(stderr, "maya hy4f serve: no copy of the rings (%s) - a turn that departs from the answer "
                                  "reads its prompt again\n", err.c_str());
             mark_ok = false;

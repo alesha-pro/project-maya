@@ -108,4 +108,31 @@ private:
     std::vector<Entry> entries_;
     uint64_t tick_ = 0;
 };
+
+// A long transfer-efficient chunk still needs repeatable split points for an
+// on-host KV snapshot. Cold and restored text traverse the same boundaries.
+class WidePrefixGrid {
+public:
+    explicit WidePrefixGrid(size_t chunk) : stride_(std::max(block, chunk / block * block)) {}
+    size_t next(size_t pos) const {
+        if (pos < first) return first;
+        if (pos < anchor) return anchor;
+        return anchor + ((pos - anchor) / stride_ + 1) * stride_;
+    }
+    size_t floor(size_t pos) const {
+        if (pos < first) return 0;
+        if (pos < anchor) return first;
+        return anchor + (pos - anchor) / stride_ * stride_;
+    }
+    size_t shallow(size_t prompt) const { return prompt ? std::min(anchor, floor(prompt - 1)) : 0; }
+    size_t deep(size_t prompt) const {
+        const size_t pos = prompt ? floor(prompt - 1) : 0;
+        return pos > anchor ? pos : 0;
+    }
+private:
+    static constexpr size_t block = HostPrefixIndex::block;
+    static constexpr size_t first = 2 * block;
+    static constexpr size_t anchor = HostPrefixIndex::limit;
+    size_t stride_;
+};
 } // namespace strata::hy4f
