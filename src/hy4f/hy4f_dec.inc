@@ -924,14 +924,27 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         kd_q8_slots<<<dim3(nb(latent), T * K), 256, 0, s.st>>>(d.xm, xmc, latent, K, d.xlq);
     }
     const bool mp = T > 4;   // (more than 4 slots per expert possible: the multi-pass copy of the grouped kernel)
+    const auto& gu = s.w.at(P + "ffn_gu_exps");
+    const auto& down = s.w.at(P + "ffn_down_exps.weight");
+    const char* setting = std::getenv("HY4F_EXPERT_PIPE");
+    const int pipe_mode = setting ? std::atoi(setting) : 0;
+    const bool pipeline = (pipe_mode == 1 || (pipe_mode == 2 && gu.type == T_Q4_K)) &&
+        !mtp && !q3_pair_layout && grouped && d.side && d.attention_side &&
+        T >= 2 && T <= 4 && K == 16 && latent == 1536 && n_ffx == 1536 &&
+        (gu.type == T_Q3_K || gu.type == T_Q4_K) && down.type == T_Q4_K &&
+        std::getenv("HY4F_GROUP_MATCH");
+    const int cut = 2 * T;
     if (grouped && !fuse_groups) {
         const int slots = T * K, threads = slots <= 64 ? 64 : 128;
         if (!std::getenv("HY4F_GROUP_MATCH"))
             kd_moe_groups<<<1, threads, 0, s.st>>>(d.eloc, slots, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
         else if (T == 1 && K <= 32)
             kd_groups_one<<<1, 32, 0, s.st>>>(d.eloc, slots, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
+        else if (pipeline)
+            kd_groups_match<true><<<1, threads, (e1-e0)*(threads/32)*sizeof(unsigned), s.st>>>(
+                d.eloc, slots, e1-e0, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, cut);
         else
-            kd_groups_match<<<1, threads, (e1 - e0) * (threads / 32) * sizeof(unsigned), s.st>>>(
+            kd_groups_match<false><<<1, threads, (e1 - e0) * (threads / 32) * sizeof(unsigned), s.st>>>(
                 d.eloc, slots, e1 - e0, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
     }
     auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out) {
@@ -965,9 +978,30 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
     };
     if (d.side) HY_CK(cudaStreamWaitEvent(s.st, d.projected));
-    ids_mmvq(s.w.at(P + "ffn_gu_exps"), d.xlq, d.ga16, latent, 2 * n_ffx);
-    k_swiglu_gu_q8<<<nb(T * K * n_ffx), 256, 0, s.st>>>(d.ga16, n_ffx, T * K * n_ffx, clampv, d.q16);
-    ids_mmvq(s.w.at(P + "ffn_down_exps.weight"), d.q16, d.dn16, n_ffx, latent);
+    if (pipeline) {
+        // Split whole experts so a group's down pass can begin while the other
+        // stream is still projecting gate/up. Offsets index the same slot list.
+        auto execute = [&](cudaStream_t stream, int offset, int* count) {
+            const int* experts = d.mg_exp + offset;
+            const int* offsets = d.mg_off + offset;
+            auto gu_kernel = gu.type == T_Q3_K ? kn::native_q3_k_mmvq_grouped : kn::native_q4_k_mmvq_grouped;
+            gu_kernel(gu.d, gu.rb*gu.ne[1], count, experts, offsets, d.mg_slot, d.xlq, d.ga16,
+                      1536, 3072, moe_blocks, stream);
+            kd_expert_quant_slots<<<dim3(6,2*T),256,0,stream>>>(d.ga16,clampv,d.q16,count,offsets,d.mg_slot);
+            kn::native_q4_k_mmvq_grouped(down.d,down.rb*down.ne[1],count,experts,offsets,d.mg_slot,
+                                         d.q16,d.dn16,1536,1536,moe_blocks,stream);
+        };
+        HY_CK(cudaEventRecord(d.attention_fork,s.st));
+        HY_CK(cudaStreamWaitEvent(d.attention_side,d.attention_fork));
+        execute(s.st,0,d.mg_n+1);
+        execute(d.attention_side,cut,d.mg_n+2);
+        HY_CK(cudaEventRecord(d.attention_join,d.attention_side));
+        HY_CK(cudaStreamWaitEvent(s.st,d.attention_join));
+    } else {
+        ids_mmvq(gu,d.xlq,d.ga16,latent,2*n_ffx);
+        k_swiglu_gu_q8<<<nb(T*K*n_ffx),256,0,s.st>>>(d.ga16,n_ffx,T*K*n_ffx,clampv,d.q16);
+        ids_mmvq(down,d.q16,d.dn16,n_ffx,latent);
+    }
     // d.q16 is dead after the expert down projection. Reuse it for the
     // shorter shared-expert activation so both inputs survive concurrently.
     const int fused_fl = d.side ? 0 : fl;

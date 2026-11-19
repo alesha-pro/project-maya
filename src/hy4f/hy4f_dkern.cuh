@@ -1282,6 +1282,22 @@ __global__ void kd_router16(const float* logits, const float* bias, float scale,
 
 // Both latent and shared FFN projections consume Q8_1, so write the
 // quantized rows directly. The summation is in the original slot order.
+// The two expert streams have disjoint local slots. Quantize just the rows
+// produced on this stream, retaining the original warp and block layout.
+__global__ void kd_expert_quant_slots(const float* gu, float limit, Q81* out,
+                                      const int* count, const int* offsets, const int* slots) {
+    const int groups = *count;
+    if (!groups) return;
+    const int col = blockIdx.x * 256 + threadIdx.x;
+    for (int i = offsets[0] + blockIdx.y; i < offsets[groups]; i += gridDim.y) {
+        const int row = slots[i];
+        const float* src = gu + size_t(row) * 3072;
+        const float g = fminf(src[col], limit);
+        const float u = fminf(fmaxf(src[1536 + col], -limit), limit);
+        q81_store(out + (size_t(row)*1536 + col)/32, silu(g)*u);
+    }
+}
+
 __global__ void kd_ffn_q8(const float* dn, const float* weights, const int* local, int K, int latent,
                           const float* shared_gu, int ld, int fl, Q81* routed_q, Q81* shared_q) {
     const int t = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;

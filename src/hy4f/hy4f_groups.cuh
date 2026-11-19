@@ -27,7 +27,8 @@ __global__ void kd_groups_one(const int* local, int n, int* ng, int* experts, in
 
 // One mask per (warp, local expert) identifies a group's first slot and the
 // rank of each occurrence. Scanning leaders preserves both original orders.
-__global__ void kd_groups_match(const int* local, int n, int expert_count, int* ng, int* experts, int* off, int* slots) {
+template<bool Partition = false>
+__global__ void kd_groups_match(const int* local, int n, int expert_count, int* ng, int* experts, int* off, int* slots, int cut = 0) {
     extern __shared__ unsigned hits[];
     __shared__ int warp_sum[4], preceding[128];
     const int slot = threadIdx.x, lane = slot % 32, warp = slot / 32, warps = blockDim.x / 32;
@@ -67,6 +68,10 @@ __global__ void kd_groups_match(const int* local, int n, int expert_count, int* 
     }
     if (slot == blockDim.x - 1) {
         *ng = prefix & 255;
+        if constexpr (Partition) {
+            ng[1] = min(cut, prefix & 255);
+            ng[2] = (prefix & 255) - ng[1];
+        }
         off[prefix & 255] = prefix >> 8;
     }
     __syncthreads();
