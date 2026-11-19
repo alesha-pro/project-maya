@@ -4,11 +4,14 @@
 #include <cmath>
 namespace strata::hy4f::kern {
 inline constexpr int cert_tile = 256;
+inline constexpr int cert_rank_bins = 258;
 struct HeadCertificate {
     float2* weight = nullptr;  // upper bounds for ||W-Wq||, ||Wq||, per vocabulary row
     float2* input = nullptr;   // upper bounds for ||x||, ||x-xq||, per verify position
     float2* lower = nullptr;   // two largest lower endpoints in each tile
     float* upper = nullptr;
+    unsigned* rank_hist = nullptr;
+    float* rank_cut = nullptr;
     int* count = nullptr;
     int* ids = nullptr;        // union of surviving rows over the verify positions
 };
@@ -58,24 +61,27 @@ __device__ __forceinline__ float2 head_warp_two(float2 p) {
     }
     return p;
 }
+__device__ __forceinline__ float2 head_interval(float v, float2 w, float2 n) {
+    const float eps=0x1p-12f;
+    // The factor covers both dot products' FP32 accumulation. Model weights and
+    // inputs within 2^30 bound all intermediates. The offset covers FTZ absolutely.
+    const float bw=__fadd_ru(w.x,w.y), bq=__fadd_ru(n.x,n.y);
+    const float round=__fmul_ru(eps,__fadd_ru(__fmul_ru(bw,n.x),__fmul_ru(w.y,bq)));
+    const float err=__fadd_ru(0x1p-64f,__fadd_ru(round,__fadd_ru(__fmul_ru(w.x,n.x),__fmul_ru(w.y,n.y))));
+    const bool good=isfinite(n.x)&&isfinite(n.y)&&isfinite(err)&&isfinite(v);
+    float upper=good?__fadd_ru(v,err):INFINITY;
+    float lower=good?__fsub_rd(v,err):-INFINITY;
+    if(fabsf(upper)<0x1p-126f) upper=0x1p-126f;
+    if(fabsf(lower)<0x1p-126f) lower=-0x1p-126f;
+    return make_float2(lower,upper);
+}
 __global__ void kd_head_bounds(const float* y, int rows, HeadCertificate c) {
     const int t=blockIdx.y, i=blockIdx.x*cert_tile+threadIdx.x;
     float lower=-INFINITY;
     if (i<rows) {
-        const float2 w=c.weight[i], n=c.input[t];
-        const float eps=0x1p-12f;
-        // The factor covers both dot products' FP32 accumulation. Model weights and
-        // inputs within 2^30 bound all intermediates. The offset covers FTZ absolutely.
-        const float bw=__fadd_ru(w.x,w.y), bq=__fadd_ru(n.x,n.y);
-        const float round=__fmul_ru(eps,__fadd_ru(__fmul_ru(bw,n.x),__fmul_ru(w.y,bq)));
-        const float err=__fadd_ru(0x1p-64f,__fadd_ru(round,__fadd_ru(__fmul_ru(w.x,n.x),__fmul_ru(w.y,n.y))));
-        const float v=y[(size_t)t*rows+i];
-        const bool good=isfinite(n.x)&&isfinite(n.y)&&isfinite(err)&&isfinite(v);
-        float upper=good?__fadd_ru(v,err):INFINITY;
-        if(good) lower=__fsub_rd(v,err);
-        if(fabsf(upper)<0x1p-126f) upper=0x1p-126f;
-        if(fabsf(lower)<0x1p-126f) lower=-0x1p-126f;
-        c.upper[(size_t)t*rows+i]=upper;
+        const float2 interval=head_interval(y[(size_t)t*rows+i],c.weight[i],c.input[t]);
+        lower=interval.x;
+        c.upper[(size_t)t*rows+i]=interval.y;
     }
     const int lane=threadIdx.x%32, warp=threadIdx.x/32;
     float2 p=head_warp_two(make_float2(lower,-INFINITY));
@@ -114,6 +120,55 @@ template<int T> __global__ void kd_head_list(float* y,int rows,int tiles,bool tw
         int base=lane==0?atomicAdd(c.count,__popc(mask)):0;
         base=__shfl_sync(~0u,base,0);
         if(keep) c.ids[base+__popc(mask & ((1u<<lane)-1))]=i;
+    }
+}
+// Round each certified lower endpoint down to a half-logit bucket. The kth
+// endpoint's bucket floor is a legal cut even when bins saturate or scores tie.
+__global__ void kd_head_rank_bounds(const float* logits, int rows, HeadCertificate c) {
+    __shared__ unsigned local[cert_rank_bins];
+    for (int b=threadIdx.x;b<cert_rank_bins;b+=blockDim.x) local[b]=0;
+    __syncthreads();
+    const int t=blockIdx.y, i=blockIdx.x*blockDim.x+threadIdx.x;
+    if (i<rows) {
+        const size_t off=(size_t)t*rows+i;
+        const float2 interval=head_interval(logits[off],c.weight[i],c.input[t]);
+        c.upper[off]=interval.y;
+        // Convert before adding the offset: an FP32 addition could round up across a bucket.
+        const float lo=interval.x;
+        const int b=lo < -64.f ? 0 : lo >= 64.f ? cert_rank_bins-1 : 129+__float2int_rd(2.f*lo);
+        atomicAdd(local+b,1u);
+    }
+    __syncthreads();
+    for (int b=threadIdx.x;b<cert_rank_bins;b+=blockDim.x)
+        if (local[b]) atomicAdd(c.rank_hist+t*cert_rank_bins+b,local[b]);
+}
+
+__global__ void kd_head_rank_cut(HeadCertificate c,int k) {
+    if (threadIdx.x) return;
+    const int t=blockIdx.x;
+    int b=cert_rank_bins-1, total=0;
+    for (;b>0;--b) {
+        total+=c.rank_hist[t*cert_rank_bins+b];
+        if (total>=k) break;
+    }
+    c.rank_cut[t]=b ? .5f*(b-129) : -INFINITY;
+    if (!t) *c.count=0;
+}
+
+template<int T> __global__ void kd_head_rank_list(float* logits,int rows,HeadCertificate c) {
+    const int i=blockIdx.x*blockDim.x+threadIdx.x, lane=threadIdx.x%32;
+    bool keep=false;
+    if (i<rows) {
+        for (int t=0;t<T;++t) keep |= c.upper[(size_t)t*rows+i]>=c.rank_cut[t];
+        // The ordinary rank kernel treats infinities as exceptional. A row can
+        // be pruned only with a finite cutoff >= -64, above this finite marker.
+        if (!keep) for (int t=0;t<T;++t) logits[(size_t)t*rows+i]=-0x1.fffffep127f;
+    }
+    const unsigned mask=__ballot_sync(~0u,keep);
+    if (mask) {
+        int base=lane==0?atomicAdd(c.count,__popc(mask)):0;
+        base=__shfl_sync(~0u,base,0);
+        if (keep)c.ids[base+__popc(mask&((1u<<lane)-1))]=i;
     }
 }
 template<int T> __global__ void kd_head_rerank(const uint16_t* weights,const float* x,int width,int rows,

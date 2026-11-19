@@ -95,6 +95,8 @@ struct DecodeGraph {
     }
 };
 
+enum HeadMode { FullHead, GreedyHead, RankedHead, HeadModes };
+
 struct DShard {
     cudaStream_t engram_side = nullptr;
     cudaEvent_t engram_fork = nullptr, engram_ready = nullptr;
@@ -131,8 +133,8 @@ struct DShard {
     int *ar_flag = nullptr, *cb_flag = nullptr, *ar_ctr = nullptr, *cb_ctr = nullptr, *arrive = nullptr;
     PeersD ar{}, cb{}, head_cb{};
     HeadCertificate cert;
-    DecodeGraph verify_heads[DT+1][2];
-    DecodeGraph mtp_heads[2];             // BF16 and greedy quantized suffixes when enabled
+    DecodeGraph verify_heads[DT+1][HeadModes];
+    DecodeGraph mtp_heads[HeadModes];
     DecodeGraph gv[DT + 1], gm[DT + 1], gc;  // verify(T), mtp(T), chained MTP
 };
 std::vector<DShard> dsh;
@@ -147,7 +149,7 @@ std::vector<DFShard> dfs;
 std::vector<int> df_slot;   // per target layer: the draft layer reading it, -1
 bool has_mtp = false;
 int draft_head_type = 0;
-bool cert_head = false, cert_target = false, cert_mtp = false;
+bool cert_head = false, cert_target = false, cert_mtp = false, cert_ranked = false;
 bool certified_mtp_active = false;
 bool greedy_draft_head = false;
 IoT *hio_v = nullptr, *hio_m = nullptr;
@@ -159,6 +161,14 @@ const bool compact_io = std::getenv("HY4F_COMPACT_LOGITS") != nullptr;
 bool mtp_full_row = false;
 HeadValue* rank_host=nullptr;  // [row][shard][head_candidates]
 bool rank_active=false;
+bool rank_from_mtp=false;
+unsigned rank_pruned_rows=0;  // rows requiring BF16 replay for a full-logit fallback
+bool rank_geometry() const {
+    const int n=V/S;
+    return n>=head_candidates && ((n+1023)/1024)*head_candidates<=2048;
+}
+bool separate_target_head() const { return cert_target || cert_ranked; }
+bool separate_mtp_head() const { return draft_head_type || cert_mtp || cert_ranked; }
 
 float* hmlog = nullptr;    // [V] pinned: the MTP head's logits row (for drafts sampled from it)
 int* hmargi = nullptr;
@@ -251,6 +261,10 @@ void dec_alloc(Shard& s, DShard& d) {
         HY_CK(cudaMalloc(&d.cert.upper,(size_t)DT*rows*sizeof(float)));
         HY_CK(cudaMalloc(&d.cert.count,sizeof(int)));
         HY_CK(cudaMalloc(&d.cert.ids,(size_t)rows*sizeof(int)));
+        if (cert_ranked) {
+            HY_CK(cudaMalloc(&d.cert.rank_hist,DT*cert_rank_bins*sizeof(unsigned)));
+            HY_CK(cudaMalloc(&d.cert.rank_cut,DT*sizeof(float)));
+        }
     }
     if (rank_host) {
         const int blocks=(V/S+1023)/1024;
@@ -868,32 +882,38 @@ void head_rows(Shard& s, DShard& d, const float* x, int T, float* argv, int* arg
     kd_argmax<<<T, 1024, 0, s.st>>>(d.logits, rows, s.g * rows, argv, argi);
 }
 
-template<int T> void rerank_head(Shard& s,DShard& d,const float* x,int rows,bool two) {
-    const int tiles=nb(rows,cert_tile);
-    kd_head_list<T><<<nb(rows),256,0,s.st>>>(d.logits,rows,tiles,two,d.cert);
+template<int T> void rerank_head(Shard& s,DShard& d,const float* x,int rows,bool two,bool ranked) {
+    if (ranked) kd_head_rank_list<T><<<nb(rows),256,0,s.st>>>(d.logits,rows,d.cert);
+    else kd_head_list<T><<<nb(rows),256,0,s.st>>>(d.logits,rows,nb(rows,cert_tile),two,d.cert);
     const auto* bf=static_cast<const uint16_t*>(s.w.at("output.weight").d);
     kd_head_rerank<T><<<128,128,0,s.st>>>(bf,x,E,rows,d.logits,d.cert);
 }
-void certified_head_rows(Shard& s,DShard& d,const float* x,int T,bool two,float* argv,int* argi) {
+void certified_head_rows(Shard& s,DShard& d,const float* x,int T,bool two,bool ranked,float* argv,int* argi) {
     const int rows=V/S;
     const DW& q=s.w.at("cert.output.weight");
     k_q8<<<nb(T*E),256,0,s.st>>>(x,T*E,d.xq);
     kd_head_input_norm<<<T,256,0,s.st>>>(x,d.xq,E,d.cert.input);
     kn::native_q8_0_mmvq(q.d,d.xq,d.logits,E,rows,T,s.st);
-    kd_head_bounds<<<dim3(nb(rows,cert_tile),T),cert_tile,0,s.st>>>(d.logits,rows,d.cert);
+    if (ranked) {
+        HY_CK(cudaMemsetAsync(d.cert.rank_hist,0,(size_t)T*cert_rank_bins*sizeof(unsigned),s.st));
+        kd_head_rank_bounds<<<dim3(nb(rows,cert_tile),T),cert_tile,0,s.st>>>(d.logits,rows,d.cert);
+        kd_head_rank_cut<<<T,32,0,s.st>>>(d.cert,head_candidates);
+    } else {
+        kd_head_bounds<<<dim3(nb(rows,cert_tile),T),cert_tile,0,s.st>>>(d.logits,rows,d.cert);
+    }
     switch(T) {
-    case 1: rerank_head<1>(s,d,x,rows,two); break;
-    case 2: rerank_head<2>(s,d,x,rows,two); break;
-    case 3: rerank_head<3>(s,d,x,rows,two); break;
-    case 4: rerank_head<4>(s,d,x,rows,two); break;
-    case 5: rerank_head<5>(s,d,x,rows,two); break;
-    default: rerank_head<6>(s,d,x,rows,two); break;
+    case 1: rerank_head<1>(s,d,x,rows,two,ranked); break;
+    case 2: rerank_head<2>(s,d,x,rows,two,ranked); break;
+    case 3: rerank_head<3>(s,d,x,rows,two,ranked); break;
+    case 4: rerank_head<4>(s,d,x,rows,two,ranked); break;
+    case 5: rerank_head<5>(s,d,x,rows,two,ranked); break;
+    default: rerank_head<6>(s,d,x,rows,two,ranked); break;
     }
     kd_argmax<<<T,1024,0,s.st>>>(d.logits,rows,s.g*rows,argv,argi);
 }
 
-void verify_head_ops(Shard& s,DShard& d,int T,bool certified) {
-    if (certified) certified_head_rows(s,d,d.x,T,false,d.argv,d.argi);
+void verify_head_ops(Shard& s,DShard& d,int T,HeadMode mode) {
+    if (mode!=FullHead) certified_head_rows(s,d,d.x,T,false,mode==RankedHead,d.argv,d.argi);
     else head_rows(s, d, d.x, T, d.argv, d.argi);
     const int rows = V / S;
     if (!compact_io) HY_CK(cudaMemcpy2DAsync(hlogT + (size_t) s.g * rows, sizeof(float) * V, d.logits, sizeof(float) * rows,
@@ -947,13 +967,13 @@ void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_
     }
     if (!ready) d_norm_in(s, d, "", "output_hc", "output_norm.weight", hc, 0.0f, T);
     HY_CK(cudaMemcpyAsync(d.h, d.x, sizeof(float) * T * E, cudaMemcpyDeviceToDevice, s.st));
-    if (!cert_target) verify_head_ops(s,d,T,false);
+    if (!separate_target_head()) verify_head_ops(s,d,T,FullHead);
 }
 
-void mtp_head_ops(Shard& s, DShard& d, bool quantized) {
-    if (quantized && cert_mtp) {
-        certified_head_rows(s,d,d.mh,1,true,d.argv+DT-1,d.argi+DT-1);
-    } else if (quantized) {
+void mtp_head_ops(Shard& s, DShard& d, HeadMode mode) {
+    if (mode==RankedHead || (mode==GreedyHead && cert_mtp)) {
+        certified_head_rows(s,d,d.mh,1,true,mode==RankedHead,d.argv+DT-1,d.argi+DT-1);
+    } else if (mode==GreedyHead) {
         const auto& w = s.w.at(cert_head && draft_head_type==T_Q8_0 ? "cert.output.weight" : "mtp.output.weight");
         const int rows = V / S;
         k_q8<<<nb(E), 256, 0, s.st>>>(d.mh, E, d.xq);
@@ -998,7 +1018,7 @@ void mtp_ops(Shard& s, DShard& d, int T, bool chain = false, bool dense_dsa = fa
         d_ffn(s, d, L, T, true);
     }
     kb_rms<<<1, 1024, 0, s.st>>>(d.mr + (size_t) (T - 1) * E, E, f32(s, P + "nextn.shared_head_norm.weight"), E, eps, d.mh, E);
-    if (!draft_head_type && !cert_mtp) mtp_head_ops(s, d, false);
+    if (!separate_mtp_head()) mtp_head_ops(s,d,FullHead);
 }
 
 void dec_setup() {
@@ -1013,8 +1033,7 @@ void dec_setup() {
     HY_CK(cudaHostAlloc((void**) &hmlog, sizeof(float) * V, cudaHostAllocPortable));
     std::memset(hio_v, 0, sizeof(IoT));
     std::memset(hio_m, 0, sizeof(IoT));
-    if (compact_io && std::getenv("HY4F_RANKED_SAMPLE") && V/S>=head_candidates &&
-        ((V/S+1023)/1024)*head_candidates<=2048)
+    if (compact_io && rank_geometry() && (cert_ranked || std::getenv("HY4F_RANKED_SAMPLE")))
         HY_CK(cudaHostAlloc(&rank_host,sizeof(HeadValue)*DT*S*head_candidates,cudaHostAllocPortable));
     dsh.resize(sh.size());
     for (size_t i = 0; i < sh.size(); ++i) dec_alloc(sh[i], dsh[i]);
@@ -1091,22 +1110,24 @@ void dec_setup() {
                 }
             }
         }
-        if (cert_target) {
-            for (int T=1;T<=DT;++T) for (int i=0;i<2;++i) {
+        if (separate_target_head()) {
+            for (int T=1;T<=DT;++T) for (HeadMode mode : {FullHead,GreedyHead,RankedHead}) {
+                if ((mode==GreedyHead && !cert_target) || (mode==RankedHead && !cert_ranked)) continue;
                 cudaGraph_t gr=nullptr;
                 HY_CK(cudaStreamBeginCapture(s.st,cudaStreamCaptureModeThreadLocal));
-                verify_head_ops(s,d,T,i!=0);
+                verify_head_ops(s,d,T,mode);
                 HY_CK(cudaStreamEndCapture(s.st,&gr));
-                d.verify_heads[T][i].capture(gr,0,false);
+                d.verify_heads[T][mode].capture(gr,0,false);
             }
         }
-        if (has_mtp && (draft_head_type || cert_mtp)) {
-            for (int i = 0; i < 2; ++i) {
+        if (has_mtp && separate_mtp_head()) {
+            for (HeadMode mode : {FullHead,GreedyHead,RankedHead}) {
+                if ((mode==GreedyHead && !cert_mtp && !draft_head_type) || (mode==RankedHead && !cert_ranked)) continue;
                 cudaGraph_t gr = nullptr;
                 HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
-                mtp_head_ops(s, d, i != 0);
+                mtp_head_ops(s,d,mode);
                 HY_CK(cudaStreamEndCapture(s.st, &gr));
-                d.mtp_heads[i].capture(gr, 0, false);
+                d.mtp_heads[mode].capture(gr, 0, false);
             }
         }
         if (df_nl) df_capture(s);
@@ -1117,9 +1138,13 @@ void dec_setup() {
 float mtp_max(int rank) const { return hmargv[rank * (compact_io ? 2 : 1)]; }
 
 void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
+    const bool ranked=cert_ranked && rank_active && !full_logits;
+    const bool narrow=greedy_draft_head && !full_logits && !rank_active;
+    rank_from_mtp=mtp;
+    rank_pruned_rows=ranked ? (1u<<(mtp ? 1 : T))-1 : 0;
     if (mtp) {
         mtp_full_row = !compact_io || full_logits;
-        certified_mtp_active = cert_mtp && greedy_draft_head && !full_logits && !rank_active;
+        certified_mtp_active = ranked || (cert_mtp && narrow);
     }
     const int end = (mtp ? hio_m : hio_v)->pos + T;
     const int mode = short_graphs && end <= top_k ? 1 : sparse_limit && end <= sparse_limit ? 2 : 0;
@@ -1150,11 +1175,14 @@ void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
         DShard& d = dsh[s.g];
         DecodeGraph& graph = chain ? d.gc : mtp ? d.gm[T] : d.gv[T];
         HY_CK(cudaGraphLaunch(graph.select(mode), s.st));
-        const bool narrow=greedy_draft_head && !full_logits && !rank_active;
-        if (mtp && (draft_head_type || cert_mtp))
-            HY_CK(cudaGraphLaunch(d.mtp_heads[narrow].exec, s.st));
-        if (!mtp && cert_target)
-            HY_CK(cudaGraphLaunch(d.verify_heads[T][narrow].exec,s.st));
+        if (mtp && separate_mtp_head()) {
+            const HeadMode mode=ranked ? RankedHead : narrow && (cert_mtp || draft_head_type) ? GreedyHead : FullHead;
+            HY_CK(cudaGraphLaunch(d.mtp_heads[mode].exec,s.st));
+        }
+        if (!mtp && separate_target_head()) {
+            const HeadMode mode=ranked ? RankedHead : narrow && cert_target ? GreedyHead : FullHead;
+            HY_CK(cudaGraphLaunch(d.verify_heads[T][mode].exec,s.st));
+        }
         if (rank_active && !full_logits) {
             const int n=V/S, blocks=(n+1023)/1024, nr=mtp ? 1 : T;
             kd_rank_head<false><<<dim3(blocks,nr),256,0,s.st>>>(d.logits,nullptr,d.rank_tiles,n,blocks,s.g*n);

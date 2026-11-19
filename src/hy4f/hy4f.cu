@@ -1073,6 +1073,8 @@ struct Model::Impl {
             if (d.cert.upper) cudaFree(d.cert.upper);
             if (d.cert.count) cudaFree(d.cert.count);
             if (d.cert.ids) cudaFree(d.cert.ids);
+            if (d.cert.rank_hist) cudaFree(d.cert.rank_hist);
+            if (d.cert.rank_cut) cudaFree(d.cert.rank_cut);
             if (d.packed_query) cudaFree(d.packed_query);
             if (d.rank_tiles) cudaFree(d.rank_tiles);
             if (d.rank_final) cudaFree(d.rank_final);
@@ -1150,7 +1152,9 @@ bool Model::load(const Options& o, std::string& err) {
             const bool both = std::getenv("HY4F_CERT_HEAD") != nullptr;
             d.cert_target = eligible && (both || std::getenv("HY4F_CERT_TARGET"));
             d.cert_mtp = eligible && (both || std::getenv("HY4F_CERT_MTP"));
-            d.cert_head = d.cert_target || d.cert_mtp;
+            const char* ranked=std::getenv("HY4F_CERT_RANKED");
+            d.cert_ranked = eligible && d.rank_geometry() && ranked && !std::strcmp(ranked,"1");
+            d.cert_head = d.cert_target || d.cert_mtp || d.cert_ranked;
             d.has_mtp = t && te && (int) te->type != 30 /*BF16 experts: requantize first (scripts/requant_mtp_q3k.py)*/ &&
                         (int) t->type == 8 && !std::getenv("HY4F_NO_MTP") && (o.dfly.empty() || std::getenv("HY4F_KEEP_MTP"));
         }
@@ -1373,10 +1377,20 @@ bool Model::ranked_row(int row, int k, float inv_temp, std::vector<HeadValue>& v
                      v[k-1].logit*inv_temp==v[k].logit*inv_temp;
     }
     if (ambiguous) {
+        const unsigned bit=1u<<row;
         d.launch_parallel([&](Shard& s) {
-            HY_CK(cudaMemcpy(fallback+(size_t)s.g*n,d.dsh[s.g].logits+(size_t)row*n,
-                              sizeof(float)*n,cudaMemcpyDeviceToHost));
+            auto& ds=d.dsh[s.g];
+            auto* logits=ds.logits+(size_t)row*n;
+            if (d.rank_pruned_rows & bit) {
+                const auto* w=static_cast<const uint16_t*>(s.w.at("output.weight").d);
+                // Verify preserves every normalized head input in h; MTP preserves its final input in mh.
+                const float* x=d.rank_from_mtp ? ds.mh : ds.h+(size_t)row*d.E;
+                kd_bf16_gemv<1><<<nb(n*32),256,0,s.st>>>(w,x,d.E,n,logits);
+            }
+            HY_CK(cudaMemcpyAsync(fallback+(size_t)s.g*n,logits,sizeof(float)*n,cudaMemcpyDeviceToHost,s.st));
+            HY_CK(cudaStreamSynchronize(s.st));
         });
+        d.rank_pruned_rows &= ~bit;
         return false;
     }
     values.clear();
