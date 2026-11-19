@@ -41,12 +41,25 @@ struct Lane {
         else if (dt < std::chrono::seconds(1)) std::this_thread::sleep_for(std::chrono::microseconds(50));
         else std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+    // the rows about to be read: one prefetch a cache line, so the cold lines arrive with the core memory parallelism
+    // instead of one demand miss after another (a 4 KiB page ends every hardware prefetch stream)
+    static void fetch(const uint8_t* p, size_t n) {
+        for (size_t i = 0; i < n; i += 64) _mm_prefetch(reinterpret_cast<const char*>(p + i), _MM_HINT_T1);
+    }
+    bool prefetch = true;
     void run(const Task& t) {
         namespace kc = strata::kernels::cpu;
         const int gi = t.group;
-        if (phase == 0)
+        if (phase == 0) {
+            if (prefetch) {
+                fetch(rec[gi] + (size_t) t.r0 * fmt->gu_row, (size_t) (t.r1 - t.r0) * fmt->gu_row);
+                fetch(rec[gi] + half + (size_t) t.r0 * fmt->gu_row, (size_t) (t.r1 - t.r0) * fmt->gu_row);
+            }
             kc::native_gu_rows_split(*fmt, rec[gi], rec[gi] + half, act_p[gi], nt[gi], ff_p[gi], t.r0, t.r1, m->clampv);
-        else kc::native_down_rows_split(*fmt, rec[gi] + 2 * half, hq_p[gi], nt[gi], out_p[gi], t.r0, t.r1);
+        } else {
+            if (prefetch) fetch(rec[gi] + 2 * half + (size_t) t.r0 * fmt->d_row, (size_t) (t.r1 - t.r0) * fmt->d_row);
+            kc::native_down_rows_split(*fmt, rec[gi] + 2 * half, hq_p[gi], nt[gi], out_p[gi], t.r0, t.r1);
+        }
     }
     void drain() {
         for (;;) {
@@ -171,6 +184,7 @@ void lane_start() {
         ln->ff.resize((size_t) LANE_SLOTS * n_ffx);
         ln->hq.resize((size_t) LANE_SLOTS * kc::kNativeHBytes);
         Lane* p = ln.get();
+        if (const char* pf = std::getenv("HY4F_LANE_PREFETCH")) p->prefetch = std::atoi(pf) != 0;
         p->boss = std::thread([p] { p->boss_loop(); });
         for (int i = 1; i < per; ++i) p->crew.emplace_back([p] { p->crew_loop(); });
         lanes.push_back(std::move(ln));

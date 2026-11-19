@@ -62,6 +62,7 @@
 #include <thread>
 #include <atomic>
 #include <immintrin.h>
+#include <sys/mman.h>
 #include <memory>
 
 namespace strata::hy4f {
@@ -857,6 +858,21 @@ struct Model::Impl {
         }
     }
 
+    // The expert host store: anonymous memory (HY4F_HOST_HUGE=1: on transparent huge pages), registered with CUDA once
+    // it is filled.  (Huge pages are off by default: with the RAM full of page cache the kernel compacts for minutes.)
+    static uint8_t* host_store_alloc(size_t bytes) {
+        const size_t huge = size_t(2) << 20, len = (bytes + huge - 1) / huge * huge + huge;
+        void* p = mmap(nullptr, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p == MAP_FAILED) throw std::runtime_error("hy4f: mmap of the expert host store failed");
+        uint8_t* a = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(p) + huge - 1) / huge * huge);
+        const char* e = std::getenv("HY4F_HOST_HUGE");
+        if (e && std::atoi(e)) madvise(a, len - (size_t) (a - static_cast<uint8_t*>(p)), MADV_HUGEPAGE);
+        return a;
+    }
+    static void host_store_register(uint8_t* p, size_t bytes) {
+        HY_CK(cudaHostRegister(p, (bytes + 4095) / 4096 * 4096, cudaHostRegisterPortable | cudaHostRegisterMapped));
+    }
+
     void load_offload_experts(Shard& s, int il, const std::string& P) {
         const ExpertSrc base = expert_src(il, false);
         OffLayer ol;
@@ -893,9 +909,10 @@ struct Model::Impl {
             ol.cold_gu = cold.gu_type, ol.cold_dn = cold.dn_type;
             ol.cstride = cold.stride, ol.cgu_bytes = cold.gu_bytes;
             const size_t host_bytes = (size_t) ol.n * cold.stride + 4096;
-            HY_CK(cudaHostAlloc((void**) &ol.chost, host_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
+            ol.chost = host_store_alloc(host_bytes);
             std::memset(ol.chost + (size_t) ol.n * cold.stride, 0, 4096);
             fill_all(cold, ol.chost, 0, ol.n);
+            host_store_register(ol.chost, host_bytes);
             const int nb = ol.n_res - ol.n_hot;
             if (nb) {
                 ol.cvram = static_cast<uint8_t*>(walloc((size_t) nb * cold.stride));
@@ -913,14 +930,14 @@ struct Model::Impl {
         } else {
             if (ol.n_res) ol.vram = static_cast<uint8_t*>(walloc((size_t) ol.n_res * stride));
             const size_t host_bytes = (size_t) ol.n * stride + stride + 4096;
-            uint8_t* block = nullptr;
-            HY_CK(cudaHostAlloc((void**) &block, host_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
+            uint8_t* block = host_store_alloc(host_bytes);
             size_t shift = 0;
             if (ol.vram)
                 shift = (reinterpret_cast<uintptr_t>(ol.vram) % stride + stride - reinterpret_cast<uintptr_t>(block) % stride) % stride;
             ol.host = block + shift;
             std::memset(ol.host + (size_t) ol.n * stride, 0, host_bytes - shift - (size_t) ol.n * stride);
             fill_all(base, ol.host, 0, ol.n);
+            host_store_register(block, host_bytes);
             if (ol.n_res) HY_CK(cudaMemcpy(ol.vram, ol.host, (size_t) ol.n_res * stride, cudaMemcpyHostToDevice));
             base_ptr = ol.host;
             int64_t av = 0, ah = 0;
