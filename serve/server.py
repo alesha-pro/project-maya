@@ -1028,6 +1028,7 @@ class StrataEngine:
                 self.can_stop = "stop" in f[2:]
                 self.can_pause = "pause" in f[2:]
                 self.can_prefill_yield = "prefill_yield" in f[2:]
+                self.can_warm_prefill_yield = "warm_prefill_yield" in f[2:]
                 self.multi = next((int(x[6:]) for x in f[2:] if x.startswith("multi=") and x[6:].isdigit()), 0)
                 break
         loading.set()
@@ -1489,6 +1490,7 @@ class StrataEngine:
             return
         ends0 = self._asked_end()                         # (_ended_itself: what the server asked of the engine)
         self.__dict__.setdefault("_paused", set()).discard(None)
+        self.prefill_declined = False
         self.progress = None
         self.prefill_tok_s_mean = None
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
@@ -1553,6 +1555,9 @@ class StrataEngine:
                     if lp_wait is not None:
                         t, lp_wait = lp_attach(lp_wait, line.split()[1:]), None
                         yield t
+                elif line.startswith("YIELD_DECLINED"):
+                    self.prefill_declined = True
+                    yield None
                 elif line.startswith("PP "):
                     f = line.split()
                     if len(f) >= 3 and f[1].isdigit() and f[2].isdigit():
@@ -1810,8 +1815,9 @@ class StrataEngine:
             self.__dict__.get("_paused", set()).discard(rid)
             self._tls.rid = None
 
-    def yield_prefill(self):
-        self.proc.stdin.write("YIELD_PREFILL\n")
+    def yield_prefill(self, waiter_ids=None):
+        self.proc.stdin.write("YIELD_WARM " + ",".join(map(str, waiter_ids)) + "\n" if waiter_ids is not None
+                              else "YIELD_PREFILL\n")
         self.proc.stdin.flush()
 
     def pause(self, keep: bool = False):
@@ -4010,7 +4016,7 @@ class Service:
         if cancel is None:                              # (no way to leave the line: _turn waits as before)
             return
         every = queue_ping_seconds()
-        place = self.fifo.enqueue(units=units, short_prefill=True) if short_prefill else self.fifo.enqueue(units=units)
+        place = self.fifo.enqueue(units=units, short_prefill=short_prefill) if short_prefill else self.fifo.enqueue(units=units)
         try:
             last = time.monotonic()
             while not cancel.is_set():
@@ -4298,6 +4304,9 @@ class Service:
             stat.prefill_progress = None
             try:
                 for t in gen:
+                    if short_waiter is not None and (t is not None or getattr(self.engine, "prefill_declined", False)):
+                        self.fifo.unclaim_yield()   # this prefill continued, or decode began before it could pause
+                        short_waiter, claimed = None, False
                     if t is None and (smp_call or {}).get("_resume_prefill") and segments:
                         pp = getattr(self.engine, "progress", None)
                         if pp and pp[1] == len(cur):
@@ -4316,7 +4325,10 @@ class Service:
                                 short_waiter = self.fifo.claim_short_prefill()
                                 if short_waiter is not None:
                                     prefill_tried = claimed = True
-                                    self.engine.yield_prefill()
+                                    if short_waiter[4] is True:
+                                        self.engine.yield_prefill()
+                                    else:
+                                        self.engine.yield_prefill(short_waiter[4])
                         continue
                     produced.append(t)
                     if soft_text is not None:
@@ -4542,10 +4554,14 @@ class Service:
         hold = [False, False]                           # holds the FIFO (fair slices let go of it); counts as active
         asked = time.monotonic()
         try:
-            short = (getattr(self.engine, "can_prefill_yield", False) and not emb and
-                     len(ids) <= 2048 and 0 < max_new <= 256)
+            short = False
+            if getattr(self.engine, "can_prefill_yield", False) and not emb and 0 < max_new <= 256:
+                if len(ids) <= 2048:
+                    short = True
+                elif getattr(self.engine, "can_warm_prefill_yield", False) and len(ids) <= 262144:
+                    short = ids   # only the native host-slot check can admit this queued prompt
             if short:
-                yield from self._queue_wait(hold, cancel, short_prefill=True)
+                yield from self._queue_wait(hold, cancel, short_prefill=short)
             else:
                 yield from self._queue_wait(hold, cancel)
             with self._turn(hold, cancel):

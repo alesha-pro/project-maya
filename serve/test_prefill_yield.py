@@ -17,12 +17,16 @@ class CheckpointEngine(ResumingEngine):
         super().__init__(tok, {"long request": "long result", "short request": "short result"}, delay_s=0)
         self.reading, self.queued, self.short, self.finish_short = (threading.Event() for _ in range(4))
         self.last, self.progress, self.signal, self.attempts = {}, None, False, []
+        self.warm_queries, self.warm_hit = [], True
 
-    def yield_prefill(self):
-        self.signal = True
+    def yield_prefill(self, waiter_ids=None):
+        if waiter_ids is not None:
+            self.warm_queries.append(tuple(waiter_ids))
+        self.signal = waiter_ids is None or self.warm_hit
+        self.prefill_declined = not self.signal
 
     def generate(self, ids, max_new, sampling, cancel, embeddings=None):
-        long = len(ids) > 8192
+        long = "long request" in self.tok.decode(ids)
         order = sampling.get("_resume_prefill")
         self.attempts.append((long, order, tuple(ids), dict(sampling)))
         self.progress = None
@@ -76,10 +80,11 @@ class PrefillYield(unittest.TestCase):
             fifo.leave(older)
             fifo.leave(later)
 
-    def exercise(self, abort=False, enabled=True, short_limit=32):
+    def exercise(self, abort=False, enabled=True, short_limit=32, warm=False, hit=True):
         tok = ByteTokenizer()
         engine = CheckpointEngine(tok)
         engine.can_prefill_yield = enabled
+        engine.can_warm_prefill_yield, engine.warm_hit = warm, hit
         svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
         output, errors = {}, []
         cancel = threading.Event()
@@ -89,14 +94,14 @@ class PrefillYield(unittest.TestCase):
                                                 {"enable_thinking": False}, limit)
                 events = list(svc.run(ids, think, None, limit, {"seed": 19}, stop))
                 output[tag] = "".join(e.text for kind, e in events if kind == "event" and e.kind == "content")
-                if tag == "a" and enabled and not abort and short_limit <= 256:
+                if tag == "a" and enabled and not abort and short_limit <= 256 and hit:
                     progress = [pp for kind, pp in events if kind == "ping" and pp]
                     assert all(pp["cache"] == 0 for pp in progress)
                     assert progress[-1]["processed"] == len(ids) and progress[-1]["time_ms"] == 140
             except BaseException as exc:
                 errors.append(exc)
         a = threading.Thread(target=turn, args=("a", "long request " + "x" * 16000, 48, cancel))
-        b = threading.Thread(target=turn, args=("b", "short request", short_limit, threading.Event()))
+        b = threading.Thread(target=turn, args=("b", "short request" + ("y" * 12000 if warm else ""), short_limit, threading.Event()))
         with patch.dict(os.environ, {"MAYA_FAIR_SLICE_S": "0"}):
             a.start()
             self.assertTrue(engine.reading.wait(3))
@@ -132,6 +137,15 @@ class PrefillYield(unittest.TestCase):
         self.assertEqual(engine.attempts[0][2], engine.attempts[2][2])
         self.assertEqual(engine.attempts[2][3], {**engine.attempts[0][3], "_resume_prefill": 37})
         self.assertEqual((engine.last["prompt_ms"], engine.last["reused"]), (140, 0))
+
+    def test_long_logical_waiter_needs_an_exact_native_hit_and_bounded_decode(self):
+        for hit, cap in ((True, 64), (False, 64), (True, 4096)):
+            eng, _ = self.exercise(warm=True, hit=hit, short_limit=cap)
+            self.assertEqual(len(eng.attempts), 3 if hit and cap == 64 else 2)
+            if cap == 64:
+                self.assertEqual(eng.warm_queries, [next(ids for long, _, ids, _ in eng.attempts if not long)])
+            else:
+                self.assertEqual(eng.warm_queries, [])
 
     def test_abort_while_queued_does_not_resume(self):
         eng, _ = self.exercise(abort=True)

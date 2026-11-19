@@ -46,7 +46,7 @@ public:
         return -1;
     }
     // Replay the last token for logits. Avoid paying PCIe transfer for a small gain.
-    int lookup(const Key& request, size_t retained) {
+    int peek(const Key& request, size_t retained) const {
         int best = -1;
         for (size_t i = 0; i < entries_.size(); ++i) {
             const Key& key = entries_[i].tokens;
@@ -54,6 +54,19 @@ public:
             if (best >= 0 && key.size() <= entries_[best].tokens.size()) continue;
             if (std::equal(key.begin(), key.end(), request.begin())) best = static_cast<int>(i);
         }
+        return best;
+    }
+    // The current foreground branch may make restore at most 255 rows less attractive than its host hit.
+    // If its shared start ends before that interval the regular lookup must choose this checkpoint or a longer one.
+    size_t guaranteed_reuse(const Key& request, const Key& active) const {
+        const int slot = peek(request, 0);
+        if (slot < 0) return 0;
+        const size_t pos = entries_[slot].tokens.size();
+        const size_t low = pos - 255;
+        return active.size() >= low && std::equal(request.begin(), request.begin() + low, active.begin()) ? low : pos;
+    }
+    int lookup(const Key& request, size_t retained) {
+        const int best = peek(request, retained);
         if (best >= 0) {
             entries_[best].age = ++tick_;
             if (entries_[best].parent >= 0) entries_[entries_[best].parent].age = tick_;

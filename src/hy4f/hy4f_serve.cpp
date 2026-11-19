@@ -49,6 +49,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <charconv>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -187,6 +188,28 @@ struct Lines {
     std::deque<std::string> q;
     bool eof = false, running = false, pending_wrap = false;  // guarded by mu
     std::atomic<bool> stop{false}, wrap{false}, yield_prefill{false};
+    std::vector<int32_t> warm_waiter;   // guarded by mu, empty for the ordinary short request
+    static bool warm_ids(const std::string& line, std::vector<int32_t>& ids) {
+        const char* p = line.data() + 11;  // "YIELD_WARM "
+        const char* end = line.data() + line.size();
+        while (p < end && ids.size() < 262144) {
+            int32_t id;
+            auto val = std::from_chars(p, end, id);
+            if (val.ec != std::errc{} || id < 0) return false;
+            ids.push_back(id);
+            if (val.ptr == end) return ids.size() > 2048;
+            if (*val.ptr != ',') return false;
+            p = val.ptr + 1;
+        }
+        return false;
+    }
+    bool pending_yield(std::vector<int32_t>& waiter) {
+        if (!yield_prefill.load()) return false;
+        std::lock_guard<std::mutex> lk(mu);
+        if (!yield_prefill.exchange(false)) return false;
+        waiter.swap(warm_waiter);
+        return true;
+    }
     void start() {
         std::thread([this] {
             std::string buf;
@@ -203,9 +226,15 @@ struct Lines {
                         stop.store(true);
                         continue;
                     }
+                    const bool warm = l.rfind("YIELD_WARM ", 0) == 0;
+                    std::vector<int32_t> waiter;
+                    if (warm && !warm_ids(l, waiter)) continue;
                     std::lock_guard<std::mutex> lk(mu);
-                    if (l == "YIELD_PREFILL") {
-                        if (running) yield_prefill.store(true);
+                    if (warm || l == "YIELD_PREFILL") {
+                        if (running) {
+                            warm_waiter.swap(waiter);
+                            yield_prefill.store(true);
+                        }
                         continue;
                     }
                     if (l == "WRAP") {
@@ -230,6 +259,7 @@ struct Lines {
         if (q.empty()) return false;
         running = true;
         yield_prefill.store(false);
+        warm_waiter.clear();
         wrap.store(pending_wrap);
         pending_wrap = false;
         out = std::move(q.front());
@@ -543,7 +573,9 @@ int serve(Model& m, const ServeOptions& so) {
         std::printf("INFO vision=off\n");
     const char* yield_setting = std::getenv("HY4F_PREFILL_YIELD");
     const bool allow_yield = host_slots && yield_setting && std::strcmp(yield_setting, "1") == 0;
-    std::printf("READY %lld stop%s\n", C, allow_yield ? " prefill_yield" : "");
+    const char* warm_setting = std::getenv("HY4F_PREFILL_WARM_YIELD");
+    const bool allow_warm = allow_yield && warm_setting && std::strcmp(warm_setting, "1") == 0;
+    std::printf("READY %lld stop%s%s\n", C, allow_yield ? " prefill_yield" : "", allow_warm ? " warm_prefill_yield" : "");
     std::fflush(stdout);
     std::fprintf(stderr, "maya hy4f serve: GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT\n");
 #if defined(SIGPIPE)
@@ -767,8 +799,19 @@ int serve(Model& m, const ServeOptions& so) {
                 cancel = true;
                 break;
             }
-            if (allow_yield && in.yield_prefill.exchange(false) && text_cache && cold_aligned && !resume_order &&
-                a >= 2 * size_t(CH) && a % CH == 0 && n - a >= 2 * size_t(CH)) {
+            std::vector<int32_t> waiter;
+            if (allow_yield && in.pending_yield(waiter)) {
+                const size_t reuse = !waiter.empty() && allow_warm ? host_keys.guaranteed_reuse(waiter, state) : 0;
+                const bool fits = waiter.empty() || (reuse && waiter.size() - reuse <= size_t(CH));
+                if (!waiter.empty())
+                    std::fprintf(stderr, "maya hy4f serve: warm waiter rows=%zu guaranteed_reuse=%zu eligible=%d\n",
+                                 waiter.size(), reuse, int(fits));
+                if (!text_cache || !cold_aligned || resume_order || a < 2 * size_t(CH) || a % CH ||
+                    n - a < 2 * size_t(CH) || !fits) {
+                    std::puts("YIELD_DECLINED");
+                    std::fflush(stdout);
+                    continue;
+                }
                 double transfer_ms = 0;
                 const double started = now_ms();
                 interrupted_order = 0;
@@ -783,6 +826,8 @@ int serve(Model& m, const ServeOptions& so) {
                     break;
                 }
                 std::fprintf(stderr, "maya hy4f serve: prefill yield skipped (%s)\n", err.c_str());
+                std::puts("YIELD_DECLINED");
+                std::fflush(stdout);
             }
         }
         const double t1 = now_ms();
