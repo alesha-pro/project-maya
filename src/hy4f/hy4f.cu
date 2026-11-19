@@ -1968,6 +1968,51 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
         }
         d.truncate_full_mirrors((int)pos);
         const auto t_start = std::chrono::steady_clock::now();
+        const char* short_limit = d.scratch_cache ? std::getenv("HY4F_SINGLE_SHORT_VERIFY") : nullptr;
+        if (short_limit && n > 0 && n <= std::atoi(short_limit) && d.has_mtp && !d.dsh.empty()
+            && (!spans || spans->empty())) {
+            // A short text turn uses the decode graphs and keeps the cached experts in place.
+            // At the boundary, MTP pairs the previous trunk hidden state with the new token.
+            Shard& s = d.sh.front();
+            auto& b = d.bsh.front();
+            auto& ds = d.dsh.front();
+            HY_CK(cudaSetDevice(s.dev));
+            if (pos > 0) {
+                HY_CK(cudaMemcpyAsync(ds.h,b.hprev,sizeof(float)*d.E,cudaMemcpyDeviceToDevice,s.st));
+                if (!mtp(toks,1,pos-1,nullptr,err)) return false;
+            }
+            for (int t = 0; t < n; t += Impl::DT) {
+                const int T = std::min(Impl::DT, n-t);
+                const bool last = t+T == n;
+                const int pairs = last ? T-1 : T;
+                // Use the native output staging to avoid a host allocation for T full rows.
+                d.hio_v->pos = int(pos)+t;
+                d.hio_v->n = T;
+                std::copy_n(toks+t,T,d.hio_v->toks);
+                d.dec_launch(false,T,false,last && logits);
+                if (last && logits) std::copy_n(d.hlogT + size_t(T-1)*d.V,d.V,logits);
+                if (pairs && !mtp(toks+t+1,pairs,pos+t,nullptr,err)) return false;
+                if (last) {
+                    HY_CK(cudaMemcpyAsync(b.hprev,ds.h+size_t(T-1)*d.E,sizeof(float)*d.E,cudaMemcpyDeviceToDevice,s.st));
+                    HY_CK(cudaMemcpyAsync(ds.h,b.hprev,sizeof(float)*d.E,cudaMemcpyDeviceToDevice,s.st));
+                    HY_CK(cudaStreamSynchronize(s.st));
+                }
+            }
+            d.pos_next = pos+n;
+            d.full_prefill_warmed = true;
+            d.rebalance(d.adapt_pf_swaps);
+            if (logits && !d.o.dump_dir.empty()) {
+                if (auto* f = std::fopen((d.o.dump_dir+"/logits.f32").c_str(),"ab")) {
+                    std::fwrite(logits,sizeof(float),d.V,f);
+                    std::fclose(f);
+                }
+            }
+            if (d.o.verbose) {
+                const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_start).count();
+                std::fprintf(stderr,"hy4f: graph prefill %d tokens: %.1f ms (%.1f tok/s)\n",n,ms,1000.*n/ms);
+            }
+            return true;
+        }
         d.release_decode_scratch();
         d.change_q3_layout(false);
         if (chunk <= 0) chunk = 1024;
