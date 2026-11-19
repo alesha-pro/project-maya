@@ -108,6 +108,80 @@ struct Bump {
     }
 };
 
+// The packed decode index occupies a prefix of the arena. The tail and trunk
+// residual rows are free between calls, including when a prefix is restored.
+void release_decode_scratch() {
+    if (!scratch_active) return;
+    if (adapt) harvest_routes();
+    Shard& s = sh.front();
+    HY_CK(cudaSetDevice(s.dev));
+    for (auto& [il, layer] : s.off) {
+        HY_CK(cudaMemsetAsync(layer.device_scratch_index, 0xff, layer.n * sizeof(int), s.st));
+        std::fill(layer.scratch_index.begin(), layer.scratch_index.end(), -1);
+    }
+    scratch_active = false;
+}
+
+void populate_decode_scratch() {
+    if (!scratch_cache || scratch_active || bsh.empty()) return;
+    Shard& s = sh.front();
+    BShard& b = bsh.front();
+    HY_CK(cudaSetDevice(s.dev));
+    size_t index_bytes = 0;
+    if (!dsh.empty() && dsh.front().index_cache) {
+        for (int il = 0; il < L; ++il)
+            if (!swa[il]) index_bytes += size_t(o.max_context / 4) * 256;
+    }
+    index_bytes = std::min(index_bytes, b.arena_bytes);
+    struct Region { uintptr_t next, end; };
+    const uintptr_t hidden = reinterpret_cast<uintptr_t>(b.X);
+    const uintptr_t arena = reinterpret_cast<uintptr_t>(b.arena_base);
+    Region regions[] = {{hidden, hidden + size_t(b.Tmax)*hc*E*sizeof(float)},
+                        {arena + index_bytes, arena + b.arena_bytes}};
+    std::vector<OffItem> picks;
+    for (auto& [il, layer] : s.off)
+        for (int e = layer.n_res; e < layer.n; ++e)
+            picks.push_back({off_score.at(il)[e],il,e});
+    std::stable_sort(picks.begin(), picks.end(), [](const OffItem& a, const OffItem& z) {return a.p > z.p;});
+    size_t budget = regions[0].end-regions[0].next + regions[1].end-regions[1].next;
+    std::map<int,std::vector<int>> by_layer;
+    for (const auto& pick : picks) {
+        const auto bytes = s.off.at(pick.il).stride;
+        if (bytes > budget) continue;
+        budget -= bytes;
+        by_layer[pick.il].push_back(pick.l);
+    }
+    size_t copied = 0;
+    int records = 0;
+    for (auto& [il, ids] : by_layer) {
+        auto& layer = s.off.at(il);
+        const size_t stride = layer.stride;
+        std::sort(ids.begin(),ids.end());
+        for (int e : ids) {
+            for (auto& region : regions) {
+                const auto delta = (layer.record_base % stride + stride - region.next % stride) % stride;
+                const uintptr_t at = region.next + delta;
+                if (at + stride > region.end || at < layer.record_base) continue;
+                const auto index = (at - layer.record_base) / stride;
+                if (index >= INT_MAX) continue;
+                HY_CK(cudaMemcpyAsync(reinterpret_cast<void*>(at), layer.host + size_t(layer.home[e])*stride,
+                                      stride, cudaMemcpyHostToDevice, s.st));
+                region.next = at + stride;
+                layer.scratch_index[e] = (int)index;
+                copied += stride;
+                ++records;
+                break;
+            }
+        }
+        HY_CK(cudaMemcpyAsync(layer.device_scratch_index,layer.scratch_index.data(),layer.n*sizeof(int),
+                              cudaMemcpyHostToDevice,s.st));
+    }
+    HY_CK(cudaStreamSynchronize(s.st));
+    scratch_active = true;
+    if (o.verbose) std::fprintf(stderr,"hy4f: decode workspace holds %d additional experts (%zu MiB)\n",
+                                records,copied >> 20);
+}
+
 // the batch buffers: persistent ones, and one arena the attention / FFN / Engram phases of a layer share
 void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_CK(cudaSetDevice(s.dev));

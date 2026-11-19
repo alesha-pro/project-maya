@@ -1031,7 +1031,7 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         const int single_mapped = mapped_opt ? std::clamp(std::atoi(mapped_opt), 0, n_used) : 0;
         k_split_lane<<<1, 256, 0, s.st>>>(d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, ofl->n_res, ofl->n_res, ofl->vmap, nullptr,
                                           d.ha_n, d.ha_exp, d.ha_off, d.ha_slot, d.hb_n, d.ne_ptr, d.hb_off, d.hb_slot,
-                                          d.mail, d.lane_seq, d.lane_info, d.xm, xmc, T, il, single_mapped);
+                                          d.mail, d.lane_seq, d.lane_info, d.xm, xmc, T, il, single_mapped, ofl->device_scratch_index);
         g_n = d.ha_n, g_exp = d.ha_exp, g_off = d.ha_off, g_slot = d.ha_slot;
     }
     if (pipeline) {
@@ -1442,6 +1442,7 @@ void prepare_packed_index(int pos, int T) {
 }
 
 void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
+    if (scratch_cache) populate_decode_scratch();
     if (!mtp && dsh.front().index_cache) prepare_packed_index(hio_v->pos,T);
     const bool ranked=cert_ranked && rank_active && !full_logits;
     const bool narrow=greedy_draft_head && !full_logits && !rank_active;
@@ -1538,6 +1539,7 @@ bool encode_img(const vision::Image& img, std::vector<float>& rows, int& n_token
     HY_CK(cudaSetDevice(s.dev));
     vision::Arena ar;
     packed_index_groups = -1;
+    release_decode_scratch();
     ar.dev_ptr = b.arena_base;
     ar.bytes = b.arena_bytes;
     ar.gpu = s.dev;

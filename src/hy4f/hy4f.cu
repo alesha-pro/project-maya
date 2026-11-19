@@ -144,6 +144,9 @@ struct OffLayer {
     size_t stride = 0, gu_bytes = 0;
     uint8_t *vram = nullptr, *host = nullptr;
     std::vector<int> home;   // local expert -> its host record (the adaptation swaps experts without moving records)
+    std::vector<int> scratch_index;
+    int* device_scratch_index = nullptr;
+    uintptr_t record_base = 0;
     int* vmap = nullptr;     // device: local expert -> lattice index
     bool base_type = false;  // the records are of a tuned type (Q3_K / Q4_K / Q8_0)
     // A hybrid layer (HY4F_HOT_VRAM_MB): locals [0, n_hot) keep the base quantization in VRAM (`vram`, `stride`; no
@@ -246,6 +249,7 @@ struct Model::Impl {
     uint64_t st_hot = 0;
     std::string route_stats;
     // HY4F_EXPERT_ADAPT: the VRAM set follows the routing - a cold resident and a hot host expert trade places
+    bool scratch_cache = false, scratch_active = false;
     bool adapt = false;
     double adapt_horizon = 1024;                   // tokens after which an old pick weighs 1/e
     double adapt_pf_weight = 0;                    // (a prompt's routing does not predict the answer's: measured)
@@ -968,12 +972,20 @@ struct Model::Impl {
             fill_all(base, ol.host, 0, ol.n);
             host_store_register(block, host_bytes);
             if (ol.n_res) HY_CK(cudaMemcpy(ol.vram, ol.host, (size_t) ol.n_res * stride, cudaMemcpyHostToDevice));
-            base_ptr = ol.host;
-            int64_t av = 0, ah = 0;
-            if (ol.vram && ol.host > ol.vram) {
-                base_ptr = ol.vram;
-                ah = (ol.host - ol.vram) / (int64_t) stride;
-            } else if (ol.vram) av = (ol.vram - ol.host) / (int64_t) stride;
+            uintptr_t origin = reinterpret_cast<uintptr_t>(ol.host);
+            if (ol.vram) origin = std::min(origin, reinterpret_cast<uintptr_t>(ol.vram));
+            if (scratch_cache) {
+                const uintptr_t buffer = reinterpret_cast<uintptr_t>(bsh.front().dbounds);
+                const size_t pad = (origin % stride + stride - buffer % stride) % stride;
+                origin = std::min(origin, buffer + pad);
+                ol.scratch_index.assign(ol.n, -1);
+                HY_CK(cudaMalloc(&ol.device_scratch_index, ol.n * sizeof(int)));
+                HY_CK(cudaMemset(ol.device_scratch_index, 0xff, ol.n * sizeof(int)));
+            }
+            ol.record_base = origin;
+            base_ptr = reinterpret_cast<uint8_t*>(origin);
+            const auto av = ol.vram ? (reinterpret_cast<uintptr_t>(ol.vram) - origin) / stride : 0;
+            const auto ah = (reinterpret_cast<uintptr_t>(ol.host) - origin) / stride;
             if (av + ol.n >= INT_MAX || ah + ol.n >= INT_MAX) throw std::runtime_error("hy4f: the expert stores are too far apart");
             ol.av = (int) av;
             ol.ah = (int) ah;
@@ -1055,9 +1067,11 @@ struct Model::Impl {
                     if (il == dense_lead) tokens += ((double) h[i] + adapt_pf_weight * (double) s.pf_rows[i]) / n_used;
                     if (offload && il < L) {
                         const OffLayer& ol = s.off.at(il);
-                        const bool res = l < ol.n_res;
+                        const bool permanent = l < ol.n_res;
+                        const bool res = permanent || (scratch_active && ol.scratch_index[l] >= 0);
                         st_picks += h[i], st_pf += s.pf_touch[i], win_picks += h[i];
-                        if (res) st_hits += h[i], st_pf_hit += s.pf_touch[i], win_hits += h[i];
+                        if (res) st_hits += h[i], win_hits += h[i];
+                        if (permanent) st_pf_hit += s.pf_touch[i];
                         if (ol.hybrid ? l < ol.n_hot : (ol.base_type && res)) st_hot += h[i], win_hot += h[i];
                     }
                     s.pf_rows[i] = 0, s.pf_touch[i] = 0;
@@ -1111,6 +1125,12 @@ struct Model::Impl {
         OffLayer& ol = s.off.at(sw.il);
         auto& perm = off_perm.at(sw.il);
         HY_CK(cudaSetDevice(s.dev));
+        // sw.lo receives the old hot expert. If it also has a scratch slot,
+        // keep that slot synchronized before replacing the permanent copy.
+        if (scratch_active && ol.scratch_index[sw.lo] >= 0) {
+            void* dest = reinterpret_cast<void*>(ol.record_base + size_t(ol.scratch_index[sw.lo]) * ol.stride);
+            HY_CK(cudaMemcpy(dest, ol.vram + size_t(sw.hi)*ol.stride, ol.stride, cudaMemcpyDeviceToDevice));
+        }
         if (ol.hybrid) {
             const size_t cs = ol.cstride;
             if (sw.hi < ol.n_hot) {   // the hot slot takes the base weights of lo's expert, read from the GGUF
@@ -1468,6 +1488,10 @@ struct Model::Impl {
                                  budget >> 20);
                 plan_residency(g, budget);
             }
+            const char* lane_mode = std::getenv("HY4F_CPU_LANE");
+            scratch_cache = S == 1 && !hybrid && lane_mode && std::atoi(lane_mode)
+                && single_prefill_mode() && std::getenv("HY4F_SINGLE_WORKSPACE_CACHE");
+            if (scratch_cache) batch_setup(o.prefill_chunk > 0 ? o.prefill_chunk : 2048);
             for (int il : s.off_pending) load_offload_experts(s, il, "blk." + std::to_string(il) + ".");
             s.off_pending.clear();
         }
@@ -1753,6 +1777,11 @@ struct Model::Impl {
     ~Impl() {
         dump_route_stats();
         lane_stop();
+        for (auto& s : sh) {
+            cudaSetDevice(s.dev);
+            for (auto& [il, layer] : s.off)
+                if (layer.device_scratch_index) cudaFree(layer.device_scratch_index);
+        }
         if (pool) {
             {
                 std::lock_guard<std::mutex> lk(pool->m);
@@ -1939,6 +1968,7 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
         }
         d.truncate_full_mirrors((int)pos);
         const auto t_start = std::chrono::steady_clock::now();
+        d.release_decode_scratch();
         d.change_q3_layout(false);
         if (chunk <= 0) chunk = 1024;
         // two micro-batches (overlap one half's exchanges with the other's compute) unless HY4F_MB=1

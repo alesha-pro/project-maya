@@ -517,18 +517,19 @@ struct LaneMail {
 __global__ void k_split_lane(const int* ng, const int* experts, const int* off, const int* slots, int n_hot, int n_res,
                              const int* vmap, const unsigned long long* cptr, int* an, int* aexp, int* aoff, int* aslot,
                              int* bn, unsigned long long* bptr, int* boff, int* bslot, LaneMail* mail, unsigned* seq,
-                             int* info, const float* x, int ldx, int T, int layer, int mapped_groups = 0) {
+                             int* info, const float* x, int ldx, int T, int layer, int mapped_groups = 0, const int* scratch_index = nullptr) {
     __shared__ int n_mail;
     if (threadIdx.x == 0) {
         int na = 0, nb = 0, nm = 0, sa = 0, sb = 0, sm = 0;
         const int n = *ng;
         for (int g = 0; g < n; ++g) {
             const int e = experts[g], s0 = off[g], s1 = off[g + 1];
-            const bool mapped = e >= n_res && mapped_groups > 0;
+            const int cached = scratch_index ? scratch_index[e] : -1;
+            const bool mapped = e >= n_res && cached < 0 && mapped_groups > 0;
             if (mapped) --mapped_groups;
-            const bool held = e < n_res || mapped || !mail;
+            const bool held = e < n_res || cached >= 0 || mapped || !mail;
             if (held && (e < n_hot || !cptr)) {
-                aexp[na] = vmap ? vmap[e] : e;
+                aexp[na] = cached >= 0 ? cached : vmap ? vmap[e] : e;
                 aoff[na++] = sa;
                 for (int i = s0; i < s1; ++i) aslot[sa++] = slots[i];
             } else if (held) {
