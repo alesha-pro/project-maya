@@ -35,9 +35,9 @@ __device__ __forceinline__ void multiply(float (&c)[4], const uint4& a, unsigned
         : "r"(a.x),"r"(a.y),"r"(a.z),"r"(a.w),"r"(b0),"r"(b1));
 }
 
-template<int Tokens, int WarpTokens>
-__global__ __launch_bounds__(128) void score(const float* query, int ldq, const __half* raw, const Cache* state,
-        const float* weights, const int* pos, int capacity, float* scores, int lds) {
+template<int Tokens, int WarpTokens, bool Histogram>
+__device__ __forceinline__ void score_impl(const float* query, int ldq, const __half* raw, const Cache* state,
+        const float* weights, const int* pos, int capacity, float* scores, int lds, unsigned* global_hist) {
     constexpr int Warps=4, PerToken=WarpTokens==1?Tokens:1;
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int first_token = WarpTokens==1?0:warp%WarpTokens;
@@ -47,6 +47,13 @@ __global__ __launch_bounds__(128) void score(const float* query, int ldq, const 
     const int first=int(blockIdx.x)*(Warps/WarpTokens)+warp/WarpTokens;
     if (first*8 >= groups) return;
     // PTX m16n8k16 A fragment order spans the two 8-head halves in each 8-K slice.
+    // Some token/warp masks return above. Each active warp owns and reduces its histogram independently.
+    __shared__ unsigned local_hist[Histogram ? Warps : 1][Histogram ? PerToken : 1][Histogram ? 256 : 1];
+    if constexpr (Histogram) {
+        for (int t = 0; t < PerToken; ++t)
+            for (int i = lane; i < 256; i += 32) local_hist[warp][t][i] = 0;
+        __syncwarp();
+    }
     uint4 q[PerToken][8];
 #pragma unroll
     for(int t=0;t<PerToken;++t) {
@@ -108,6 +115,10 @@ __global__ __launch_bounds__(128) void score(const float* query, int ldq, const 
                     sum+=fmaxf(d.w,0.f)*w.w;
                 }
                 scores[size_t(tt)*lds+g]=sum;
+                if constexpr (Histogram) {
+                    const unsigned bin=kern::kd_score_coarse(sum);
+                    atomicAdd(&local_hist[warp][t][bin >> 1], 1u << (16 * (bin & 1u)));
+                }
             }
             __syncwarp();
         }
@@ -115,6 +126,29 @@ __global__ __launch_bounds__(128) void score(const float* query, int ldq, const 
     int tile=first;
     for (; tile<min(cache.tiles,(groups+7)/8); tile+=stride) score_tile(tile,std::true_type{});
     for (; tile*8<groups; tile+=stride) score_tile(tile,std::false_type{});
+    if constexpr (Histogram) {
+        __syncwarp();
+        for (int t = 0; t < PerToken; ++t) {
+            unsigned* hist = global_hist + (first_token + t) * 512;
+            for (int i = lane; i < 256; i += 32) {
+                const unsigned counts = local_hist[warp][t][i];
+                if (counts & 65535u) atomicAdd(hist + 2*i, counts & 65535u);
+                if (counts >> 16) atomicAdd(hist + 2*i + 1, counts >> 16);
+            }
+        }
+    }
+}
+
+template<int Tokens, int WarpTokens>
+__global__ __launch_bounds__(128) void score(const float* query, int ldq, const __half* raw, const Cache* state,
+        const float* weights, const int* pos, int capacity, float* scores, int lds) {
+    score_impl<Tokens,WarpTokens,false>(query,ldq,raw,state,weights,pos,capacity,scores,lds,nullptr);
+}
+
+template<int Tokens, int WarpTokens>
+__global__ __launch_bounds__(128) void score_hist(const float* query, int ldq, const __half* raw, const Cache* state,
+        const float* weights, const int* pos, int capacity, float* scores, int lds, unsigned* histogram) {
+    score_impl<Tokens,WarpTokens,true>(query,ldq,raw,state,weights,pos,capacity,scores,lds,histogram);
 }
 }  // namespace strata::hy4f::packed_index
 

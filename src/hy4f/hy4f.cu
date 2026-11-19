@@ -1080,6 +1080,7 @@ struct Model::Impl {
             if (d.cert.rank_cut) cudaFree(d.cert.rank_cut);
             if (d.packed_query) cudaFree(d.packed_query);
             if (d.index_cache) cudaFree(d.index_cache);
+            if (d.sel_compact) cudaFree(d.sel_compact);
             if (d.rank_tiles) cudaFree(d.rank_tiles);
             if (d.rank_final) cudaFree(d.rank_final);
         }

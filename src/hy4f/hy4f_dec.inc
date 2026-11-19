@@ -511,18 +511,25 @@ void d_indexer_select(Shard& s, DShard& d, const std::string& P, int il, const i
         d_indexer_weights(s,d,P,T,st);
     }
     const int ld_sc = (int) (o.max_context / kpool + 1);
+    const bool packed_score = d.index_cache && packed_index_dispatch && il<L && T>=2 && T<=4;
     const char* selected = std::getenv("HY4F_DEC_SCORE_SELECT");
     const int tp = top_k / kpool - tail;
     if (d.sel_compact && selected && std::strcmp(selected, "1") == 0 && IH == 16 && IK == 128 && T <= 4 &&
         dec_score_blocks == 256 && tp > 0 && tp <= KD_CANDIDATES && !std::getenv("HY4F_OLD_SELECT")) {
         kd_score_select_init<<<T,256,0,st>>>(d.sel_hist,d.sel_compact);
-        const auto kernel = T == 1 ? kd_score_hist_tile<1> : T == 2 ? kd_score_hist_tile<2> : kd_score_hist_tile<4>;
-        kernel<<<256,256,0,st>>>(iq,qpc,s.pooled[il],d.iw,IH,kpool,top_k,pp,0,T,ld_sc-1,d.score,ld_sc,d.sel_hist);
+        if (packed_score) {
+            const auto kernel = T==2 ? packed_index::score_hist<2,2> :
+                                T==3 ? packed_index::score_hist<3,4> : packed_index::score_hist<4,4>;
+            kernel<<<T==2?256:512,128,0,st>>>(iq,qpc,s.pooled[il],d.index_cache+il,d.iw,pp,ld_sc-1,d.score,ld_sc,d.sel_hist);
+        } else {
+            const auto kernel = T==1 ? kd_score_hist_tile<1> : T==2 ? kd_score_hist_tile<2> : kd_score_hist_tile<4>;
+            kernel<<<256,256,0,st>>>(iq,qpc,s.pooled[il],d.iw,IH,kpool,top_k,pp,0,T,ld_sc-1,d.score,ld_sc,d.sel_hist);
+        }
         kd_score_compact<<<dim3(64,T),256,0,st>>>(d.score,ld_sc,pp,kpool,top_k,tp,d.sel_hist,d.sel_compact);
         kd_score_finish<<<T,256,0,st>>>(d.score,ld_sc,pp,kpool,top_k,tp,n_cap,d.sel_compact,d.cells);
         return;
     }
-    if (d.index_cache && packed_index_dispatch && il<L && T>=2 && T<=4) {
+    if (packed_score) {
         const auto kernel = T==2 ? packed_index::score<2,2> :
                             T==3 ? packed_index::score<3,4> : packed_index::score<4,4>;
         kernel<<<T==2?256:512,128,0,st>>>(iq,qpc,s.pooled[il],d.index_cache+il,d.iw,pp,ld_sc-1,d.score,ld_sc);
