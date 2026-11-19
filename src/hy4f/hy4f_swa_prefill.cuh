@@ -11,7 +11,7 @@ __global__ void kb_mqa_queries(const float* qabs, const float* q, int ldq, int q
     if (c0 >= H*D) return;
     const int h = c0 / D, c = c0 % D;
     float v;
-    if (c < 512) v = qabs[(((size_t)t*Groups+blockIdx.z)*H+h)*512+c];
+    if (c < 512) v = qabs[((size_t)t*H+h)*512+c];
     else {
         int j = c-512, jj=j/2;
         const float* pe = q + (size_t)t*ldq + h*qs + nope + 2*jj;
