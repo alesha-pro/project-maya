@@ -171,10 +171,9 @@ __global__ void kd_moe_sum(float* moe, const float* dn, const float* w, const in
 }
 // y[t][r] = W[r] . x[t] for T <= 4 rows of x, BF16 W [rows][n] read once (warp per row)
 template <int T>
-__global__ void kd_bf16_gemv(const uint16_t* __restrict__ W, const float* __restrict__ x, int n, int rows,
-                             float* __restrict__ y) {
-    const int r = (blockIdx.x * blockDim.x + threadIdx.x) >> 5, lane = threadIdx.x & 31;
-    if (r >= rows) return;
+__device__ __forceinline__ void kd_head_bf16_row(const uint16_t* __restrict__ W, const float* __restrict__ x,
+                                                 int n, int rows, float* __restrict__ y, int r) {
+    const int lane=threadIdx.x & 31;
     const uint32_t* w2 = reinterpret_cast<const uint32_t*>(W + (size_t) r * n);
     float acc[T];
 #pragma unroll
@@ -193,6 +192,13 @@ __global__ void kd_bf16_gemv(const uint16_t* __restrict__ W, const float* __rest
         const float s = warp_sum(acc[t]);
         if (lane == 0) y[(size_t) t * rows + r] = s;
     }
+}
+template <int T>
+__global__ void kd_bf16_gemv(const uint16_t* __restrict__ W, const float* __restrict__ x, int n, int rows,
+                             float* __restrict__ y) {
+    const int r = (blockIdx.x * blockDim.x + threadIdx.x) >> 5;
+    if (r >= rows) return;
+    kd_head_bf16_row<T>(W,x,n,rows,y,r);
 }
 // per row of y [T][rows]: (max, first index of the max + idx0); blockIdx.x = row, 1024 threads
 __global__ void kd_argmax(const float* y, int rows, int idx0, float* oval, int* oidx) {

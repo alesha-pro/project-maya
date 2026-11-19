@@ -20,6 +20,7 @@
 #include "hy4f_swa_prefill.cuh"
 #include "hy4f_dsa_prefill.cuh"
 #include "hy4f_dkern.cuh"
+#include "hy4f_head_cert.cuh"
 #include "hy4f_ranked.cuh"
 #include "hy4f_project.cuh"
 #include "hy4f_q3packed.cuh"
@@ -355,6 +356,12 @@ struct Model::Impl {
         weight.ne[1] = rows;
         weight.rb = ggml_row_size(type, E);
         weight.d = walloc(rows * weight.rb);
+        float2* device_norms = nullptr;
+        if (cert_head) {
+            auto& norms = s.w["mtp.output.norms"];
+            norms.d = walloc((size_t)rows*sizeof(float2));
+            device_norms = static_cast<float2*>(norms.d);
+        }
         constexpr int chunk = 128;
         std::vector<float> input((size_t) chunk * E);
         std::vector<uint8_t> packed(chunk * weight.rb);
@@ -362,8 +369,41 @@ struct Model::Impl {
         for (int i = 0; i < rows; i += chunk) {
             const int n = std::min(rows-i, chunk);
             ggml_bf16_to_fp32_row(bf16 + (size_t) i * E, input.data(), (int64_t) n * E);
+            bool valid[chunk] = {};
+            if (cert_head) {
+                for (int j=0;j<n;++j) {
+                    float* row=input.data()+(size_t)j*E;
+                    valid[j]=std::all_of(row,row+E,[](float v){return std::isfinite(v) && std::fabs(v)<=0x1p16f;});
+                    // A row outside the proof domain is always evaluated in BF16.
+                    if (!valid[j]) std::fill(row,row+E,0.0f);
+                }
+            }
             const auto bytes = ggml_quantize_chunk(type, input.data(), packed.data(), 0, n, E, nullptr);
             if (bytes != n * weight.rb) throw std::runtime_error("hy4f: incomplete draft head quantization");
+            if (cert_head) {
+                float2 norms[chunk];
+                for (int j=0;j<n;++j) {
+                    double residual=0, quant=0;
+                    const float* row=input.data()+(size_t)j*E;
+                    const uint8_t* block=packed.data()+j*weight.rb;
+                    for (int k=0;k<E;k+=32,block+=34) {
+                        ggml_fp16_t h; std::memcpy(&h,block,sizeof(h));
+                        const double scale=ggml_fp16_to_fp32(h);
+                        for (int l=0;l<32;++l) {
+                            const double wq=scale*reinterpret_cast<const int8_t*>(block+2)[l];
+                            const double dx=double(row[k+l])-wq;
+                            residual+=dx*dx; quant+=wq*wq;
+                        }
+                    }
+                    // Positive double sums of E terms. Cover rounding of the difference,
+                    // squares, sum and sqrt, then round the float storage upwards.
+                    const auto norm=[&](double ss) {
+                        return valid[j] ? std::nextafter(float(std::sqrt(ss)*(1.0+0x1p-38)),INFINITY) : INFINITY;
+                    };
+                    norms[j]=make_float2(norm(residual),norm(quant));
+                }
+                HY_CK(cudaMemcpy(device_norms+i,norms,(size_t)n*sizeof(float2),cudaMemcpyHostToDevice));
+            }
             HY_CK(cudaMemcpy(static_cast<uint8_t*>(weight.d) + i * weight.rb, packed.data(), bytes, cudaMemcpyHostToDevice));
         }
     }
@@ -542,7 +582,7 @@ struct Model::Impl {
         for (const char* n : {"output_norm.weight", "output_hc_fn.weight", "output_hc_scale.weight", "output_hc_base.weight"})
             up_full(s, n);
         up_rows(s, "output.weight", (int64_t) g * V / S, (int64_t) (g + 1) * V / S);
-        if (has_mtp && draft_head_type) up_draft_head(s);
+        if (draft_head_type && (has_mtp || cert_head)) up_draft_head(s);
         const char* project_env = std::getenv("HY4F_Q8_KV_PROJ");
         const int project_mask = project_env ? std::atoi(project_env) : 0;
         const bool pack_k = (project_mask & 1) && nope == 192 && kvl == 512;
@@ -1021,6 +1061,12 @@ struct Model::Impl {
             for (auto& graph : d.gm) graph.clear();
             d.gc.clear();
             for (auto& graph : d.mtp_heads) graph.clear();
+            for (auto& pair : d.verify_heads) for (auto& graph : pair) graph.clear();
+            if (d.cert.input) cudaFree(d.cert.input);
+            if (d.cert.lower) cudaFree(d.cert.lower);
+            if (d.cert.upper) cudaFree(d.cert.upper);
+            if (d.cert.count) cudaFree(d.cert.count);
+            if (d.cert.ids) cudaFree(d.cert.ids);
             if (d.packed_query) cudaFree(d.packed_query);
             if (d.rank_tiles) cudaFree(d.rank_tiles);
             if (d.rank_final) cudaFree(d.rank_final);
@@ -1093,6 +1139,12 @@ bool Model::load(const Options& o, std::string& err) {
                 if (!std::strcmp(bits, "8")) d.draft_head_type = T_Q8_0;
                 else if (!std::strcmp(bits, "4")) d.draft_head_type = T_Q4_K;
                 else throw std::runtime_error("hy4f: HY4F_MTP_HEAD_Q expects 8 or 4");
+            }
+            d.cert_head = std::getenv("HY4F_CERT_HEAD") && d.compact_io && d.E == 3072;
+            if (d.cert_head) {
+                if (d.draft_head_type && d.draft_head_type != T_Q8_0)
+                    throw std::runtime_error("hy4f: certified argmax requires Q8_0");
+                d.draft_head_type = T_Q8_0;
             }
             d.has_mtp = t && te && (int) te->type != 30 /*BF16 experts: requantize first (scripts/requant_mtp_q3k.py)*/ &&
                         (int) t->type == 8 && !std::getenv("HY4F_NO_MTP") && (o.dfly.empty() || std::getenv("HY4F_KEEP_MTP"));
@@ -1337,6 +1389,18 @@ float Model::draft_margin(int token) const {
     for (int g = 0; g < d.S; ++g) if (g != owner) runner_up = std::max(runner_up, d.mtp_max(g));
     if (d.compact_io && token == d.hmargi[owner])
         return d.mtp_max(owner) - std::max(runner_up, d.hmargv[2 * owner + 1]);
+    // Clients may ask for the margin of an alternative to the last proposer.
+    if (d.certified_mtp_active) {
+        const auto& s=d.sh[owner];
+        const auto& ds=d.dsh[owner];
+        HY_CK(cudaSetDevice(s.dev));
+        const auto* w=static_cast<const uint16_t*>(s.w.at("output.weight").d)+(size_t)(token%rows)*d.E;
+        kd_bf16_gemv<1><<<1,32,0,s.st>>>(w,ds.mh,d.E,1,ds.logits+token%rows);
+        float score;
+        HY_CK(cudaMemcpyAsync(&score,ds.logits+token%rows,sizeof(score),cudaMemcpyDeviceToHost,s.st));
+        HY_CK(cudaStreamSynchronize(s.st));
+        return score-std::max(runner_up,d.mtp_max(owner));
+    }
     if (!d.mtp_full_row) {
         HY_CK(cudaSetDevice(d.sh[owner].dev));
         HY_CK(cudaMemcpy(d.hmlog + (size_t)owner * rows, d.dsh[owner].logits,
