@@ -1394,17 +1394,15 @@ float Model::draft_margin(int token) const {
     for (int g = 0; g < d.S; ++g) if (g != owner) runner_up = std::max(runner_up, d.mtp_max(g));
     if (d.compact_io && token == d.hmargi[owner])
         return d.mtp_max(owner) - std::max(runner_up, d.hmargv[2 * owner + 1]);
-    // Clients may ask for the margin of an alternative to the last proposer.
+    // An alternative-token query needs the original host reduction as well:
+    // std::max_element's comparison order is observable for nonfinite logits.
     if (d.certified_mtp_active) {
         const auto& s=d.sh[owner];
         const auto& ds=d.dsh[owner];
         HY_CK(cudaSetDevice(s.dev));
-        const auto* w=static_cast<const uint16_t*>(s.w.at("output.weight").d)+(size_t)(token%rows)*d.E;
-        kd_bf16_gemv<1><<<1,32,0,s.st>>>(w,ds.mh,d.E,1,ds.logits+token%rows);
-        float score;
-        HY_CK(cudaMemcpyAsync(&score,ds.logits+token%rows,sizeof(score),cudaMemcpyDeviceToHost,s.st));
+        const auto* w=static_cast<const uint16_t*>(s.w.at("output.weight").d);
+        kd_bf16_gemv<1><<<nb(rows*32),256,0,s.st>>>(w,ds.mh,d.E,rows,ds.logits);
         HY_CK(cudaStreamSynchronize(s.st));
-        return score-std::max(runner_up,d.mtp_max(owner));
     }
     if (!d.mtp_full_row) {
         HY_CK(cudaSetDevice(d.sh[owner].dev));
