@@ -29,7 +29,12 @@ struct BShard {
     cudaEvent_t routing_ready = nullptr;
     int* hmb = nullptr;   // pinned copy of the bounds (the MMQ grid and the rows are host values)
     int64_t cap = 0;      // rows of the expert buffers
-    uint8_t* stage = nullptr;   // expert offload: the host experts of one launch
+    // expert offload: the host experts of a launch.  Two buffers and a copy stream: the next launch's experts arrive
+    // while the current one computes (HY4F_OFFLOAD_STAGE_OVERLAP=0: the copies run on the compute stream).
+    uint8_t* stage[2] = {nullptr, nullptr};
+    cudaStream_t copy_st = nullptr;
+    cudaEvent_t copy_done[2] = {nullptr, nullptr}, use_done[2] = {nullptr, nullptr};
+    int stage_turn = 0;
     float *eg_r = nullptr, *eg_kv = nullptr;
     int64_t* eg_ids = nullptr;
     float* ar_buf[2] = {nullptr, nullptr};   // reduce-scatter receive [src][ts][E] bf16
@@ -121,8 +126,14 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_CK(cudaHostAlloc((void**) &b.hmb, sizeof(int) * (nl_max + 1), cudaHostAllocPortable));
     b.cap = std::min((int64_t) T * K, std::max<int64_t>((int64_t) cap_num * T * K / (cap_den * S), 2 * T));
     if (offload) {
-        HY_CK(cudaMalloc(&b.stage, off_stage + 4096));
-        HY_CK(cudaMemset(b.stage, 0, off_stage + 4096));
+        for (int i = 0; i < 2; ++i) {
+            HY_CK(cudaMalloc(&b.stage[i], off_stage / 2 + 4096));
+            HY_CK(cudaMemset(b.stage[i], 0, off_stage / 2 + 4096));
+            HY_CK(cudaEventCreateWithFlags(&b.copy_done[i], cudaEventDisableTiming));
+            HY_CK(cudaEventCreateWithFlags(&b.use_done[i], cudaEventDisableTiming));
+        }
+        const char* ov = std::getenv("HY4F_OFFLOAD_STAGE_OVERLAP");
+        if (!ov || std::atoi(ov)) HY_CK(cudaStreamCreateWithFlags(&b.copy_st, cudaStreamNonBlocking));
     }
     xp_ld = ((size_t) q_lora + KV_ROW + (size_t) Hmax / S * vh + IK + 3) / 4 * 4;
     qp_ld = std::max((size_t) Hd * QH + (size_t) IH * IK, (size_t) Hs / S * QH);
@@ -766,7 +777,7 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
     // expert offload: a range lies wholly in VRAM or wholly in host memory, and a host range fits the staging buffer
     const OffLayer* ol = offload ? &s.off.at(il) : nullptr;
     const bool hyb = ol && ol->hybrid;   // tiers: [0, n_hot) base in VRAM, [n_hot, n_res) cold in VRAM, the rest cold on the host
-    const int stage_n = ol ? (int) std::max<size_t>(1, off_stage / (hyb ? ol->cstride : ol->stride)) : 0;
+    const int stage_n = ol ? (int) std::max<size_t>(1, off_stage / 2 / (hyb ? ol->cstride : ol->stride)) : 0;
     bool first = true;
     // the experts in ranges of at most cap rows (one range unless the routing piles onto this shard)
     for (int ea = 0; ea < nl;) {
@@ -797,7 +808,7 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
             mq::Product p{};
             const uint8_t* wg = static_cast<const uint8_t*>(wgu.d) + (size_t) ea * wgu.rb * (size_t) wgu.ne[1];
             const uint8_t* wdn = static_cast<const uint8_t*>(wd.d) + (size_t) ea * wd.rb * (size_t) wd.ne[1];
-            int type_gu = wgu.type, type_dn = wd.type;
+            int type_gu = wgu.type, type_dn = wd.type, staged = -1;
             size_t step_gu = expert_stride(wgu), step_dn = expert_stride(wd);
             if (ol) {
                 const bool cold = cold_tier;
@@ -808,6 +819,10 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
                 else {
                     const uint8_t* host = hyb ? ol->chost : ol->host;
                     const std::vector<int>& home = hyb ? ol->chome : ol->home;
+                    staged = b.stage_turn++ & 1;
+                    const cudaStream_t cs = b.copy_st ? b.copy_st : b.st;
+                    uint8_t* stage = b.stage[staged];
+                    if (b.copy_st) HY_CK(cudaStreamWaitEvent(cs, b.use_done[staged]));   // (the buffer's last launch is over)
                     for (int l = ea; l < eb;) {
                         if (b.hmb[l + 1] == b.hmb[l]) {   // (an idle expert's weights are never read)
                             ++l;
@@ -815,11 +830,15 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
                         }
                         int m = l + 1;
                         while (m < eb && b.hmb[m + 1] != b.hmb[m] && home[m] == home[m - 1] + 1) ++m;
-                        HY_CK(cudaMemcpyAsync(b.stage + (size_t) (l - ea) * st, host + (size_t) home[l] * st,
-                                              (size_t) (m - l) * st, cudaMemcpyHostToDevice, b.st));
+                        HY_CK(cudaMemcpyAsync(stage + (size_t) (l - ea) * st, host + (size_t) home[l] * st,
+                                              (size_t) (m - l) * st, cudaMemcpyHostToDevice, cs));
                         l = m;
                     }
-                    wg = b.stage;
+                    if (b.copy_st) {
+                        HY_CK(cudaEventRecord(b.copy_done[staged], cs));
+                        HY_CK(cudaStreamWaitEvent(b.st, b.copy_done[staged]));
+                    }
+                    wg = stage;
                 }
                 wdn = wg + (cold ? ol->cgu_bytes : ol->gu_bytes);
             }
@@ -848,6 +867,7 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
             p.dst = b.dn;
             p.ld_dst = latent;
             b.mmq->run(p, b.st);
+            if (staged >= 0 && b.copy_st) HY_CK(cudaEventRecord(b.use_done[staged], b.st));
         }
         kb_moe_combine<<<dim3(nb(latent), T), 256, 0, b.st>>>(b.dn, latent, b.row_of, b.ew, K, b.moe, latent, ra, rb, !first);
         first = false;

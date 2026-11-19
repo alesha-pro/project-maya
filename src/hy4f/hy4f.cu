@@ -180,6 +180,7 @@ struct Shard {
           *sh = nullptr, *ffn = nullptr, *ga16 = nullptr, *up16 = nullptr, *dn16 = nullptr;
     int *eids = nullptr, *eloc = nullptr, *evirt = nullptr;
     std::map<int, OffLayer> off;
+    std::vector<int> off_pending;   // MoE layers whose experts load after everything else (the auto budget)
     unsigned* rstat = nullptr;                 // HY4F_ROUTE_STATS: decode picks [layer][local expert]
     std::vector<uint64_t> pf_rows, pf_touch;   // ... and the prefill's rows / chunks that touched the expert
     float *eg_r = nullptr, *eg_kv = nullptr;
@@ -227,6 +228,18 @@ struct Model::Impl {
     std::vector<std::map<int, int>> off_hot;     // ... of them in the hybrid's hot tier
     bool hybrid = false;                         // HY4F_HOT_VRAM_MB + HY4F_EXPERT_GGUF: two quantizations of the experts
     size_t hot_budget = 0;
+    // HY4F_EXPERT_VRAM_MB=auto: the budget of a shard is its free VRAM once everything else is loaded, less
+    // HY4F_VRAM_RESERVE_MB (2048: the prefill buffers of a 4096-token chunk, the staging buffers, the decode
+    // buffers and graphs, a margin; a 2048-token chunk needs about 500 less)
+    bool off_auto = false, off_profile = false;
+    std::map<int, std::vector<double>> profile_seed;   // the decode picks HY4F_EXPERT_PROFILE gave [layer][GGUF expert]
+    size_t off_reserve = 0;
+    struct OffItem {
+        double p;
+        int il, l;
+    };
+    std::vector<std::vector<OffItem>> off_items;   // [shard]: its experts by heat
+    std::map<int, size_t> off_stride, off_cstride;
     std::map<std::string, std::pair<const strata::GgufFile*, const strata::TensorInfo*>> cold_tensors;
     uint64_t st_hot = 0;
     std::string route_stats;
@@ -745,7 +758,10 @@ struct Model::Impl {
         }
         if (std::getenv("HY4F_PACK_Q3")) throw std::runtime_error("hy4f: HY4F_PACK_Q3 does not combine with the expert offload");
         offload = true;
-        off_budget = (size_t) std::atoll(mb) << 20;
+        off_auto = !std::strcmp(mb, "auto");
+        off_budget = off_auto ? 0 : (size_t) std::atoll(mb) << 20;
+        const char* rs = std::getenv("HY4F_VRAM_RESERVE_MB");
+        off_reserve = (size_t) (rs ? std::atoll(rs) : 2048) << 20;
         hybrid = !cold_tensors.empty();
         if (hybrid) hot_budget = (size_t) std::atoll(std::getenv("HY4F_HOT_VRAM_MB")) << 20;
         const char* sm = std::getenv("HY4F_OFFLOAD_STAGE_MB");
@@ -775,12 +791,13 @@ struct Model::Impl {
                 }
             std::fclose(f);
         }
-        struct Item {
-            double p;
-            int il, l;
-        };
-        std::vector<std::vector<Item>> items(S);
-        std::map<int, size_t> stride, cstride;
+        using Item = OffItem;
+        off_items.assign(S, {});
+        auto& items = off_items;
+        auto& stride = off_stride;
+        auto& cstride = off_cstride;
+        off_profile = !heat.empty();
+        profile_seed = heat;
         off_res.assign(S, {});
         off_hot.assign(S, {});
         for (int il = dense_lead; il < last; ++il) {
@@ -812,49 +829,57 @@ struct Model::Impl {
             std::stable_sort(items[g].begin(), items[g].end(), [](const Item& a, const Item& b) {
                 return a.p != b.p ? a.p > b.p : a.l != b.l ? a.l < b.l : a.il < b.il;
             });
-            size_t used = 0;
-            std::map<int, bool> closed_hot, closed;
-            double hit = 0, hot = 0, all = 0;
-            int kept = 0, kept_hot = 0;
-            if (hybrid)
-                for (const Item& it : items[g]) {
-                    if (!hybrid_layer(it.il) || closed_hot[it.il]) continue;
-                    if (used + stride[it.il] + 4096 > std::min(hot_budget, off_budget)) {
-                        closed_hot[it.il] = true;
-                        continue;
-                    }
-                    used += stride[it.il];
-                    ++off_hot[g][it.il];
-                    ++off_res[g][it.il];
-                    ++kept_hot;
-                    hot += it.p;
-                }
-            const size_t hot_used = used;
-            for (const Item& it : items[g]) {
-                if (it.il < L) all += it.p;
-                const bool hyb = hybrid_layer(it.il);
-                if ((hyb && it.l < off_hot[g][it.il]) || closed[it.il]) continue;
-                const size_t cost = hyb ? cstride[it.il] : stride[it.il];
-                if (used + cost + 4096 > off_budget) {
-                    closed[it.il] = true;
+            if (!off_auto) plan_residency(g, off_budget);
+        }
+    }
+
+    // shard g's VRAM residents within `budget` bytes: the hybrid's hot tier first, then the next hottest experts
+    void plan_residency(int g, size_t budget) {
+        const auto& items = off_items[g];
+        auto& stride = off_stride;
+        auto& cstride = off_cstride;
+        size_t used = 0;
+        std::map<int, bool> closed_hot, closed;
+        double hit = 0, hot = 0, all = 0;
+        int kept = 0, kept_hot = 0;
+        if (hybrid)
+            for (const OffItem& it : items) {
+                if (!hybrid_layer(it.il) || closed_hot[it.il]) continue;
+                if (used + stride[it.il] + 4096 > std::min(hot_budget, budget)) {
+                    closed_hot[it.il] = true;
                     continue;
                 }
-                used += cost;
+                used += stride[it.il];
+                ++off_hot[g][it.il];
                 ++off_res[g][it.il];
-                ++kept;
-                if (it.il < L) hit += it.p;
+                ++kept_hot;
+                hot += it.p;
             }
-            if (o.verbose) {
-                if (hybrid)
-                    std::fprintf(stderr, "hy4f: offload: shard %d keeps %d hot (%.2f GiB) + %d cold (%.2f GiB) of %zu experts in VRAM, "
-                                         "expected picks hot %.3f, in VRAM %.3f%s\n",
-                                 g, kept_hot, hot_used / 1073741824.0, kept, (used - hot_used) / 1073741824.0, items[g].size(),
-                                 all > 0 ? hot / all : 0.0, all > 0 ? (hot + hit) / all : 0.0, heat.empty() ? " (no profile)" : "");
-                else
-                    std::fprintf(stderr, "hy4f: offload: shard %d keeps %d of %zu experts in VRAM (%.2f GiB), expected hits %.3f%s\n",
-                                 g, kept, items[g].size(), used / 1073741824.0, all > 0 ? hit / all : 0.0,
-                                 heat.empty() ? " (no profile)" : "");
+        const size_t hot_used = used;
+        for (const OffItem& it : items) {
+            if (it.il < L) all += it.p;
+            const bool hyb = hybrid_layer(it.il);
+            if ((hyb && it.l < off_hot[g][it.il]) || closed[it.il]) continue;
+            const size_t cost = hyb ? cstride[it.il] : stride[it.il];
+            if (used + cost + 4096 > budget) {
+                closed[it.il] = true;
+                continue;
             }
+            used += cost;
+            ++off_res[g][it.il];
+            ++kept;
+            if (it.il < L) hit += it.p;
+        }
+        if (o.verbose) {
+            if (hybrid)
+                std::fprintf(stderr, "hy4f: offload: shard %d keeps %d hot (%.2f GiB) + %d cold (%.2f GiB) of %zu experts in VRAM, "
+                                     "expected picks hot %.3f, in VRAM %.3f%s\n",
+                             g, kept_hot, hot_used / 1073741824.0, kept, (used - hot_used) / 1073741824.0, items.size(),
+                             all > 0 ? hot / all : 0.0, all > 0 ? (hot + hit) / all : 0.0, !off_profile ? " (no profile)" : "");
+            else
+                std::fprintf(stderr, "hy4f: offload: shard %d keeps %d of %zu experts in VRAM (%.2f GiB), expected hits %.3f%s\n",
+                             g, kept, items.size(), used / 1073741824.0, all > 0 ? hit / all : 0.0,
+                             !off_profile ? " (no profile)" : "");
         }
     }
 
@@ -1170,6 +1195,12 @@ struct Model::Impl {
                          (unsigned long long) st_picks, st_picks ? (double) st_hits / st_picks : 0.0,
                          st_picks ? (double) st_hot / st_picks : 0.0, (unsigned long long) st_pf,
                          st_pf ? (double) st_pf_hit / st_pf : 0.0, (unsigned long long) st_swaps, st_swap_s);
+        if (offload && o.verbose)
+            for (auto& s : sh) {
+                size_t fr = 0, tot = 0;
+                if (cudaSetDevice(s.dev) == cudaSuccess && cudaMemGetInfo(&fr, &tot) == cudaSuccess)
+                    std::fprintf(stderr, "hy4f: GPU %d free %.2f GiB at exit\n", s.dev, fr / 1073741824.0);
+            }
         for (const auto& ln : lanes)
             std::fprintf(stderr, "hy4f: CPU lane %d: %llu requests, %llu expert groups, %llu slots, %.2f s busy (%.3f ms a request)\n",
                          ln->g, (unsigned long long) ln->n_req, (unsigned long long) ln->n_groups,
@@ -1180,7 +1211,11 @@ struct Model::Impl {
         for (int il = dense_lead; il < last; ++il)
             for (int e = 0; e < n_exp; ++e) {
                 const size_t k = (size_t) il * n_exp + e;
-                if (cum_dec[k]) std::fprintf(f, "D %d %d %llu\n", il, e, (unsigned long long) cum_dec[k]);
+                // (half of the profile this run started from stays in: one file as HY4F_EXPERT_PROFILE and
+                // HY4F_ROUTE_STATS carries the routing history over restarts, the older runs fading)
+                const auto seed = profile_seed.find(il);
+                const unsigned long long d = cum_dec[k] + (seed == profile_seed.end() ? 0ull : (unsigned long long) (0.5 * seed->second[e]));
+                if (d) std::fprintf(f, "D %d %d %llu\n", il, e, d);
                 if (cum_rows[k]) std::fprintf(f, "P %d %d %llu\n", il, e, (unsigned long long) cum_rows[k]);
                 if (cum_touch[k]) std::fprintf(f, "T %d %d %llu\n", il, e, (unsigned long long) cum_touch[k]);
             }
@@ -1268,7 +1303,7 @@ struct Model::Impl {
                 up_full(s, P + "ffn_routed_up.weight");
                 const auto& ownership = expert_bounds(il);
                 const int64_t e0 = ownership[g], e1 = ownership[g + 1];
-                if (offload) load_offload_experts(s, il, P);
+                if (offload) s.off_pending.push_back(il);
                 else {   // gate | up of each expert as one [2 n_ff, latent] matrix (MMQ run_glu's layout; one decode launch)
                     const strata::GgufFile *fg = nullptr, *fu = nullptr;
                     const strata::TensorInfo* tg = T(P + "ffn_gate_exps.weight", &fg);
@@ -1416,6 +1451,19 @@ struct Model::Impl {
         HY_CK(cudaMemset(s.ar_ctr, 0, sizeof(int)));
         HY_CK(cudaMalloc(&s.cb_ctr, sizeof(int)));
         HY_CK(cudaMemset(s.cb_ctr, 0, sizeof(int)));
+        if (offload) {   // the experts last: the auto budget is what the rest left free
+            if (off_auto) {
+                size_t fr = 0, tot = 0;
+                HY_CK(cudaMemGetInfo(&fr, &tot));
+                const size_t budget = fr > off_reserve ? fr - off_reserve : 0;
+                if (o.verbose)
+                    std::fprintf(stderr, "hy4f: offload: shard %d free %.2f GiB, expert budget %zu MiB\n", g, fr / 1073741824.0,
+                                 budget >> 20);
+                plan_residency(g, budget);
+            }
+            for (int il : s.off_pending) load_offload_experts(s, il, "blk." + std::to_string(il) + ".");
+            s.off_pending.clear();
+        }
     }
 
     void gemv(Shard& s, const DW& w, size_t off, const float* x, float* y, int n_in, int n_out) {
