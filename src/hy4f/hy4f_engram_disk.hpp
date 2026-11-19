@@ -43,6 +43,7 @@ class EngramDisk {
     uint64_t offset_, rows_;
     unsigned cols_;
     std::array<Lane,2> lanes_;
+    int64_t* host_index_ = nullptr;
     int64_t* index_ = nullptr;
     std::vector<int64_t> keys_;
     std::vector<std::array<uint8_t,Width>> cache_;
@@ -145,11 +146,10 @@ class EngramDisk {
     void release() noexcept {
         if (device_>=0) cudaSetDevice(device_);
         for (auto& l:lanes_) {
-            if (l.device) cudaFree(l.device);
             if (l.ids) cudaFreeHost(l.ids);
             if (l.packed) cudaFreeHost(l.packed);
         }
-        if (index_) cudaFree(index_);
+        if (host_index_) cudaFreeHost(host_index_);
         if (ctx_) syscall(SYS_io_destroy,ctx_);
         std::free(io_);
         if (fd_>=0) close(fd_);
@@ -167,17 +167,19 @@ public:
             ck(cudaSetDevice(dev)); device_=dev;
             const size_t cap=Batch*cols;
             missing_.reserve(cap);
-            std::vector<int64_t> seq(cap); std::iota(seq.begin(),seq.end(),int64_t(0));
-            ck(cudaMalloc(&index_,cap*sizeof(int64_t)));
-            ck(cudaMemcpy(index_,seq.data(),cap*sizeof(int64_t),cudaMemcpyHostToDevice));
+            // The resident path also lets CUDA read host rows. Mapped staging avoids
+            // shifting the GPU workspace addresses used to place the expert cache.
+            ck(cudaHostAlloc(&host_index_,cap*sizeof(int64_t),cudaHostAllocMapped));
+            std::iota(host_index_,host_index_+cap,int64_t(0));
+            ck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&index_),host_index_,0));
             for (unsigned i=0;i<lanes_.size();++i) {
                 auto& l=lanes_[i];
                 const unsigned limit=i?8:Batch;
                 const size_t maxrows=limit*cols;
                 ck(cudaMallocHost(&l.ids,maxrows*sizeof(int64_t)));
-                ck(cudaMallocHost(&l.packed,maxrows*Width));
+                ck(cudaHostAlloc(&l.packed,maxrows*Width,cudaHostAllocMapped));
                 std::memset(l.packed,0,maxrows*Width);
-                ck(cudaMalloc(&l.device,maxrows*Width));
+                ck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&l.device),l.packed,0));
                 for (unsigned t=0;t<=limit;++t) l.calls.push_back({this,i,t});
             }
         } catch (...) { release(); throw; }
@@ -198,7 +200,6 @@ public:
         if (t>=l.calls.size()) throw std::runtime_error("Engram chunk exceeds lane capacity");
         ck(cudaMemcpyAsync(l.ids,ids,t*cols_*sizeof(int64_t),cudaMemcpyDeviceToHost,st));
         ck(cudaLaunchHostFunc(st,callback,&l.calls[t]));
-        ck(cudaMemcpyAsync(l.device,l.packed,t*cols_*Width,cudaMemcpyHostToDevice,st));
         return l.device;
     }
 };
