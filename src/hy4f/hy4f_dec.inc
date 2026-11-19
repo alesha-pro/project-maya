@@ -372,7 +372,7 @@ HcNext hc_next(Shard& s, const std::string& P, const std::string& k, const std::
     n.mag = mag;
     return n;
 }
-bool fuse_ok() const { return E == 3072 && hc <= 4 && !std::getenv("HY4F_NO_FUSE"); }
+bool fuse_ok() const { return E == 3072 && hc <= 4 && !std::getenv("HY4F_NO_FUSE") && !abl_k; }
 void d_hc_prepare(Shard& s, DShard& d, const HcNext& nx, int T) {
     HY_CK(cudaEventRecord(d.hc_fork,s.st));
     HY_CK(cudaStreamWaitEvent(d.hc_side,d.hc_fork));
@@ -1192,7 +1192,8 @@ void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_
                 if (eg_layers[e] == il + 1) d_engram_fork(s, d, (int)e, il + 1, pp, T);
         }
         auto* foreign=full?full_layer_mirror(s,il):nullptr;
-        d_attention(s,d,il,pp,T,false,ready,dense_dsa,nullptr,sparse_dsa || foreign,early_inputs,foreign);
+        if (abl_k) abl_apply(s, d.X, T, il, s.st);   // (fuse_ok is off: the stream is whole here)
+        d_attention(s,d,il,pp,T,false,ready,dense_dsa,nullptr,sparse_dsa || foreign,early_inputs && !abl_k,foreign);
         HcNext nx;
         const HcNext* nxp = nullptr;
         if (fuse && il + 1 < L && !has_engram(il + 1)) {
@@ -1206,6 +1207,7 @@ void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_
         d_ffn(s, d, il, T, false, fuse, nxp);
         ready = nxp != nullptr;
     }
+    if (abl_k) abl_apply(s, d.X, T, L, s.st);
     if (!ready) d_norm_in(s, d, "", "output_hc", "output_norm.weight", hc, 0.0f, T);
     HY_CK(cudaMemcpyAsync(d.h, d.x, sizeof(float) * T * E, cudaMemcpyDeviceToDevice, s.st));
     if (!separate_target_head()) verify_head_ops(s,d,T,FullHead);

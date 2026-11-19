@@ -71,7 +71,7 @@ struct BShard {
 };
 std::vector<BShard> bsh;
 int score_tile = 64;
-const bool fuse_hc = std::getenv("HY4F_PF_HC_FUSE") != nullptr;
+const bool fuse_hc = std::getenv("HY4F_PF_HC_FUSE") != nullptr && !std::getenv("HY4F_ABLATE");   // (the projection needs the whole stream)
 bool mtp_kv_only = std::getenv("HY4F_PF_MTP_KV_ONLY") != nullptr;
 const bool fuse_pack_add = std::getenv("HY4F_PF_PACK_ADD") != nullptr;
 int dma_mask = std::getenv("HY4F_PF_DMA") ? std::atoi(std::getenv("HY4F_PF_DMA")) : 0;   // RS=1, AG=2, DSA=4, residual=8
@@ -552,6 +552,13 @@ void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int
 // the residual entering trunk layer il (hc_attn) or leaving the last one (output_hc), last row of the call
 void b_norm_in(Shard& s, BShard& b, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
                float mag, int T, size_t t0 = 0) {
+    if (abl_k && !b.mtp && T > 0 && (k == "hc_attn" || k == "output_hc")) {
+        if (b.pending_ag) {   // (a fused update still owed to the stream: write it first, as b_engram does)
+            kb_ag_residual<<<dim3(nb(E / 4), (int) t0 + T, hc), 256, 0, b.st>>>(b.pending_ag, b.X, b.post, E, hc);
+            b.pending_ag = nullptr;
+        }
+        abl_apply(s, b.X + t0 * hc * E, T, k == "hc_attn" ? std::atoi(P.c_str() + 4) : L, b.st);
+    }
     b_norm_in_(s, b, P, k, norm, n_mix, mag, T, t0);
     if (!b.rcap || b.mtp || T <= 0) return;
     const int il = k == "hc_attn" ? std::atoi(P.c_str() + 4) : k == "output_hc" ? L : -1;

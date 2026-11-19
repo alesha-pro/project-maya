@@ -94,6 +94,18 @@ __global__ void kb_engram_mix(float* X, float* R, const float* kv, const float* 
         __syncthreads();
     }
 }
+// HY4F_ABLATE: x_s -= scale * sum_j (x_s . v_sj) v_sj for the k orthonormal rows v_s of stream s; grid (rows, hc)
+__global__ void kb_ablate(float* X, const float* V, int k, int E, int hc, float scale) {
+    float* x = X + ((size_t) blockIdx.x * hc + blockIdx.y) * E;
+    const float* v = V + (size_t) blockIdx.y * k * E;
+    for (int j = 0; j < k; ++j, v += E) {
+        float d = 0.0f;
+        for (int i = threadIdx.x; i < E; i += blockDim.x) d += x[i] * v[i];
+        d = block_sum(d) * scale;
+        for (int i = threadIdx.x; i < E; i += blockDim.x) x[i] -= d * v[i];
+        __syncthreads();
+    }
+}
 // embedding rows (an image) over the chunk's token rows [t0, t0 + n): X[t][s] = row for every hc stream, the history
 // entry -1 (an embedding has no token id: the Engram n-gram of later tokens sees the pad there) and the Engram mask
 __global__ void kb_embed_rows(const float* rows, int t0, const int* pos0p, float* X, int E, int hc, int* hist, int* mask) {

@@ -254,6 +254,34 @@ struct Model::Impl {
     // HY4F_EXPERT_ADAPT: the VRAM set follows the routing - a cold resident and a hot host expert trade places
     bool scratch_cache = false, scratch_active = false;
     const bool adapt_scratch = std::getenv("HY4F_SINGLE_ADAPT_WORKSPACE") != nullptr;
+    const char* abl_env = std::getenv("HY4F_ABLATE");    // refusal directions projected out per layer (abl_setup)
+    float abl_scale = std::getenv("HY4F_ABLATE_SCALE") ? (float) std::atof(std::getenv("HY4F_ABLATE_SCALE")) : 1.0f;
+    int abl_k = 0;
+    std::vector<float*> abl_dev;   // per shard: [points][hc][k][E]
+    void abl_setup() {
+        if (!abl_env || !*abl_env) return;
+        FILE* f = std::fopen(abl_env, "rb");
+        if (!f) throw std::runtime_error(std::string("hy4f: HY4F_ABLATE: cannot open ") + abl_env);
+        int32_t h[4] = {0, 0, 0, 0};
+        const bool ok = std::fread(h, sizeof(h), 1, f) == 1 && h[0] == L + 1 && h[1] == hc && h[2] > 0 && h[2] <= 64 && h[3] == E;
+        std::vector<float> v(ok ? (size_t) h[0] * h[1] * h[2] * h[3] : 0);
+        const bool full = ok && std::fread(v.data(), sizeof(float), v.size(), f) == v.size();
+        std::fclose(f);
+        if (!full) throw std::runtime_error("hy4f: HY4F_ABLATE: wrong header or size (layers + 1, hc, k, E)");
+        abl_k = h[2];
+        abl_dev.assign(sh.size(), nullptr);
+        for (auto& s : sh) {
+            HY_CK(cudaSetDevice(s.dev));
+            HY_CK(cudaMalloc(&abl_dev[s.g], v.size() * sizeof(float)));
+            HY_CK(cudaMemcpy(abl_dev[s.g], v.data(), v.size() * sizeof(float), cudaMemcpyHostToDevice));
+        }
+        std::fprintf(stderr, "hy4f: refusal directions projected out: %d per stream at %d points, scale %.2f (%s)\n", abl_k, L + 1,
+                     abl_scale, abl_env);
+    }
+    void abl_apply(Shard& s, float* X, int rows, int point, cudaStream_t st) {
+        if (!abl_k || rows <= 0) return;
+        kb_ablate<<<dim3(rows, hc), 256, 0, st>>>(X, abl_dev[s.g] + (size_t) point * hc * abl_k * E, abl_k, E, hc, abl_scale);
+    }
     const char* cap_env = std::getenv("HY4F_RESID_DUMP");   // residual capture for refusal directions (b_norm_in)
     float* cap_host = nullptr;
     bool adapt = false;
@@ -1958,6 +1986,7 @@ bool Model::load(const Options& o, std::string& err) {
             HY_CK(cudaDeviceSynchronize());
         }
         d.lane_start();
+        d.abl_setup();
         if (d.graphs && std::getenv("HY4F_OLD_DECODE")) d.capture();
         if (d.graphs) d.dec_setup();
         if (o.verbose)
