@@ -48,6 +48,7 @@ struct Lane {
     }
     bool prefetch = true;
     bool parallel_quant = false;
+    unsigned ticket_rows = 0;
     void run(const Task& t) {
         namespace kc = strata::kernels::cpu;
         const int gi = t.group;
@@ -66,6 +67,19 @@ struct Lane {
         }
     }
     void drain() {
+        if (ticket_rows) {
+            unsigned completed = 0;
+            for (;;) {
+                const uint64_t t = ticket.fetch_add(ticket_rows, std::memory_order_acq_rel);
+                const unsigned first = uint32_t(t), end = uint32_t(t >> 32);
+                if (first >= end) break;
+                const unsigned stop = std::min(end, first + ticket_rows);
+                for (unsigned i = first; i < stop; ++i) run(tasks[i]);
+                completed += stop - first;
+            }
+            if (completed) left.fetch_sub((int)completed, std::memory_order_acq_rel);
+            return;
+        }
         for (;;) {
             const uint64_t t = ticket.fetch_add(1, std::memory_order_acq_rel);
             const uint32_t i = (uint32_t) t, n = (uint32_t) (t >> 32);
@@ -203,6 +217,8 @@ void lane_start() {
         Lane* p = ln.get();
         if (const char* pf = std::getenv("HY4F_LANE_PREFETCH")) p->prefetch = std::atoi(pf) != 0;
         p->parallel_quant = S == 1 && std::getenv("HY4F_SINGLE_PAR_QUANT");
+        if (const char* batch = std::getenv("HY4F_SINGLE_LANE_BATCH"); S==1 && batch)
+            p->ticket_rows = (unsigned)std::clamp(std::atoi(batch),0,8);
         p->boss = std::thread([p] { p->boss_loop(); });
         for (int i = 1; i < per; ++i) p->crew.emplace_back([p] { p->crew_loop(); });
         // HY4F_LANE_PIN=1: one online CPU a thread, from CPU 1 up (the first hardware thread of each core comes first

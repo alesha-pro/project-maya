@@ -108,8 +108,9 @@ struct Bump {
     }
 };
 
-// The packed decode index occupies a prefix of the arena. The tail and trunk
-// residual rows are free between calls, including when a prefix is restored.
+// The packed decode index occupies a prefix of the arena. The tail and single-shard
+// work buffers between xq and ones are written from scratch by the next prefill.
+// Keep iota, ones, the last hidden state, and packed index keys intact.
 void release_decode_scratch() {
     if (!scratch_active) return;
     if (adapt) harvest_routes();
@@ -134,9 +135,9 @@ void populate_decode_scratch() {
     }
     index_bytes = std::min(index_bytes, b.arena_bytes);
     struct Region { uintptr_t next, end; };
-    const uintptr_t hidden = reinterpret_cast<uintptr_t>(b.X);
+    const uintptr_t scratch = reinterpret_cast<uintptr_t>(b.xq);
     const uintptr_t arena = reinterpret_cast<uintptr_t>(b.arena_base);
-    Region regions[] = {{hidden, hidden + size_t(b.Tmax)*hc*E*sizeof(float)},
+    Region regions[] = {{scratch, reinterpret_cast<uintptr_t>(b.ones)},
                         {arena + index_bytes, arena + b.arena_bytes}};
     std::vector<OffItem> picks;
     for (auto& [il, layer] : s.off)
