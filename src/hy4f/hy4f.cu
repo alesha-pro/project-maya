@@ -1221,7 +1221,7 @@ bool Model::warm_full_verify(std::string& err) {
     try {
         Impl& d=*d_;
         if (!d.graphs || !d.ensure_full_storage()) return true;
-        for (int T=1; T<=DT; ++T) d.capture_full_verify(T);
+        for (int T=1; T<=Impl::DT; ++T) d.capture_full_verify(T);
         return true;
     } catch (const std::exception& e) {
         err=e.what();
