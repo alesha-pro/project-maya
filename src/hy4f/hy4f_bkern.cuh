@@ -597,6 +597,32 @@ __global__ void kb_moe_combine(const float* D, int ldd, const int* row_of, const
         moe[(size_t) t * n + i] = s;
     }
 }
+// Reuse one ballot across four adjacent output columns per lane. Iterating
+// its set bits preserves the source slot order and the FP32 FMA sequence.
+__global__ void kb_combine_routed4(const float4* d, const int* row_of, const float* weights,
+                                   int k, float4* moe, int width, int lo, int hi, bool accumulate) {
+    const int t=blockIdx.y, lane=threadIdx.x & 31;
+    const int row=lane<k ? row_of[t*k+lane] : -1;
+    const float weight=lane<k ? weights[t*k+lane] : 0.f;
+    unsigned active=__ballot_sync(0xffffffffu,row>=lo && row<hi);
+    if (accumulate && !active) return;
+    const int c=blockIdx.x*blockDim.x+threadIdx.x;
+    const size_t dst=size_t(t)*width+c;
+    float4 sum=accumulate && c<width ? moe[dst] : make_float4(0,0,0,0);
+    while (active) {
+        const int slot=__ffs(active)-1;
+        const int r=__shfl_sync(0xffffffffu,row,slot)-lo;
+        const float w=__shfl_sync(0xffffffffu,weight,slot);
+        if (c<width) {
+            const float4 v=d[size_t(r)*width+c];
+            sum.x=fmaf(w,v.x,sum.x); sum.y=fmaf(w,v.y,sum.y);
+            sum.z=fmaf(w,v.z,sum.z); sum.w=fmaf(w,v.w,sum.w);
+        }
+        active&=active-1;
+    }
+    if (c<width) moe[dst]=sum;
+}
+
 // SwiGLU of rows [gate | up] (ld) -> h [rows][n_ff], no clamp (dense / shared expert)
 __global__ void kb_swiglu_rows(const float* gu, int ld, int n_ff, int rows, float* h) {
     const int r = blockIdx.y;

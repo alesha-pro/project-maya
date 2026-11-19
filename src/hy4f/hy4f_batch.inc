@@ -548,6 +548,12 @@ void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int
 
 void b_norm_in(Shard& s, BShard& b, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
                float mag, int T, size_t t0 = 0) {
+    if (S==1 && hc==4 && E==3072 && HC_SPLIT==16 && n_mix<=8 && std::getenv("HY4F_SINGLE_COMBINE")) {
+        kb_hc_norm_fused<false><<<T,1024,0,b.st>>>(b.X+t0*hc*E,nullptr,nullptr,
+            f32(s,P+k+"_fn.weight"),f32(s,P+k+"_scale.weight"),f32(s,P+k+"_base.weight"),
+            f32(s,norm),n_mix,eps,hc_eps,mag,b.x,b.post);
+        return;
+    }
     if (b.pending_ag) {
         float* X = b.X + t0 * hc * E;
         const float* fn = f32(s, P + k + "_fn.weight");
@@ -996,7 +1002,10 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
             b.mmq->run(p, b.st);
             if (staged >= 0 && b.copy_st) HY_CK(cudaEventRecord(b.use_done[staged], b.st));
         }
-        kb_moe_combine<<<dim3(nb(latent), T), 256, 0, b.st>>>(b.dn, latent, b.row_of, b.ew, K, b.moe, latent, ra, rb, !first);
+        if (S==1 && K<=32 && latent%4==0 && std::getenv("HY4F_SINGLE_COMBINE"))
+            kb_combine_routed4<<<dim3(nb(latent/4,128),T),128,0,b.st>>>(reinterpret_cast<const float4*>(b.dn),
+                b.row_of,b.ew,K,reinterpret_cast<float4*>(b.moe),latent/4,ra,rb,!first);
+        else kb_moe_combine<<<dim3(nb(latent), T), 256, 0, b.st>>>(b.dn, latent, b.row_of, b.ew, K, b.moe, latent, ra, rb, !first);
         first = false;
         ea = eb;
     }
