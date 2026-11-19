@@ -235,7 +235,7 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     xm_ld = (size_t) latent + 2 * n_ffx / S;
     const size_t q8a = std::max({strata::prefill::mmq::q8_bytes(b.cap, std::max(latent, n_ffx)),
                                  strata::prefill::mmq::q8_bytes(F, std::max({E, Hmax / S * vh, n_ff / S, 4096})),
-                                 strata::prefill::mmq::q8_bytes(T, std::max(2*E, n_ffx / S)),
+                                 sliced ? strata::prefill::mmq::q8_bytes(T, std::max(2*E, n_ffx / S)) : size_t(0),
                                  strata::prefill::mmq::q8_bytes(F, eg_D * (eg_ngram - 1) * eg_heads)});
     const int ts = (T + S - 1) / S, ncol = (eg_ngram - 1) * eg_heads;
     const int Ha = std::max(Hd, Hs / S), Ho = S > 1 ? Hmax / S : Hmax;
