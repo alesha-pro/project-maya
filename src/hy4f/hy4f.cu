@@ -250,6 +250,7 @@ struct Model::Impl {
     std::string route_stats;
     // HY4F_EXPERT_ADAPT: the VRAM set follows the routing - a cold resident and a hot host expert trade places
     bool scratch_cache = false, scratch_active = false;
+    const bool adapt_scratch = std::getenv("HY4F_SINGLE_ADAPT_WORKSPACE") != nullptr;
     bool adapt = false;
     double adapt_horizon = 1024;                   // tokens after which an old pick weighs 1/e
     double adapt_pf_weight = 0;                    // (a prompt's routing does not predict the answer's: measured)
@@ -1106,7 +1107,10 @@ struct Model::Impl {
                 const int a0 = pass == 0 ? 0 : ol.n_hot, a1 = pass == 0 && ol.hybrid ? ol.n_hot : ol.n_res;
                 res.clear(), host.clear();
                 for (int l = a0; l < a1; ++l) res.push_back(l);
-                for (int l = a1; l < nl; ++l) host.push_back(l);
+                for (int l = a1; l < nl; ++l) {
+                    if (scratch_active && adapt_scratch && ol.scratch_index[l] >= 0) res.push_back(l);
+                    else host.push_back(l);
+                }
                 const int base = g * nl;
                 std::sort(res.begin(), res.end(), [&](int a, int b) { return score[base + a] < score[base + b]; });
                 std::sort(host.begin(), host.end(), [&](int a, int b) { return score[base + a] > score[base + b]; });
@@ -1125,6 +1129,18 @@ struct Model::Impl {
         OffLayer& ol = s.off.at(sw.il);
         auto& perm = off_perm.at(sw.il);
         HY_CK(cudaSetDevice(s.dev));
+        if (scratch_active && sw.hi >= ol.n_res) {
+            // The scratch table is indirect, so replacing one of its records
+            // only changes the lookup. The router and physical host IDs stay in place.
+            const int index = ol.scratch_index[sw.hi];
+            void* dest = reinterpret_cast<void*>(ol.record_base + size_t(index)*ol.stride);
+            HY_CK(cudaMemcpy(dest, ol.host + size_t(ol.home[sw.lo])*ol.stride,ol.stride,cudaMemcpyHostToDevice));
+            ol.scratch_index[sw.hi] = -1;
+            ol.scratch_index[sw.lo] = index;
+            for (int e : {sw.hi,sw.lo})
+                HY_CK(cudaMemcpy(ol.device_scratch_index+e,ol.scratch_index.data()+e,sizeof(int),cudaMemcpyHostToDevice));
+            return;
+        }
         // sw.lo receives the old hot expert. If it also has a scratch slot,
         // keep that slot synchronized before replacing the permanent copy.
         if (scratch_active && ol.scratch_index[sw.lo] >= 0) {
