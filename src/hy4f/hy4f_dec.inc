@@ -68,7 +68,7 @@ struct IoT {   // a multi-token step's inputs (pinned host -> device at the head
 // graph memory on the GPU. A switch can happen when decoding crosses top_k or
 // when a later request reuses a shorter prefix; ordinary steps reuse the same exec.
 struct DecodeGraph {
-    cudaGraph_t shape[3] = {};
+    cudaGraph_t shape[4] = {};
     cudaGraphExec_t exec = nullptr;
     int active = 0;
 
@@ -580,7 +580,7 @@ void d_early_index_inputs(Shard& s, DShard& d, const std::string& P, int il, con
     kd_rms_q81<1><<<T,1024,0,queries>>>(d.qr,q_lora,f32(s,P+"attn_q_a_norm.weight"),
                                           q_lora,eps,nullptr,d.xlq);
     HY_CK(cudaEventRecord(d.projected,queries));
-    kn::native_q8_0_mmvq(qrows+(size_t)qpc*qw.rb,d.xlq,iq,q_lora,niq,T,queries);
+    kn::native_q8_0_mmvq(qrows+(size_t)Hd*(nope+rope)*qw.rb,d.xlq,iq,q_lora,niq,T,queries);
     d_indexer_rope(iq,niq,T,pp,th,queries);
     HY_CK(cudaEventRecord(d.shared_done,queries));
 
@@ -597,18 +597,20 @@ void d_early_index_inputs(Shard& s, DShard& d, const std::string& P, int il, con
     kn::native_q8_0_mmvq(xrows+(size_t)q_lora*xw.rb,d.xq,d.xp,E,xpc,T,s.st);
 }
 
-void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false, bool dense_dsa = false, const int* last_pos = nullptr, bool sparse_dsa = false, bool early_inputs = false) {
+void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false, bool dense_dsa = false, const int* last_pos = nullptr, bool sparse_dsa = false, bool early_inputs = false, uint8_t* foreign = nullptr) {
     const std::string P = "blk." + std::to_string(il) + ".";
     const bool sw = swa[il] != 0;
     const int Hl = sw ? Hs / S : Hd / S, QH = nope + rope;
     const float th = sw ? theta_swa : theta;
     const DW& kb = s.w.at(P + "attn_k_b.weight");
+    const int mirror_base = foreign ? 0 : sparse_base;
+    const int mirror_rows = foreign ? full_stride() : sparse_pitch;
     const bool local_queries = !sw && (dense_dsa || sparse_dsa) && !s.prefix_kv.empty() && kb.type == T_Q8_0 &&
                                std::getenv("HY4F_LOCAL_QUERY");
     const int query_first = local_queries ? s.g * Hl : 0;
     const int Ha = (sw || local_queries) ? Hl : Hd;
     const int xrows=rows_of(s,P+"xproj"), qrows=rows_of(s,P+"qproj");
-    const bool early=early_inputs && !sw && !mtp && !dense_dsa && !sparse_dsa && !last_pos &&
+    const bool early=early_inputs && !sw && !mtp && !dense_dsa && (!sparse_dsa || foreign) && !last_pos &&
         (T==2 || T==3) && d.side && d.attention_side && fuse_rms_q81 && q_lora==1024 &&
         S==4 && E==3072 && Hd==32 && IH==16 && IK==128 && n_used*latent>=q_lora &&
         s.w.at(P+"xproj").type==T_Q8_0 && s.w.at(P+"qproj").type==T_Q8_0 &&
@@ -639,7 +641,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     }
     if (!sw && sparse_limit && (dense_dsa || sparse_dsa))
         kb_kv_prep<true,true><<<T,576,0,keys>>>(d.xp+okv,xpc,f32(s,P+"attn_kv_a_norm.weight"),kvl,
-            rope,eps,th,s.kv[il],pp,2,S,s.g,0,s.prefix_kv.at(il),top_k,sparse_base,sparse_pitch,sparse_skip);
+            rope,eps,th,s.kv[il],pp,2,S,s.g,0,s.prefix_kv.at(il),top_k,mirror_base,mirror_rows,foreign ? 0 : sparse_skip,foreign);
     else if (!sw && !s.prefix_kv.empty())
         kb_kv_prep<true><<<T,576,0,keys>>>(d.xp+okv,xpc,f32(s,P+"attn_kv_a_norm.weight"),kvl,
             rope,eps,th,s.kv[il],pp,2,S,s.g,0,s.prefix_kv.at(il),top_k);
@@ -671,7 +673,8 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     int index_stride = qpc;
     if (early) {
         const DW& q=s.w.at(P+"qproj");
-        kn::native_q8_0_mmvq(q.d,d.xlq,d.qp,q_lora,qpc,T,s.st);
+        const auto* weights=static_cast<const uint8_t*>(q.d)+(size_t)query_first*QH*q.rb;
+        kn::native_q8_0_mmvq(weights,d.xlq,d.qp,q_lora,qpc,T,s.st);
     } else if (!sw && (dense_dsa || (sparse_dsa && local_queries))) {
         const DW& q = s.w.at(P + "qproj");
         const auto* weights=static_cast<const uint8_t*>(q.d)+(size_t)query_first*QH*q.rb;
@@ -730,7 +733,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     if (sw) {
         if (split && Hl == 16) {
             (value_groups==4 ? kd_mqa_dec<16,false,4> : kd_mqa_dec<16>)<<<dim3(NSP*value_groups, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
-                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh, false, 0, 0, nullptr, 0);
+                                                                       win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh, false, 0, 0, nullptr, 0, nullptr);
             if (std::getenv("HY4F_MQA_FOLD"))
                 kd_mqa_fold<false><<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hl,
                     f32(s,P+"attn_sinks.weight")+s.g*Hl,d.o,nullptr,0,d.cb,s.g,S,nullptr);
@@ -750,7 +753,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
             if (sparse_dsa)
                 kd_mqa_dec<16,false,1,true><<<dim3(NSP,T,4),256,mqd_smem<16>(),s.st>>>(
                     d.qabs,d.qp,qpc,QH,nope,th,s.kv[il],d.cells,n_cap,pp,win,S,s.g,
-                    scale,d.spm,d.spl,d.spacc,top_k,top_k/kpool-tail,qh,local_queries,sparse_base,sparse_pitch,s.prefix_kv.at(il),sparse_skip);
+                    scale,d.spm,d.spl,d.spacc,top_k,top_k/kpool-tail,qh,local_queries,mirror_base,mirror_rows,s.prefix_kv.at(il),foreign ? 0 : sparse_skip,foreign);
             else
                 kd_mqa_dec<16,true,1,true><<<dim3(NSP,T,4),256,mqd_smem<16>(),s.st>>>(
                     d.qabs,d.qp,qpc,QH,nope,th,s.prefix_kv.at(il),nullptr,0,pp,win,S,s.g,
@@ -762,7 +765,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
             if (split && Hd == 32) {
                 (value_groups==4 ? (dense_dsa ? kd_mqa_dec<32,true,4> : kd_mqa_dec<32,false,4>) : (dense_dsa ? kd_mqa_dec<32, true> : kd_mqa_dec<32>))<<<dim3(NSP*value_groups, T), 256, mqd_smem<32>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], d.cells,
                                                                            n_cap, pp, win, S, s.g, scale, d.spm, d.spl,
-                                                                           d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail, qh, false, 0, 0, nullptr, 0);
+                                                                           d.spacc, direct_dsa && S == 4 && kpool == 4 ? top_k : 0, top_k / kpool - tail, qh, false, 0, 0, nullptr, 0, nullptr);
                 if (contiguous_cb) {
                     kd_mqa_fold<false,true><<<dim3(Hd,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hd,nullptr,nullptr,
                                                                       d.part,CBW(),d.cb,s.g,S,nullptr);
@@ -1032,7 +1035,7 @@ void verify_head_ops(Shard& s,DShard& d,int T,HeadMode mode) {
     HY_CK(cudaMemcpyAsync(hargi + (size_t) s.g * DT, d.argi, sizeof(int) * T, cudaMemcpyDeviceToHost, s.st));
 }
 
-void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_dsa = false, bool early_inputs = false) {
+void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_dsa = false, bool early_inputs = false, bool full = false) {
     HY_CK(cudaMemcpyAsync(d.dio_v, hio_v, sizeof(IoT), cudaMemcpyHostToDevice, s.st));
     const int* pp = &d.dio_v->pos;
     if (dense_dsa) kd_dense_cells<<<dim3(nb(n_cap), T), 256, 0, s.st>>>(pp, n_cap, d.cells);
@@ -1061,7 +1064,8 @@ void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_
             for (size_t e = 0; e < eg_layers.size(); ++e)
                 if (eg_layers[e] == il + 1) d_engram_fork(s, d, (int)e, il + 1, pp, T);
         }
-        d_attention(s, d, il, pp, T, false, ready, dense_dsa, nullptr, sparse_dsa, early_inputs);
+        auto* foreign=full?full_layer_mirror(s,il):nullptr;
+        d_attention(s,d,il,pp,T,false,ready,dense_dsa,nullptr,sparse_dsa || foreign,early_inputs,foreign);
         HcNext nx;
         const HcNext* nxp = nullptr;
         if (fuse && il + 1 < L && !has_engram(il + 1)) {
@@ -1285,7 +1289,15 @@ void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
         certified_mtp_active = ranked || (cert_mtp && narrow);
     }
     const int end = (mtp ? hio_m : hio_v)->pos + T;
-    const int mode = short_graphs && end <= top_k ? 1 : sparse_limit && end <= sparse_limit ? 2 : 0;
+    const int pos = end - T;
+    int mode = short_graphs && end <= top_k ? 1 : sparse_limit && end <= sparse_limit ? 2 : 0;
+    if (!mtp) {
+        truncate_full_mirrors(pos);
+        if (mode == 0 && full_requested && ensure_full_storage()) {
+            restore_full_mirrors(pos);
+            mode = 3;
+        }
+    }
     const bool restore = mode == 2 && !sparse_valid;
     if (sparse_limit) {
         sparse_high = std::max(sparse_high,std::min(end,sparse_limit));
@@ -1309,6 +1321,30 @@ void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
         sparse_valid = true;
     }
     change_q3_layout(true);
+    // Capture every participating device before the first one launches this
+    // topology. Its peer exchanges use the same ordering as the CP graph.
+    if (mode == 3) {
+        for (auto& s : sh) {
+            auto& d = dsh[s.g];
+            auto& graph = d.gv[T];
+            if (graph.shape[3]) continue;
+            HY_CK(cudaSetDevice(s.dev));
+            cudaGraph_t topology = nullptr;
+            HY_CK(cudaStreamBeginCapture(s.st,cudaStreamCaptureModeThreadLocal));
+            kn::native_mmvq_set_multi_exact(T >= 5 && !std::getenv("HY4F_FAST_T56"));
+            try {
+                verify_ops(s,d,T,false,false,std::getenv("HY4F_INDEX_INPUT") && std::getenv("HY4F_INDEX_OVERLAP"),true);
+            } catch (...) {
+                kn::native_mmvq_set_multi_exact(false);
+                cudaStreamEndCapture(s.st,&topology);
+                if (topology) cudaGraphDestroy(topology);
+                throw;
+            }
+            kn::native_mmvq_set_multi_exact(false);
+            HY_CK(cudaStreamEndCapture(s.st,&topology));
+            graph.capture(topology,3,true);
+        }
+    }
     launch_parallel([&](Shard& s) {
         DShard& d = dsh[s.g];
         DecodeGraph& graph = chain ? d.gc : mtp ? d.gm[T] : d.gv[T];
@@ -1343,6 +1379,7 @@ void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
         HY_CK(cudaStreamSynchronize(s.st));
     }
     HY_CK(cudaGetLastError());
+    if (mode == 3) std::fill_n(full_prefix,full_count,end);
 }
 
 #ifdef HY4F_VISION

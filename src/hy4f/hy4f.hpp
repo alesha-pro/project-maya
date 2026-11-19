@@ -64,6 +64,7 @@ public:
     /// Gap between the last greedy MTP token and its runner-up in the already transferred draft logits.
     float draft_margin(int token) const;
     // For unwarped top-k sampling, transfer the best 65 raw scores from each vocabulary shard.
+    void set_partial_prompt_end(int pos);
     bool set_ranked_output(bool enabled);
     void set_greedy_draft_head(bool enabled);
     // On an ambiguous cutoff, copies the full device row to fallback and returns false.

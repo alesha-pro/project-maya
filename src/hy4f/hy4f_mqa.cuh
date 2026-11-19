@@ -305,7 +305,7 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
                                                   int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                   const int* __restrict__ cells, int n_cap, const int* pos0p, int win,
                                                   int n_shards, int shard, float scale, float* __restrict__ pm,
-                                                  float* __restrict__ pl, float* __restrict__ pacc, int top_k = 0, int groups = 0, const __half* packed_q = nullptr, bool local_queries = false, int mirror_base = 0, int mirror_stripe = 0, const uint8_t* prefix = nullptr, int mirror_skip = 0) {
+                                                  float* __restrict__ pl, float* __restrict__ pacc, int top_k = 0, int groups = 0, const __half* packed_q = nullptr, bool local_queries = false, int mirror_base = 0, int mirror_stripe = 0, const uint8_t* prefix = nullptr, int mirror_skip = 0, const uint8_t* foreign = nullptr) {
     using namespace nvcuda;
     constexpr int KVL = 512, ROPE = 64, D = 576, LD = MQA_LD, TR = MQA_TR;
     constexpr int NST = H / 8, KS = Replica ? 2 : 8 / NST, KP = D / KS, OPW = H / (4 * ValueGroups);
@@ -408,9 +408,10 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
                     if constexpr (Replica && !DenseDsa) {
                         const int row = grouped_kv_row(s2,pos,top_k,groups,cells+(size_t)t*n_cap,nullptr);
                         const int base = replica_row_base(logical_shard,shard,mirror_base,mirror_stripe);
+                        const uint8_t* source = foreign && logical_shard != shard ? foreign : kv;
                         if (row < mirror_skip && logical_shard != shard)
                             p = prefix + ((size_t)row*n_shards+logical_shard)*KV_RB;
-                        else p = kv + (size_t)(base+row)*KV_RB;
+                        else p = source + (size_t)(base+row)*KV_RB;
                     } else if constexpr (Replica) p = kv + ((size_t)s2*n_shards+logical_shard)*KV_RB;
                     else if constexpr (DenseDsa) p = kv + (size_t) s2 * KV_RB;
                     else if (top_k > 0) p = kv + (size_t)grouped_kv_row(s2, pos, top_k, groups, cells+(size_t)t*n_cap, nullptr) * KV_RB;

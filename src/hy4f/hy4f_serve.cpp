@@ -591,6 +591,7 @@ int serve(Model& m, const ServeOptions& so) {
             std::fflush(stdout);
             continue;
         }
+        m.set_partial_prompt_end(int(n));
         const double t0 = now_ms();
         std::vector<Pic> pics;
         if (!r.file.empty()) {

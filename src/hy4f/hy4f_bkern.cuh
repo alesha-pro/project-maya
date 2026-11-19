@@ -182,9 +182,9 @@ __global__ void kb_rms(const float* x, int ldx, const float* w, int n, float eps
 }
 // the latent rows of the chunk: RoPE(k_pe) at pos0 + t, RMS * w on c, Q8 into: mode 1 (SWA) the chunk buffer row t,
 // mode 2 (DSA, context parallel) the cache slot when this shard owns the position, mode 3 the ring slot pos % rw.  blockIdx.x = token, 576 threads.
-template<bool CopyPrefix = false, bool Mirror = false>
+template<bool CopyPrefix = false, bool Mirror = false, bool ExtraMirror = false>
 __global__ void kb_kv_prep(const float* kvin, int ld, const float* nw, int kvl, int rope, float eps, float theta,
-                           uint8_t* dst_base, const int* pos0p, int mode, int n_shards, int shard, int rw, uint8_t* prefix = nullptr, int prefix_rows = 0, int mirror_base = 0, int mirror_stripe = 0, int mirror_skip = 0) {
+                           uint8_t* dst_base, const int* pos0p, int mode, int n_shards, int shard, int rw, uint8_t* prefix = nullptr, int prefix_rows = 0, int mirror_base = 0, int mirror_stripe = 0, int mirror_skip = 0, uint8_t* foreign = nullptr, uint8_t* extra = nullptr, int extra_stride = 0) {
     const int pos0 = *pos0p;
     const int t = blockIdx.x, pos = pos0 + t, j = threadIdx.x;
     __shared__ float row[KV_ROW];
@@ -210,7 +210,10 @@ __global__ void kb_kv_prep(const float* kvin, int ld, const float* nw, int kvl, 
         const int source = pos % n_shards;
         if (!Mirror && source != shard && (!CopyPrefix || pos >= prefix_rows)) return;
         slot = pos / n_shards;
-        if constexpr (Mirror) slot += replica_row_base(source, shard, mirror_base, mirror_stripe);
+        if constexpr (Mirror) {
+            slot += replica_row_base(source, shard, mirror_base, mirror_stripe);
+            if (source != shard && foreign) dst_base = foreign;
+        }
     }
     uint8_t* primary = dst_base + (size_t) slot * KV_RB;
     uint8_t* dst = primary;
@@ -225,8 +228,21 @@ __global__ void kb_kv_prep(const float* kvin, int ld, const float* nw, int kvl, 
     __syncthreads();
     const int g = j >> 6;
     const float d = fmaxf(gmax[2 * g], gmax[2 * g + 1]) / 127.0f;
-    if (j < KV_ROW) reinterpret_cast<int8_t*>(dst)[j] = (int8_t) (d > 0.0f ? __float2int_rn(v / d) : 0);
-    if (j < KV_GROUPS) reinterpret_cast<__half*>(dst + KV_ROW)[j] = __float2half(fmaxf(gmax[2 * j], gmax[2 * j + 1]) / 127.0f);
+    uint8_t* second = nullptr;
+    if constexpr (ExtraMirror) {
+        const int owner=pos%n_shards;
+        if (owner!=shard) second=extra+size_t(replica_row_base(owner,shard,0,extra_stride)+pos/n_shards)*KV_RB;
+    }
+    if (j < KV_ROW) {
+        const int8_t q=(int8_t)(d>0.0f ? __float2int_rn(v/d) : 0);
+        reinterpret_cast<int8_t*>(dst)[j]=q;
+        if constexpr (ExtraMirror) if (second) reinterpret_cast<int8_t*>(second)[j]=q;
+    }
+    if (j < KV_GROUPS) {
+        const __half q=__float2half(fmaxf(gmax[2*j],gmax[2*j+1])/127.0f);
+        reinterpret_cast<__half*>(dst+KV_ROW)[j]=q;
+        if constexpr (ExtraMirror) if (second) reinterpret_cast<__half*>(second+KV_ROW)[j]=q;
+    }
     if constexpr (CopyPrefix) {
         if (pos < prefix_rows && ((Mirror && pos / n_shards >= mirror_skip) || pos % n_shards == shard)) {
             __syncthreads();

@@ -118,6 +118,8 @@ struct Shard {
     std::map<std::string, DW> w;
     std::map<int, uint8_t*> kv;       // layer -> Q8 rows (SWA ring / DSA context-parallel slots)
     std::map<int, uint8_t*> prefix_kv;  // dense DSA prefix replicated per device
+    uint8_t* full_store = nullptr;
+    uint8_t* full_mirror[2]{};
     std::map<int, float*> ring;
     std::map<int, __half*> pooled;   // the k-pool keys, F16 (replicated: the score reads every group)
     Io* dio = nullptr;
@@ -201,6 +203,14 @@ struct Model::Impl {
     }
     int sparse_limit = 0, sparse_base = 0, sparse_pitch = 0, sparse_skip = 0, sparse_high = 0;
     bool sparse_valid = true;
+    bool full_ready = false, full_disabled = false;
+    int full_count = 0, full_layers[2]{}, full_prefix[2]{};
+    const int full_requested = [] {
+        const char* opt=std::getenv("HY4F_FULL_DSA_LAYERS");
+        return opt && (std::strcmp(opt,"1")==0 || std::strcmp(opt,"2")==0) ? opt[0]-'0' : 0;
+    }();
+    int full_request_end = -1;
+    bool full_batch_writes = false, full_prefill_warmed = false;
     void setup_sparse_replica() {
         const char* limit = std::getenv("HY4F_SPARSE_REPLICA");
         if (!limit || !replicate_prefix() || !direct_dsa || kpool != 4) return;
@@ -1085,6 +1095,7 @@ struct Model::Impl {
             if (d.rank_final) cudaFree(d.rank_final);
         }
         if (rank_host) cudaFreeHost(rank_host);
+        discard_full_storage();
         for (size_t g = 0; g < bsh.size(); ++g) {
             auto& b = bsh[g];
             cudaSetDevice(sh[g].dev);
@@ -1097,6 +1108,7 @@ struct Model::Impl {
     }
 
 #include "hy4f_batch.inc"
+#include "hy4f_partial.inc"
 #include "hy4f_dec.inc"
 #include "hy4f_dfly.inc"
 
@@ -1218,6 +1230,7 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
             if (end > d.sparse_limit) d.sparse_valid = false;
             d.sparse_high = std::max(d.sparse_high, std::min(end,d.sparse_limit));
         }
+        d.truncate_full_mirrors((int)pos);
         const auto t_start = std::chrono::steady_clock::now();
         d.change_q3_layout(false);
         if (chunk <= 0) chunk = 1024;
@@ -1233,10 +1246,25 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
             d.batch_setup(tmax);
             if (mb) d.mb_setup(tmax);
         }
+        const bool build_full = d.full_requested && !mb && d.sparse_limit
+            && std::max<int64_t>(d.full_request_end, pos+n) > d.sparse_limit;
+        int progressive_end = d.full_ready ? d.full_prefix[0] : 0;
+        d.full_batch_writes = false;
         for (int c0 = 0; c0 < n; c0 += chunk) {
             const int T = std::min(chunk, n - c0);
             const bool last = c0 + T == n;
             const int p0 = (int) (pos + c0);
+            const bool can_fill = build_full && p0 >= progressive_end && p0-progressive_end <= 4096
+                && (d.full_ready || d.full_prefill_warmed || c0 > 0);
+            if (can_fill && c0 > 0 && (!d.full_ready || p0 != progressive_end))
+                d.launch_parallel([&](Shard& s) { HY_CK(cudaStreamSynchronize(s.st)); });
+            if (can_fill && d.ensure_full_storage()) {
+                if (p0 != progressive_end) d.restore_full_mirrors(p0);
+                d.full_batch_writes = true;
+                progressive_end = p0 + T;
+            } else {
+                d.full_batch_writes = false;
+            }
             std::vector<Impl::Span> cs;   // the spans' pieces inside this chunk
             if (spans)
                 for (const EmbdSpan& e : *spans) {
@@ -1270,6 +1298,9 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
             HY_CK(cudaStreamSynchronize(s.st));
         }
         HY_CK(cudaGetLastError());
+        d.full_prefill_warmed = true;
+        if (d.full_batch_writes) std::fill_n(d.full_prefix,d.full_count,progressive_end);
+        d.full_batch_writes = false;
         d.pos_next = pos + n;
         if (d.o.verbose)
             std::fprintf(stderr, "hy4f: prefill %d tokens: %.1f ms (%.1f tok/s, setup excluded)\n", n,
@@ -1366,6 +1397,8 @@ bool Model::mtp_chain(int32_t tok, int64_t mpos, int32_t* draft, std::string& er
     }
 }
 void Model::set_greedy_draft_head(bool enabled) { d_->greedy_draft_head = enabled; }
+void Model::set_partial_prompt_end(int pos) { d_->full_request_end = pos; }
+
 bool Model::set_ranked_output(bool enabled) {
     d_->rank_active=enabled && d_->rank_host;
     return d_->rank_active;
@@ -1524,6 +1557,7 @@ bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
     try {
         Impl& d = *d_;
         if (pos > d.pos_next) throw std::runtime_error("hy4f: step out of order");
+        d.truncate_full_mirrors((int)pos);
         d.packed_index_groups = -1;
         if (pos >= d.o.max_context) throw std::runtime_error("hy4f: context full");
         d.hio->pos = (int) pos;
@@ -1826,6 +1860,7 @@ bool Model::load_host_prefix(int i, int64_t pos, std::string& err) {
         prefix_pos_ = -1;
         if (snap_) snap_->pos = -1;
         d_->pos_next = hw_ = 0;
+        d_->truncate_full_mirrors(0);
         // The host checkpoint contains the canonical rows and short dense
         // prefix. Borrowed sparse stripes belong to the previous branch.
         if (d_->sparse_limit) {
@@ -1963,6 +1998,7 @@ int64_t Model::rewind(int64_t pos, std::string& err, bool restore_prompt, bool* 
         if (pos < prefix_pos_) prefix_pos_=-1;
         if (pos == 0) hw_ = 0;
         d.pos_next = pos;
+        d.truncate_full_mirrors((int)pos);
         if (d.sparse_limit) {
             d.sparse_high = (int)std::min<int64_t>(pos,d.sparse_limit);
             if (pos == 0) d.sparse_valid = true;
