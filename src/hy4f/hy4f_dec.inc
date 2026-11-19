@@ -988,11 +988,12 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         auto execute = [&](cudaStream_t stream, int offset, int* count) {
             const int* experts = d.mg_exp + offset;
             const int* offsets = d.mg_off + offset;
-            auto gu_kernel = gu.type == T_Q3_K ? kn::native_q3_k_mmvq_grouped : kn::native_q4_k_mmvq_grouped;
+            auto q4_kernel = q4_repeated ? kn::native_q4_k_mmvq_grouped_repeated : kn::native_q4_k_mmvq_grouped;
+            auto gu_kernel = gu.type == T_Q3_K ? kn::native_q3_k_mmvq_grouped : q4_kernel;
             gu_kernel(gu.d, gu.rb*gu.ne[1], count, experts, offsets, d.mg_slot, d.xlq, d.ga16,
                       1536, 3072, moe_blocks, stream);
             kd_expert_quant_slots<<<dim3(6,2*T),256,0,stream>>>(d.ga16,clampv,d.q16,count,offsets,d.mg_slot);
-            kn::native_q4_k_mmvq_grouped(down.d,down.rb*down.ne[1],count,experts,offsets,d.mg_slot,
+            q4_kernel(down.d,down.rb*down.ne[1],count,experts,offsets,d.mg_slot,
                                          d.q16,d.dn16,1536,1536,moe_blocks,stream);
         };
         HY_CK(cudaEventRecord(d.attention_fork,s.st));
