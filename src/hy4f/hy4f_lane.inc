@@ -33,7 +33,7 @@ struct Lane {
     std::vector<uint8_t> act, hq;
     std::vector<float> ff;
     uint64_t n_req = 0, n_groups = 0, n_slots = 0;
-    double busy = 0;
+    double busy = 0, t_prep = 0, t_gu = 0, t_qh = 0, t_dn = 0;   // (seconds: a request's stages)
 
     static void idle(clk::time_point last) {
         const auto dt = clk::now() - last;
@@ -101,6 +101,7 @@ struct Lane {
         half = (ol.hybrid ? ol.cgu_bytes : ol.gu_bytes) / 2;
         const uint8_t* host = ol.hybrid ? ol.chost : ol.host;
         const std::vector<int>& home = ol.hybrid ? ol.chome : ol.home;
+        const auto c0 = clk::now();
         bool used[LANE_T] = {};
         for (int gi = 0; gi < ng; ++gi) {
             rec[gi] = host + (size_t) home[mail->gexp[gi]] * st;
@@ -120,14 +121,20 @@ struct Lane {
         phase = 0;
         for (int gi = 0; gi < ng; ++gi)
             for (int r = 0; r < n_ff; r += 128) tasks[n++] = {gi, r, std::min(r + 128, n_ff)};
+        const auto c1 = clk::now();
         run_phase(n);
+        const auto c2 = clk::now();
         for (int gi = 0; gi < ng; ++gi)
             for (int j = 0; j < nt[gi]; ++j) kc::native_quant_h(*fmt, ff_p[gi][j], const_cast<void*>(hq_p[gi][j]));
+        const auto c3 = clk::now();
         n = 0;
         phase = 1;
         for (int gi = 0; gi < ng; ++gi)
             for (int r = 0; r < n_out; r += 256) tasks[n++] = {gi, r, std::min(r + 256, n_out)};
         run_phase(n);
+        const auto c4 = clk::now();
+        const auto sec = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double>(b - a).count(); };
+        t_prep += sec(c0, c1), t_gu += sec(c1, c2), t_qh += sec(c2, c3), t_dn += sec(c3, c4);
         n_groups += ng;
         n_slots += mail->n_slots;
     }
@@ -187,6 +194,25 @@ void lane_start() {
         if (const char* pf = std::getenv("HY4F_LANE_PREFETCH")) p->prefetch = std::atoi(pf) != 0;
         p->boss = std::thread([p] { p->boss_loop(); });
         for (int i = 1; i < per; ++i) p->crew.emplace_back([p] { p->crew_loop(); });
+        // HY4F_LANE_PIN=1: one online CPU a thread, from CPU 1 up (the first hardware thread of each core comes first
+        // in the kernel's numbering here), shard after shard
+        if (const char* pin = std::getenv("HY4F_LANE_PIN"); pin && std::atoi(pin)) {
+            cpu_set_t online;
+            CPU_ZERO(&online);
+            sched_getaffinity(0, sizeof(online), &online);
+            std::vector<int> cpus;
+            for (int c = 1; c < CPU_SETSIZE; ++c)
+                if (CPU_ISSET(c, &online)) cpus.push_back(c);
+            auto bind = [&](std::thread& th, int k) {
+                if (cpus.empty()) return;
+                cpu_set_t one;
+                CPU_ZERO(&one);
+                CPU_SET(cpus[(size_t) k % cpus.size()], &one);
+                pthread_setaffinity_np(th.native_handle(), sizeof(one), &one);
+            };
+            bind(p->boss, g * per);
+            for (int i = 1; i < per; ++i) bind(p->crew[(size_t) i - 1], g * per + i);
+        }
         lanes.push_back(std::move(ln));
     }
     if (o.verbose) std::fprintf(stderr, "hy4f: CPU lane: %d threads a shard\n", per);

@@ -63,6 +63,8 @@
 #include <atomic>
 #include <immintrin.h>
 #include <sys/mman.h>
+#include <pthread.h>
+#include <sched.h>
 #include <memory>
 
 namespace strata::hy4f {
@@ -245,9 +247,9 @@ struct Model::Impl {
     std::string route_stats;
     // HY4F_EXPERT_ADAPT: the VRAM set follows the routing - a cold resident and a hot host expert trade places
     bool adapt = false;
-    double adapt_horizon = 2048;                   // tokens after which an old pick weighs 1/e
+    double adapt_horizon = 1024;                   // tokens after which an old pick weighs 1/e
     double adapt_pf_weight = 0;                    // (a prompt's routing does not predict the answer's: measured)
-    int adapt_every = 16, adapt_step_swaps = 1024, adapt_pf_swaps = 2048, adapt_calls = 0;
+    int adapt_every = 8, adapt_step_swaps = 1024, adapt_pf_swaps = 2048, adapt_calls = 0;
     uint64_t win_picks = 0, win_hits = 0, win_hot = 0;
     std::vector<uint8_t> swap_rows;
     uint8_t* swap_pinned = nullptr;   // one base record on its way into a hot slot
@@ -1204,7 +1206,10 @@ struct Model::Impl {
         for (const auto& ln : lanes)
             std::fprintf(stderr, "hy4f: CPU lane %d: %llu requests, %llu expert groups, %llu slots, %.2f s busy (%.3f ms a request)\n",
                          ln->g, (unsigned long long) ln->n_req, (unsigned long long) ln->n_groups,
-                         (unsigned long long) ln->n_slots, ln->busy, ln->n_req ? 1e3 * ln->busy / ln->n_req : 0.0);
+                         (unsigned long long) ln->n_slots, ln->busy, ln->n_req ? 1e3 * ln->busy / ln->n_req : 0.0),
+            std::fprintf(stderr, "hy4f: CPU lane %d stages, ms a request: prepare %.3f, gate/up %.3f, quantize h %.3f, down %.3f\n", ln->g,
+                         ln->n_req ? 1e3 * ln->t_prep / ln->n_req : 0.0, ln->n_req ? 1e3 * ln->t_gu / ln->n_req : 0.0,
+                         ln->n_req ? 1e3 * ln->t_qh / ln->n_req : 0.0, ln->n_req ? 1e3 * ln->t_dn / ln->n_req : 0.0);
         if (route_stats.empty()) return;
         std::FILE* f = std::fopen(route_stats.c_str(), "w");
         if (!f) return;
