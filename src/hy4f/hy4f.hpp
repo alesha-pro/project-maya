@@ -22,6 +22,8 @@ struct Options {
     std::string dfly;                  // the DFly2 drafter GGUF (scripts/dfly_to_gguf.py); empty: none.  Drops the MTP layer
                                        // (VRAM) unless HY4F_KEEP_MTP
     bool verbose = false;
+    int prefill_chunk = 0;             // the chunk the prompts will come in (0: unknown); an image encoded before the
+                                       // first prefill sizes the batch buffers by it
 };
 
 /// embedding rows (an encoded image) that replace the token embeddings of toks[offset .. offset + n) in prefill();

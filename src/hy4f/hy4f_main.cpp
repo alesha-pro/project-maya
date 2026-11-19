@@ -108,6 +108,7 @@ int main(int argc, char** argv) {
                              "[--chunk N] [--spec-k auto|0..3] [--mmproj F] [--model-name NAME]\n");
         return 2;
     }
+    o.prefill_chunk = serve_mode ? so.chunk : pchunk;
     strata::hy4f::Model m;
     std::string err;
     const auto t0 = std::chrono::steady_clock::now();

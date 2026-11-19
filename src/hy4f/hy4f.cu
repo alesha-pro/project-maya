@@ -251,6 +251,7 @@ struct Model::Impl {
     double adapt_pf_weight = 0;                    // (a prompt's routing does not predict the answer's: measured)
     int adapt_every = 8, adapt_step_swaps = 1024, adapt_pf_swaps = 2048, adapt_calls = 0;
     uint64_t win_picks = 0, win_hits = 0, win_hot = 0;
+    double adapt_margin = 3.0;   // picks a host expert must lead a resident by (a swap costs about as much as ten misses)
     std::vector<uint8_t> swap_rows;
     uint8_t* swap_pinned = nullptr;   // one base record on its way into a hot slot
     size_t swap_pinned_bytes = 0;
@@ -772,6 +773,7 @@ struct Model::Impl {
         if (const char* a = std::getenv("HY4F_ADAPT_HORIZON")) adapt_horizon = std::max(1.0, std::atof(a));
         if (const char* a = std::getenv("HY4F_ADAPT_PF_WEIGHT")) adapt_pf_weight = std::atof(a);
         if (const char* a = std::getenv("HY4F_ADAPT_EVERY")) adapt_every = std::max(1, std::atoi(a));
+        if (const char* a = std::getenv("HY4F_ADAPT_MARGIN")) adapt_margin = std::atof(a);
         if (const char* a = std::getenv("HY4F_ADAPT_STEP_SWAPS")) adapt_step_swaps = std::atoi(a);
         if (const char* a = std::getenv("HY4F_ADAPT_PF_SWAPS")) adapt_pf_swaps = std::atoi(a);
         const int nl = n_exp / S, last = L + (has_mtp ? 1 : 0);
@@ -1096,7 +1098,7 @@ struct Model::Impl {
                 std::sort(host.begin(), host.end(), [&](int a, int b) { return score[base + a] > score[base + b]; });
                 const bool hot_tier = pass == 0 && ol.hybrid;   // (a quality tier: a wider hysteresis)
                 for (size_t i = 0; i < res.size() && i < host.size(); ++i) {
-                    if (score[base + host[i]] <= (hot_tier ? 1.5 : 1.25) * score[base + res[i]] + (hot_tier ? 8.0 : 3.0)) break;
+                    if (score[base + host[i]] <= (hot_tier ? 1.5 : 1.25) * score[base + res[i]] + (hot_tier ? adapt_margin + 5.0 : adapt_margin)) break;
                     plan.push_back({score[base + host[i]] - score[base + res[i]], il, g, res[i], host[i]});
                 }
             }

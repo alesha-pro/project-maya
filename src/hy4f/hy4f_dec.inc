@@ -1512,7 +1512,7 @@ void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
 #ifdef HY4F_VISION
 bool encode_img(const vision::Image& img, std::vector<float>& rows, int& n_tokens, std::string& err) {
     if (!venc) throw std::runtime_error("hy4f: no vision encoder loaded");
-    if (bsh.empty()) batch_setup(2048);
+    if (bsh.empty()) batch_setup(o.prefill_chunk > 0 ? o.prefill_chunk : 2048);
     // the shard whose batch arena is biggest relative to the need; the arena's contents are scratch between calls
     Shard& s = sh[0];
     BShard& b = bsh[0];
