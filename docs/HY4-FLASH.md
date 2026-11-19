@@ -40,9 +40,9 @@ cmake --build build -j 24 --target maya-hy4f
 
 ```bash
 # Q3_K trunk (150 GB): the full quality model
-hf download alesha-pro/Hy4-flash-Uncensored-GGUF --exclude "Hy4-flash-IQ2-*" --local-dir /models/Hy4-flash-Uncensored-GGUF
-# or the IQ2 trunk (115 GB): smaller and faster, further from the base
-hf download alesha-pro/Hy4-flash-Uncensored-GGUF --exclude "Hy4-flash-Q3_K-00001-*" --local-dir /models/Hy4-flash-Uncensored-GGUF
+hf download alesha-pro/Hy4-flash-Uncensored-GGUF --exclude "Hy4-flash-IQ2_XXS-*" --local-dir /models/Hy4-flash-Uncensored-GGUF
+# or the IQ2_XXS set (115 GB): smaller and faster, further from the base
+hf download alesha-pro/Hy4-flash-Uncensored-GGUF --exclude "Hy4-flash-Q3_K-*" --local-dir /models/Hy4-flash-Uncensored-GGUF
 ```
 
 **3. Pick a config and run**

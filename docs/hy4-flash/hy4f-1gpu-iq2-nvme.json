@@ -2,9 +2,9 @@
  "exe": "/opt/project-maya/build/maya-hy4f",
  "args": [
   "--gguf",
-  "/models/Hy4-flash-Uncensored-GGUF/Hy4-flash-IQ2-00001-of-00002.gguf",
+  "/models/Hy4-flash-Uncensored-GGUF/Hy4-flash-IQ2_XXS-00001-of-00002.gguf",
   "--gguf",
-  "/nvme/hy4-flash/Hy4-flash-Q3_K-00002-of-00002.gguf",
+  "/nvme/hy4-flash/Hy4-flash-IQ2_XXS-00002-of-00002.gguf",
   "--max-context",
   "262144",
   "--chunk",

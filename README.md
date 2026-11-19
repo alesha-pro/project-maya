@@ -31,7 +31,7 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON 
   -DCMAKE_CUDA_ARCHITECTURES=86 -DCUDAToolkit_ROOT=/usr/local/cuda-12.8 \
   -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc -DSTRATA_BUILD_TESTS=OFF
 cmake --build build -j 24 --target maya-hy4f
-hf download alesha-pro/Hy4-flash-Uncensored-GGUF --exclude "Hy4-flash-IQ2-*" --local-dir /models/Hy4-flash-Uncensored-GGUF
+hf download alesha-pro/Hy4-flash-Uncensored-GGUF --exclude "Hy4-flash-IQ2_XXS-*" --local-dir /models/Hy4-flash-Uncensored-GGUF
 # set exe and cwd in the config to this checkout, then
 python -m serve.server --engine maya --config docs/hy4-flash/hy4f-2gpu.json --host 127.0.0.1 --port 18000
 ```
