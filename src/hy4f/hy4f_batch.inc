@@ -29,6 +29,7 @@ struct BShard {
     cudaEvent_t routing_ready = nullptr;
     int* hmb = nullptr;   // pinned copy of the bounds (the MMQ grid and the rows are host values)
     int64_t cap = 0;      // rows of the expert buffers
+    uint8_t* stage = nullptr;   // expert offload: the host experts of one launch
     float *eg_r = nullptr, *eg_kv = nullptr;
     int64_t* eg_ids = nullptr;
     float* ar_buf[2] = {nullptr, nullptr};   // reduce-scatter receive [src][ts][E] bf16
@@ -119,6 +120,10 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     HY_CK(cudaHostAlloc((void**) &b.hb, sizeof(int) * 4, cudaHostAllocPortable));
     HY_CK(cudaHostAlloc((void**) &b.hmb, sizeof(int) * (nl_max + 1), cudaHostAllocPortable));
     b.cap = std::min((int64_t) T * K, std::max<int64_t>((int64_t) cap_num * T * K / (cap_den * S), 2 * T));
+    if (offload) {
+        HY_CK(cudaMalloc(&b.stage, off_stage + 4096));
+        HY_CK(cudaMemset(b.stage, 0, off_stage + 4096));
+    }
     xp_ld = ((size_t) q_lora + KV_ROW + (size_t) Hmax / S * vh + IK + 3) / 4 * 4;
     qp_ld = std::max((size_t) Hd * QH + (size_t) IH * IK, (size_t) Hs / S * QH);
     xm_ld = (size_t) latent + 2 * n_ffx / S;
@@ -738,7 +743,7 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
     kb_moe_scan<<<1, std::max(nl, 32), 0, b.st>>>(b.mcnt, nl, b.mb);
     // A short chunk fits all possible slots in the existing prefill arena.
     // The MMQ kernels still take each expert's exact boundaries from the GPU.
-    const bool pad = std::getenv("HY4F_PF_SHORT_ROUTE") && T <= 64 && int64_t(T) * K <= b.cap;
+    const bool pad = std::getenv("HY4F_PF_SHORT_ROUTE") && T <= 64 && int64_t(T) * K <= b.cap && !offload;
     if (pad) HY_CK(cudaMemsetAsync(b.rows_tok, 0, sizeof(int) * T * K, b.st));
     kb_moe_place<<<nl, 256, 0, b.st>>>(b.eids, T * K, K, e0, nl, b.mb, b.rows_tok, b.row_of);
     if (!pad) {
@@ -752,14 +757,31 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
     }
     const DW& wgu = s.w.at(P + "ffn_gu_exps");
     const DW& wd = s.w.at(P + "ffn_down_exps.weight");
+    if (!s.pf_rows.empty() && !pad)
+        for (int e = 0; e < nl; ++e) {
+            const int c = b.hmb[e + 1] - b.hmb[e];
+            s.pf_rows[(size_t) il * nl_max + e] += c;
+            s.pf_touch[(size_t) il * nl_max + e] += c > 0;
+        }
+    // expert offload: a range lies wholly in VRAM or wholly in host memory, and a host range fits the staging buffer
+    const OffLayer* ol = offload ? &s.off.at(il) : nullptr;
+    const int stage_n = ol ? (int) std::max<size_t>(1, off_stage / ol->stride) : 0;
+    bool first = true;
     // the experts in ranges of at most cap rows (one range unless the routing piles onto this shard)
     for (int ea = 0; ea < nl;) {
+        if (ol && ea >= ol->n_res && !first && b.hmb[ea + 1] == b.hmb[ea]) {   // an idle host expert is not fetched
+            ++ea;
+            continue;
+        }
+        const int elim = !ol ? nl : ea < ol->n_res ? ol->n_res : std::min(nl, ea + stage_n);
         int eb = pad ? nl : ea;
         int64_t mx = pad ? T : 0;
-        while (eb < nl && (eb == ea || b.hmb[eb + 1] - b.hmb[ea] <= b.cap)) {
+        while (eb < elim && (eb == ea || b.hmb[eb + 1] - b.hmb[ea] <= b.cap)) {
             mx = std::max<int64_t>(mx, b.hmb[eb + 1] - b.hmb[eb]);
             ++eb;
         }
+        if (ol && ea >= ol->n_res)
+            while (eb - 1 > ea && b.hmb[eb] == b.hmb[eb - 1]) --eb;
         const int ra = pad ? 0 : b.hmb[ea], rb = pad ? T * K : b.hmb[eb];
         const int64_t rows = rb - ra;
         if (rows > b.cap) throw std::runtime_error("hy4f: one expert has more rows than the buffers");
@@ -771,11 +793,22 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
         if (rows > 0) {
             mq::quantize(b.xm, b.rows_tok + ra, b.xq, wgu.type, latent, (int64_t) xm_ld, rows, b.st);
             mq::Product p{};
-            p.w = static_cast<const uint8_t*>(wgu.d) + (size_t) ea * wgu.rb * (size_t) wgu.ne[1];
+            const uint8_t* wg = static_cast<const uint8_t*>(wgu.d) + (size_t) ea * wgu.rb * (size_t) wgu.ne[1];
+            const uint8_t* wdn = static_cast<const uint8_t*>(wd.d) + (size_t) ea * wd.rb * (size_t) wd.ne[1];
+            if (ol) {
+                if (ea < ol->n_res) wg = ol->vram + (size_t) ea * ol->stride;
+                else {
+                    HY_CK(cudaMemcpyAsync(b.stage, ol->host + (size_t) ea * ol->stride, (size_t) (eb - ea) * ol->stride,
+                                          cudaMemcpyHostToDevice, b.st));
+                    wg = b.stage;
+                }
+                wdn = wg + ol->gu_bytes;
+            }
+            p.w = wg;
             p.type = wgu.type;
             p.w_rows = 2 * n_ffx;
             p.w_cols = latent;
-            p.expert_bytes = wgu.rb * (size_t) wgu.ne[1];
+            p.expert_bytes = expert_stride(wgu);
             p.n = eb - ea;
             p.xq = b.xq;
             p.bounds = bounds;
@@ -787,17 +820,18 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
             b.mmq->run_glu(p, clampv, b.st);
             if (pad) kb_zero_padded_rows<<<(unsigned)rows, 256, 0, b.st>>>(b.gu, n_ffx, b.mb + nl);
             mq::quantize(b.gu, nullptr, b.xq2, wd.type, n_ffx, n_ffx, rows, b.st);
-            p.w = static_cast<const uint8_t*>(wd.d) + (size_t) ea * wd.rb * (size_t) wd.ne[1];
+            p.w = wdn;
             p.type = wd.type;
             p.w_rows = latent;
             p.w_cols = n_ffx;
-            p.expert_bytes = wd.rb * (size_t) wd.ne[1];
+            p.expert_bytes = expert_stride(wd);
             p.xq = b.xq2;
             p.dst = b.dn;
             p.ld_dst = latent;
             b.mmq->run(p, b.st);
         }
-        kb_moe_combine<<<dim3(nb(latent), T), 256, 0, b.st>>>(b.dn, latent, b.row_of, b.ew, K, b.moe, latent, ra, rb, ea > 0);
+        kb_moe_combine<<<dim3(nb(latent), T), 256, 0, b.st>>>(b.dn, latent, b.row_of, b.ew, K, b.moe, latent, ra, rb, !first);
+        first = false;
         ea = eb;
     }
     blin(s, b, P + "ffn_routed_up.weight", b.moe, latent, b.mu, E, T);

@@ -51,6 +51,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <numeric>
 #include <stdexcept>
 #include <tuple>
 #include <condition_variable>
@@ -110,6 +111,18 @@ struct DW {
     void* d = nullptr;
     size_t rb = 0;
     bool packed_projection = false;
+    size_t stride = 0;   // experts: the bytes from one expert to the next (0: rb * ne[1])
+};
+inline size_t expert_stride(const DW& w) { return w.stride ? w.stride : w.rb * (size_t) w.ne[1]; }
+
+// expert offload: one MoE layer on one shard.  Every expert of the shard is a [gate | up | down] record in pinned
+// host memory; the n_res hottest also have a VRAM copy.  Both stores lie on one lattice of `stride` bytes, so a
+// kernel finds an expert at base + index * stride whichever store holds it.
+struct OffLayer {
+    int n = 0, n_res = 0;
+    int av = 0, ah = 0;   // lattice index = local index + (local < n_res ? av : ah)
+    size_t stride = 0, gu_bytes = 0;
+    uint8_t *vram = nullptr, *host = nullptr;
 };
 
 struct Shard {
@@ -134,7 +147,10 @@ struct Shard {
     int* cells = nullptr;
     float *lg = nullptr, *ew = nullptr, *xl = nullptr, *ga = nullptr, *up = nullptr, *moe = nullptr, *mu = nullptr,
           *sh = nullptr, *ffn = nullptr, *ga16 = nullptr, *up16 = nullptr, *dn16 = nullptr;
-    int *eids = nullptr, *eloc = nullptr;
+    int *eids = nullptr, *eloc = nullptr, *evirt = nullptr;
+    std::map<int, OffLayer> off;
+    unsigned* rstat = nullptr;                 // HY4F_ROUTE_STATS: decode picks [layer][local expert]
+    std::vector<uint64_t> pf_rows, pf_touch;   // ... and the prefill's rows / chunks that touched the expert
     float *eg_r = nullptr, *eg_kv = nullptr;
     int64_t* eg_ids = nullptr;
     int64_t* eg_map = nullptr;
@@ -173,6 +189,11 @@ struct Model::Impl {
     std::vector<int> mtp_ebound;
     const std::vector<int>& expert_bounds(int layer) const { return layer == L ? mtp_ebound : ebound; }
     int nl_max = 0;
+    bool offload = false;                        // HY4F_EXPERT_VRAM_MB: part of the experts stays in host memory
+    size_t off_budget = 0, off_stage = 0;
+    std::map<int, std::vector<int>> off_perm;    // layer -> [expert id in the engine] = the GGUF's expert
+    std::vector<std::map<int, int>> off_res;     // [shard][layer] -> experts resident in VRAM
+    std::string route_stats;
     std::vector<Shard> sh;
     Io* hio = nullptr;
     float* hlogits = nullptr;
@@ -420,12 +441,22 @@ struct Model::Impl {
             HY_CK(cudaMemcpy(static_cast<uint8_t*>(weight.d) + i * weight.rb, packed.data(), bytes, cudaMemcpyHostToDevice));
         }
     }
-    void up_router(Shard& s, const std::string& name) {
+    void up_router(Shard& s, const std::string& name, const std::vector<int>* perm = nullptr) {
         const strata::GgufFile* file = nullptr;
         const auto* tensor = T(name, &file);
+        const uint8_t* data = file->tensor_data(*tensor);
+        std::vector<uint8_t> reordered;   // the expert offload renumbers the experts: the router's rows follow
+        if (perm) {
+            if (tensor->type != T_F32 || tensor->shape.size() != 2 || tensor->shape[1] != perm->size())
+                throw std::runtime_error("hy4f: cannot reorder " + name);
+            const size_t rb = (size_t) tensor->shape[0] * sizeof(float);
+            reordered.resize(rb * perm->size());
+            for (size_t r = 0; r < perm->size(); ++r) std::memcpy(reordered.data() + rb * r, data + rb * (*perm)[r], rb);
+            data = reordered.data();
+        }
         if (std::getenv("HY4F_PACK_ROUTER") && tensor->type == T_F32 && tensor->shape.size() == 2 &&
             tensor->shape[0] % 256 == 0) {
-            const auto* src = reinterpret_cast<const uint32_t*>(file->tensor_data(*tensor));
+            const auto* src = reinterpret_cast<const uint32_t*>(data);
             size_t count = size_t(tensor->shape[0]) * tensor->shape[1];
             if (std::all_of(src, src + count, [](uint32_t bits) { return (bits & 65535) == 0; })) {
                 std::vector<uint16_t> packed(count);
@@ -441,7 +472,18 @@ struct Model::Impl {
                 return;
             }
         }
-        up_full(s, name);
+        if (!perm) {
+            up_full(s, name);
+            return;
+        }
+        DW w;
+        w.type = T_F32;
+        w.ne[0] = (int64_t) tensor->shape[0];
+        w.ne[1] = (int64_t) tensor->shape[1];
+        w.rb = row_bytes(T_F32, w.ne[0]);
+        w.d = walloc(reordered.size());
+        HY_CK(cudaMemcpy(w.d, reordered.data(), reordered.size(), cudaMemcpyHostToDevice));
+        s.w[name] = w;
     }
     DW up_cols(Shard& s, const std::string& n, int64_t c0, int64_t c1) {
         const strata::GgufFile* f = nullptr;
@@ -571,6 +613,239 @@ struct Model::Impl {
             for (int g = 0; g < S; ++g) std::fprintf(stderr, " %d", n[g]);
             std::fprintf(stderr, "\n");
         }
+        plan_offload();
+    }
+
+    // one expert's record in the offload stores: [gate | up | down] padded to whole blocks of both types
+    size_t expert_record(int il, size_t* gu_bytes = nullptr) const {
+        const std::string P = "blk." + std::to_string(il) + ".";
+        const strata::GgufFile* f = nullptr;
+        const strata::TensorInfo* tg = T(P + "ffn_gate_exps.weight", &f);
+        const strata::TensorInfo* td = T(P + "ffn_down_exps.weight", &f);
+        const size_t gu = 2 * row_bytes((int) tg->type, (int64_t) tg->shape[0]) * (size_t) tg->shape[1];
+        const size_t dn = row_bytes((int) td->type, (int64_t) td->shape[0]) * (size_t) td->shape[1];
+        const size_t bg = row_bytes((int) tg->type, block_elems((int) tg->type));
+        const size_t bd = row_bytes((int) td->type, block_elems((int) td->type));
+        const size_t unit = bg / std::gcd(bg, bd) * bd;
+        if (gu_bytes) *gu_bytes = gu;
+        return (gu + dn + unit - 1) / unit * unit;
+    }
+
+    // HY4F_EXPERT_VRAM_MB=<MiB per GPU>: the expert offload.  Per MoE layer the experts are renumbered by heat (the
+    // decode picks of HY4F_EXPERT_PROFILE, a HY4F_ROUTE_STATS file; the router rows move with them) and dealt
+    // round-robin to the shards; each shard keeps its hottest ones in VRAM up to the budget.  The others stay in
+    // pinned host memory: the decode kernels read them in place, the prefill fetches them into a staging buffer.
+    void plan_offload() {
+        if (const char* p = std::getenv("HY4F_ROUTE_STATS")) route_stats = p;
+        const char* mb = std::getenv("HY4F_EXPERT_VRAM_MB");
+        if (!mb) return;
+        if (std::getenv("HY4F_PACK_Q3")) throw std::runtime_error("hy4f: HY4F_PACK_Q3 does not combine with the expert offload");
+        offload = true;
+        off_budget = (size_t) std::atoll(mb) << 20;
+        const char* sm = std::getenv("HY4F_OFFLOAD_STAGE_MB");
+        off_stage = (size_t) (sm ? std::atoll(sm) : 256) << 20;
+        const int nl = n_exp / S, last = L + (has_mtp ? 1 : 0);
+        for (int g = 0; g <= S; ++g) ebound[g] = g * nl;
+        mtp_ebound = ebound;
+        nl_max = nl;
+        std::map<int, std::vector<double>> heat;
+        if (const char* pf = std::getenv("HY4F_EXPERT_PROFILE")) {
+            std::FILE* f = std::fopen(pf, "r");
+            if (!f) throw std::runtime_error(std::string("hy4f: cannot read ") + pf);
+            char kind = 0;
+            int il = 0, e = 0;
+            double c = 0;
+            while (std::fscanf(f, " %c %d %d %lf", &kind, &il, &e, &c) == 4)
+                if (kind == 'D' && il >= dense_lead && il < last && e >= 0 && e < n_exp) {
+                    auto& v = heat[il];
+                    if (v.empty()) v.assign(n_exp, 0.0);
+                    v[e] += c;
+                }
+            std::fclose(f);
+        }
+        struct Item {
+            double p;
+            int il, l;
+        };
+        std::vector<std::vector<Item>> items(S);
+        std::map<int, size_t> stride;
+        off_res.assign(S, {});
+        for (int il = dense_lead; il < last; ++il) {
+            std::vector<double> c(n_exp, 1.0);
+            if (heat.count(il)) c = heat[il];
+            double sum = 0;
+            for (double v : c) sum += v;
+            std::vector<int> order(n_exp);
+            std::iota(order.begin(), order.end(), 0);
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return c[a] > c[b]; });
+            auto& perm = off_perm[il];
+            perm.resize(n_exp);
+            for (int g = 0; g < S; ++g) {
+                off_res[g][il] = 0;
+                for (int l = 0; l < nl; ++l) {
+                    perm[g * nl + l] = order[l * S + g];
+                    items[g].push_back({sum > 0 ? c[order[l * S + g]] / sum : 0.0, il, l});
+                }
+            }
+            stride[il] = expert_record(il);
+        }
+        for (int g = 0; g < S; ++g) {
+            std::stable_sort(items[g].begin(), items[g].end(), [](const Item& a, const Item& b) {
+                return a.p != b.p ? a.p > b.p : a.l != b.l ? a.l < b.l : a.il < b.il;
+            });
+            size_t used = 0;
+            std::map<int, bool> closed;
+            double hit = 0, all = 0;
+            int kept = 0;
+            for (const Item& it : items[g]) {
+                if (it.il < L) all += it.p;
+                if (closed[it.il]) continue;
+                if (used + stride[it.il] + 4096 > off_budget) {
+                    closed[it.il] = true;
+                    continue;
+                }
+                used += stride[it.il];
+                ++off_res[g][it.il];
+                ++kept;
+                if (it.il < L) hit += it.p;
+            }
+            if (o.verbose)
+                std::fprintf(stderr, "hy4f: offload: shard %d keeps %d of %zu experts in VRAM (%.2f GiB), expected hits %.3f%s\n",
+                             g, kept, items[g].size(), used / 1073741824.0, all > 0 ? hit / all : 0.0,
+                             heat.empty() ? " (no profile)" : "");
+        }
+    }
+
+    void load_offload_experts(Shard& s, int il, const std::string& P) {
+        const strata::GgufFile *fg = nullptr, *fu = nullptr, *fd = nullptr;
+        const strata::TensorInfo* tg = T(P + "ffn_gate_exps.weight", &fg);
+        const strata::TensorInfo* tu = T(P + "ffn_up_exps.weight", &fu);
+        const strata::TensorInfo* td = T(P + "ffn_down_exps.weight", &fd);
+        if (tg->type != tu->type) throw std::runtime_error("hy4f: gate/up expert types differ in " + P);
+        const size_t rb = row_bytes((int) tg->type, (int64_t) tg->shape[0]), eb = rb * (size_t) tg->shape[1];
+        const size_t rbd = row_bytes((int) td->type, (int64_t) td->shape[0]), ebd = rbd * (size_t) td->shape[1];
+        OffLayer ol;
+        ol.stride = expert_record(il, &ol.gu_bytes);
+        ol.n = n_exp / S;
+        ol.n_res = off_res[s.g].at(il);
+        const size_t stride = ol.stride;
+        if (ol.n_res) ol.vram = static_cast<uint8_t*>(walloc((size_t) ol.n_res * stride));
+        const size_t host_bytes = (size_t) ol.n * stride + stride + 4096;
+        uint8_t* block = nullptr;
+        HY_CK(cudaHostAlloc((void**) &block, host_bytes, cudaHostAllocPortable | cudaHostAllocMapped));
+        size_t shift = 0;
+        if (ol.vram)
+            shift = (reinterpret_cast<uintptr_t>(ol.vram) % stride + stride - reinterpret_cast<uintptr_t>(block) % stride) % stride;
+        ol.host = block + shift;
+        std::memset(ol.host + (size_t) ol.n * stride, 0, host_bytes - shift - (size_t) ol.n * stride);
+        const uint8_t *gsrc = fg->tensor_data(*tg), *usrc = fu->tensor_data(*tu), *dsrc = fd->tensor_data(*td);
+        const auto& perm = off_perm.at(il);
+        const int workers = 8;
+        std::vector<std::thread> th;
+        for (int w = 0; w < workers; ++w)
+            th.emplace_back([&, w] {
+                for (int l = w; l < ol.n; l += workers) {
+                    const size_t e = (size_t) perm[(size_t) s.g * ol.n + l];
+                    uint8_t* rec = ol.host + (size_t) l * stride;
+                    std::memcpy(rec, gsrc + eb * e, eb);
+                    std::memcpy(rec + eb, usrc + eb * e, eb);
+                    std::memcpy(rec + 2 * eb, dsrc + ebd * e, ebd);
+                    std::memset(rec + 2 * eb + ebd, 0, stride - 2 * eb - ebd);
+                }
+            });
+        for (auto& t : th) t.join();
+        if (ol.n_res) HY_CK(cudaMemcpy(ol.vram, ol.host, (size_t) ol.n_res * stride, cudaMemcpyHostToDevice));
+        uint8_t* base = ol.host;
+        int64_t av = 0, ah = 0;
+        if (ol.vram && ol.host > ol.vram) {
+            base = ol.vram;
+            ah = (ol.host - ol.vram) / (int64_t) stride;
+        } else if (ol.vram) av = (ol.vram - ol.host) / (int64_t) stride;
+        if (av + ol.n >= INT_MAX || ah + ol.n >= INT_MAX) throw std::runtime_error("hy4f: the expert stores are too far apart");
+        ol.av = (int) av;
+        ol.ah = (int) ah;
+        DW w;
+        w.type = (int) tg->type;
+        w.ne[0] = (int64_t) tg->shape[0];
+        w.ne[1] = 2 * (int64_t) tg->shape[1];
+        w.ne[2] = ol.n;
+        w.rb = rb;
+        w.d = base;
+        w.stride = stride;
+        s.w[P + "ffn_gu_exps"] = w;
+        DW wd;
+        wd.type = (int) td->type;
+        wd.ne[0] = (int64_t) td->shape[0];
+        wd.ne[1] = (int64_t) td->shape[1];
+        wd.ne[2] = ol.n;
+        wd.rb = rbd;
+        wd.d = base + ol.gu_bytes;
+        wd.stride = stride;
+        s.w[P + "ffn_down_exps.weight"] = wd;
+        s.off[il] = ol;
+    }
+
+    // a one-dimensional F32 tensor with its entries in the offload's expert order
+    void up_permuted(Shard& s, const std::string& name, const std::vector<int>* perm) {
+        if (!perm) {
+            up_full(s, name);
+            return;
+        }
+        const strata::GgufFile* file = nullptr;
+        const auto* tensor = T(name, &file);
+        if (tensor->type != T_F32 || tensor->shape.size() != 1 || tensor->shape[0] != perm->size())
+            throw std::runtime_error("hy4f: cannot reorder " + name);
+        const float* src = reinterpret_cast<const float*>(file->tensor_data(*tensor));
+        std::vector<float> h(perm->size());
+        for (size_t i = 0; i < h.size(); ++i) h[i] = src[(*perm)[i]];
+        DW w;
+        w.type = T_F32;
+        w.ne[0] = (int64_t) h.size();
+        w.rb = row_bytes(T_F32, w.ne[0]);
+        w.d = walloc(h.size() * sizeof(float));
+        HY_CK(cudaMemcpy(w.d, h.data(), h.size() * sizeof(float), cudaMemcpyHostToDevice));
+        s.w[name] = w;
+    }
+
+    void dump_route_stats() {
+        if (route_stats.empty() || sh.empty() || !sh[0].rstat) return;
+        const int last = L + (has_mtp ? 1 : 0);
+        std::vector<uint64_t> dec((size_t) (L + 1) * n_exp, 0), rows(dec.size(), 0), touch(dec.size(), 0);
+        std::vector<unsigned> h((size_t) (L + 1) * nl_max);
+        uint64_t picks = 0, hits = 0, pf_all = 0, pf_hit = 0;   // trunk layers: decode picks / prefill expert fetches
+        for (auto& s : sh) {
+            if (cudaSetDevice(s.dev) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) return;
+            if (cudaMemcpy(h.data(), s.rstat, h.size() * sizeof(unsigned), cudaMemcpyDeviceToHost) != cudaSuccess) return;
+            for (int il = dense_lead; il < last; ++il) {
+                const auto& own = expert_bounds(il);
+                for (int l = 0; l < own[s.g + 1] - own[s.g]; ++l) {
+                    const int e = offload ? off_perm.at(il)[own[s.g] + l] : own[s.g] + l;
+                    const size_t i = (size_t) il * nl_max + l, k = (size_t) il * n_exp + e;
+                    dec[k] += h[i];
+                    rows[k] += s.pf_rows[i];
+                    touch[k] += s.pf_touch[i];
+                    if (offload && il < L) {
+                        const bool res = l < s.off.at(il).n_res;
+                        picks += h[i], pf_all += s.pf_touch[i];
+                        if (res) hits += h[i], pf_hit += s.pf_touch[i];
+                    }
+                }
+            }
+        }
+        if (offload)
+            std::fprintf(stderr, "hy4f: offload: decode picks %llu, in VRAM %.3f; prefill expert uses %llu, in VRAM %.3f\n",
+                         (unsigned long long) picks, picks ? (double) hits / picks : 0.0, (unsigned long long) pf_all,
+                         pf_all ? (double) pf_hit / pf_all : 0.0);
+        std::FILE* f = std::fopen(route_stats.c_str(), "w");
+        if (!f) return;
+        for (int il = dense_lead; il < last; ++il)
+            for (int e = 0; e < n_exp; ++e) {
+                const size_t k = (size_t) il * n_exp + e;
+                if (dec[k]) std::fprintf(f, "D %d %d %llu\n", il, e, (unsigned long long) dec[k]);
+                if (rows[k]) std::fprintf(f, "P %d %d %llu\n", il, e, (unsigned long long) rows[k]);
+                if (touch[k]) std::fprintf(f, "T %d %d %llu\n", il, e, (unsigned long long) touch[k]);
+            }
+        std::fclose(f);
     }
 
     void load_engram() {
@@ -648,11 +923,14 @@ struct Model::Impl {
                 up_concat(s, P + "dense_gu", {{P + "ffn_gate.weight", f0, f1}, {P + "ffn_up.weight", f0, f1}});
                 up_cols(s, P + "ffn_down.weight", f0, f1);
             } else {
-                up_router(s, P + "ffn_gate_inp.weight");
-                for (const char* n : {"exp_probs_b.bias", "ffn_routed_up.weight"}) up_full(s, P + n);
+                const std::vector<int>* perm = offload ? &off_perm.at(il) : nullptr;
+                up_router(s, P + "ffn_gate_inp.weight", perm);
+                up_permuted(s, P + "exp_probs_b.bias", perm);
+                up_full(s, P + "ffn_routed_up.weight");
                 const auto& ownership = expert_bounds(il);
                 const int64_t e0 = ownership[g], e1 = ownership[g + 1];
-                {   // gate | up of each expert as one [2 n_ff, latent] matrix (MMQ run_glu's layout; one decode launch)
+                if (offload) load_offload_experts(s, il, P);
+                else {   // gate | up of each expert as one [2 n_ff, latent] matrix (MMQ run_glu's layout; one decode launch)
                     const strata::GgufFile *fg = nullptr, *fu = nullptr;
                     const strata::TensorInfo* tg = T(P + "ffn_gate_exps.weight", &fg);
                     const strata::TensorInfo* tu = T(P + "ffn_up_exps.weight", &fu);
@@ -731,6 +1009,14 @@ struct Model::Impl {
         s.ew = dalloc(n_used);
         HY_CK(cudaMalloc(&s.eids, sizeof(int) * n_used));
         HY_CK(cudaMalloc(&s.eloc, sizeof(int) * n_used));
+        HY_CK(cudaMalloc(&s.evirt, sizeof(int) * n_used));
+        if (!route_stats.empty()) {
+            const size_t n = (size_t) (L + 1) * nl_max;
+            HY_CK(cudaMalloc(&s.rstat, sizeof(unsigned) * n));
+            HY_CK(cudaMemset(s.rstat, 0, sizeof(unsigned) * n));
+            s.pf_rows.assign(n, 0);
+            s.pf_touch.assign(n, 0);
+        }
         s.xl = dalloc(latent);
         s.ga = dalloc(std::max(n_ff, n_ffx));
         s.up = dalloc(std::max(n_ff, n_ffx));
@@ -939,17 +1225,23 @@ struct Model::Impl {
         const auto& ownership = expert_bounds(il);
         const int e0 = ownership[s.g], e1 = ownership[s.g + 1], fl = n_ffx / S;
         k_local_ids<<<1, 32, 0, s.st>>>(s.eids, s.eloc, n_used, e0, e1);
+        const int* eidx = s.eloc;
+        if (offload) {
+            const OffLayer& ol = s.off.at(il);
+            k_virt_ids<<<1, 32, 0, s.st>>>(s.eloc, s.evirt, n_used, ol.n_res, ol.av, ol.ah);
+            eidx = s.evirt;
+        }
         mmvq(s, P + "xmoe", s.xq, s.xm);
         k_q8<<<nb(latent), 256, 0, s.st>>>(s.xm, latent, s.xlq);
         auto ids_mmvq = [&](const DW& w, const void* xq, bool shared, float* y, int n_in, int n_out) {
-            const size_t eb = w.rb * (size_t) w.ne[1];
+            const size_t eb = expert_stride(w);
             if (w.type == T_Q8_0) {
-                expert_q8::launch<false>(w.d, eb, s.eloc, n_used, nullptr, nullptr, nullptr, xq, shared, y, n_in, n_out,
+                expert_q8::launch<false>(w.d, eb, eidx, n_used, nullptr, nullptr, nullptr, xq, shared, y, n_in, n_out,
                                          nb(n_out, 4), s.st);
                 HY_CK(cudaGetLastError());
             }
-            else if (w.type == T_Q3_K) kn::native_q3_k_mmvq_ids_loop(w.d, eb, s.eloc, n_used, xq, shared, y, n_in, n_out, s.st);
-            else if (w.type == T_Q4_K) kn::native_q4_k_mmvq_ids_loop(w.d, eb, s.eloc, n_used, xq, shared, y, n_in, n_out, s.st);
+            else if (w.type == T_Q3_K) kn::native_q3_k_mmvq_ids_loop(w.d, eb, eidx, n_used, xq, shared, y, n_in, n_out, s.st);
+            else if (w.type == T_Q4_K) kn::native_q4_k_mmvq_ids_loop(w.d, eb, eidx, n_used, xq, shared, y, n_in, n_out, s.st);
             else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
         };
         ids_mmvq(s.w.at(P + "ffn_gu_exps"), s.xlq, true, s.ga16, latent, 2 * n_ffx);   // [n_used][gate | up]
@@ -1061,6 +1353,7 @@ struct Model::Impl {
             if (!e.empty()) throw std::runtime_error(e);
     }
     ~Impl() {
+        dump_route_stats();
         if (pool) {
             {
                 std::lock_guard<std::mutex> lk(pool->m);

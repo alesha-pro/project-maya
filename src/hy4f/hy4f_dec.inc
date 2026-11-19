@@ -919,6 +919,7 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         router(s, d.lg, f32(s, P + "exp_probs_b.bias"), T, d.eids, d.ew);
         kd_local_ids<<<1, 128, 0, s.st>>>(d.eids, d.eloc, T * K, e0, e1);
     }
+    if (s.rstat) k_route_hist<<<1, 128, 0, s.st>>>(d.eloc, T * K, s.rstat + (size_t) il * nl_max);
     if (!d.side) {
         dec_mmvq(s, P + "xmoe", d.xq, d.xm, T);
         kd_q8_slots<<<dim3(nb(latent), T * K), 256, 0, s.st>>>(d.xm, xmc, latent, K, d.xlq);
@@ -949,8 +950,13 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
             kd_groups_match<false><<<1, threads, (e1 - e0) * (threads / 32) * sizeof(unsigned), s.st>>>(
                 d.eloc, slots, e1 - e0, d.mg_n, d.mg_exp, d.mg_off, d.mg_slot);
     }
+    if (offload) {   // the groups' local experts -> their places on the layer's weight lattice (VRAM or host)
+        if (!grouped) throw std::runtime_error("hy4f: the expert offload needs the grouped expert kernels");
+        const OffLayer& ol = s.off.at(il);
+        if (ol.av || ol.ah) k_virt_groups<<<1, 128, 0, s.st>>>(d.mg_n, d.mg_exp, ol.n_res, ol.av, ol.ah);
+    }
     auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out) {
-        const size_t eb = w.rb * (size_t) w.ne[1];
+        const size_t eb = expert_stride(w);
         if (w.type == T_Q8_0) {
             if (grouped)
                 expert_q8::launch<true>(w.d, eb, d.mg_exp, 0, d.mg_n, d.mg_off, d.mg_slot, xq, false, y,
@@ -990,10 +996,10 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
             const int* offsets = d.mg_off + offset;
             auto q4_kernel = q4_repeated ? kn::native_q4_k_mmvq_grouped_repeated : kn::native_q4_k_mmvq_grouped;
             auto gu_kernel = gu.type == T_Q3_K ? kn::native_q3_k_mmvq_grouped : q4_kernel;
-            gu_kernel(gu.d, gu.rb*gu.ne[1], count, experts, offsets, d.mg_slot, d.xlq, d.ga16,
+            gu_kernel(gu.d, expert_stride(gu), count, experts, offsets, d.mg_slot, d.xlq, d.ga16,
                       1536, 3072, moe_blocks, stream);
             kd_expert_quant_slots<<<dim3(6,2*T),256,0,stream>>>(d.ga16,clampv,d.q16,count,offsets,d.mg_slot);
-            q4_kernel(down.d,down.rb*down.ne[1],count,experts,offsets,d.mg_slot,
+            q4_kernel(down.d,expert_stride(down),count,experts,offsets,d.mg_slot,
                                          d.q16,d.dn16,1536,1536,moe_blocks,stream);
         };
         HY_CK(cudaEventRecord(d.attention_fork,s.st));
