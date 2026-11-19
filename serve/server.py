@@ -4365,16 +4365,16 @@ class Service:
                 fresh = getattr(self.engine, "last", None)
                 if fresh is not None and fresh is not last0:
                     segments.append(fresh)
-                if len(segments) > 1:                           # the request's figures, over all its slices
-                    first, last = segments[0], segments[-1]
-                    merged = dict(last, prompt_tokens=first.get("prompt_tokens"), reused=first.get("reused"))
-                    for k in ("generated", "prompt_ms", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups"):
-                        if all(k in sg for sg in segments):
-                            merged[k] = sum(sg[k] for sg in segments)
-                    self.engine.last = merged
-                if segments and segments[0].get("finish") == "prefill_yield":
-                    # The reader may disconnect while its short waiter owns engine.last.
-                    stat.interrupted_last = self.engine.last
+                    if len(segments) > 1:                           # the request's figures, over all its slices
+                        first, last = segments[0], segments[-1]
+                        merged = dict(last, prompt_tokens=first.get("prompt_tokens"), reused=first.get("reused"))
+                        for k in ("generated", "prompt_ms", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups"):
+                            if all(k in sg for sg in segments):
+                                merged[k] = sum(sg[k] for sg in segments)
+                        self.engine.last = merged
+                    if segments and segments[0].get("finish") == "prefill_yield":
+                        # The reader may disconnect while its short waiter owns engine.last.
+                        stat.interrupted_last = self.engine.last
             if closed:                                  # the budget, at a sentence's or line's end: the thinking ends
                 later = len(produced) - soft
                 canon = self._closed_as_rendered(ids, produced, think_end)
