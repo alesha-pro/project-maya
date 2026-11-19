@@ -476,7 +476,9 @@ void d_engram_prepare(Shard& s, DShard& d, int e, int il, const int* pp, int T, 
     const std::string P = "blk." + std::to_string(il) + ".";
     kb_engram_hash<<<T, 32, 0, stream>>>(s.hist, pp, s.eg_map, (int64_t) eg_map.size(), eg_pad, s.eg_mult + (size_t) e * ng,
                                        s.eg_vsz + (size_t) e * ncol, s.eg_off + (size_t) e * ncol, ng, nh, d.eg_ids);
-    kb_engram_rows<<<dim3(ncol, T), 128, 0, stream>>>(eg_table, d.eg_ids, f32(s, P + "engram_lookup_norm.weight"), d.eg_r,
+    const auto* table = eg_disk ? eg_disk->stage(d.eg_ids,T,1,stream) : eg_table;
+    const auto* ids = eg_disk ? eg_disk->indices() : d.eg_ids;
+    kb_engram_rows<<<dim3(ncol, T), 128, 0, stream>>>(table, ids, f32(s, P + "engram_lookup_norm.weight"), d.eg_r,
                                                     eg_D, ncol, 1.1920929e-07f);
     k_q8<<<nb(T * ncol * eg_D), 256, 0, stream>>>(d.eg_r, T * ncol * eg_D, q);
     dec_mmvq(s, P + "engram_kv.weight", q, d.eg_kv, T, stream);

@@ -67,6 +67,8 @@
 #include <sched.h>
 #include <memory>
 
+#include "hy4f_engram_disk.hpp"
+
 namespace strata::hy4f {
 
 namespace kn = strata::kernels;
@@ -221,6 +223,7 @@ struct Model::Impl {
     std::vector<int64_t> eg_map;
     int eg_ngram = 3, eg_heads = 8, eg_D = 96, eg_pad = 0;
     uint8_t* eg_table = nullptr;
+    std::unique_ptr<EngramDisk> eg_disk;
     int S = 4;
     std::vector<int> ebound;   // shard g owns the experts [ebound[g], ebound[g+1])
     std::vector<int> mtp_ebound;
@@ -1265,11 +1268,21 @@ struct Model::Impl {
         std::fclose(f);
     }
 
-    void load_engram() {
+    void load_engram(int device) {
         const strata::GgufFile* f = nullptr;
         const strata::TensorInfo* t = T("per_layer_token_embd.weight", &f);
         if ((int) t->type != T_F8) throw std::runtime_error("hy4f: Engram table is not F8_E4M3");
         const size_t bytes = (size_t) t->shape[0] * (size_t) t->shape[1];
+        const char* mode = std::getenv("HY4F_ENGRAM_IO");
+        if (mode && std::strcmp(mode,"ram") != 0) {
+            if (std::strcmp(mode,"direct") != 0) throw std::runtime_error("HY4F_ENGRAM_IO expects ram or direct");
+            if (S != 1) throw std::runtime_error("Engram direct I/O currently supports one GPU");
+            const uint64_t start = f->data_start() + t->offset;
+            if (start > f->file_size() || bytes > f->file_size()-start || int(t->shape[0]) != eg_D)
+                throw std::runtime_error("invalid GGUF Engram tensor");
+            eg_disk = std::make_unique<EngramDisk>(f->path(), start, t->shape[1], eg_D, (eg_ngram-1)*eg_heads, device);
+            return;
+        }
         const uint8_t* src = f->tensor_data(*t);
         const uintptr_t pg = 4096, a0 = reinterpret_cast<uintptr_t>(src) & ~(pg - 1);
         const size_t len = ((reinterpret_cast<uintptr_t>(src) + bytes + pg - 1) & ~(pg - 1)) - a0;
@@ -1553,7 +1566,9 @@ struct Model::Impl {
         k_engram_hash<<<1, 32, 0, s.st>>>(s.hist, s.dio, s.eg_map, (int64_t) eg_map.size(), eg_pad,
                                           s.eg_mult + (size_t) e * ng, s.eg_vsz + (size_t) e * ncol,
                                           s.eg_off + (size_t) e * ncol, ng, nh, s.eg_ids);
-        k_engram_rows<<<ncol, 128, 0, s.st>>>(eg_table, s.eg_ids, f32(s, P + "engram_lookup_norm.weight"), s.eg_r, eg_D,
+        const auto* table = eg_disk ? eg_disk->stage(s.eg_ids,1,1,s.st) : eg_table;
+        const auto* ids = eg_disk ? eg_disk->indices() : s.eg_ids;
+        k_engram_rows<<<ncol, 128, 0, s.st>>>(table, ids, f32(s, P + "engram_lookup_norm.weight"), s.eg_r, eg_D,
                                               1.1920929e-07f);
         gemv(s, P + "engram_kv.weight", s.eg_r, s.eg_kv);
         k_engram_mix<<<1, 1024, 0, s.st>>>(s.X, s.R, s.eg_kv, f32(s, P + "engram_kv_b.weight"), f32(s, P + "engram_gate.weight"),
@@ -1892,7 +1907,7 @@ bool Model::load(const Options& o, std::string& err) {
         d.load_draft_experts(std::getenv("HY4F_MTP_EXPERT_GGUF"), false);
         d.load_draft_experts(std::getenv("HY4F_MTP_DOWN_GGUF"), true);
         d.load_trunk_experts(std::getenv("HY4F_EXPERT_GGUF"));
-        d.load_engram();
+        d.load_engram(devs.front());
         HY_CK(cudaHostAlloc((void**) &d.hio, sizeof(Io), cudaHostAllocPortable));
         HY_CK(cudaHostAlloc((void**) &d.hlogits, sizeof(float) * d.V, cudaHostAllocPortable));
         {
@@ -2027,6 +2042,7 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
                 const double ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-t_start).count();
                 std::fprintf(stderr,"hy4f: graph prefill %d tokens: %.1f ms (%.1f tok/s)\n",n,ms,1000.*n/ms);
             }
+            if (d.eg_disk) d.eg_disk->check();
             return true;
         }
         d.release_decode_scratch();
@@ -2112,6 +2128,7 @@ bool Model::prefill(const int32_t* toks, int n, int64_t pos, float* logits, int 
                 if (f) std::fwrite(logits, 4, d.V, f), std::fclose(f);
             }
         }
+        if (d.eg_disk) d.eg_disk->check();
         return true;
     } catch (const std::exception& e) {
         err = e.what();
@@ -2144,6 +2161,7 @@ bool Model::verify(const int32_t* toks, int T, int64_t pos, float* logits, int32
                 }
                 argmax[t] = bi;
             }
+        if (d.eg_disk) d.eg_disk->check();
         return true;
     } catch (const std::exception& e) {
         err = e.what();
@@ -2377,6 +2395,7 @@ bool Model::step(int32_t token, int64_t pos, float* logits, std::string& err) {
             HY_CK(cudaStreamSynchronize(s.st));
         }
         HY_CK(cudaGetLastError());
+        if (d.eg_disk) d.eg_disk->check();
         d.pos_next = pos + 1;
         if (logits) std::memcpy(logits, d.hlogits, sizeof(float) * d.V);
         if (!d.o.dump_dir.empty() && logits) {

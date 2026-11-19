@@ -595,8 +595,17 @@ void b_engram(Shard& s, BShard& b, int e, int il, int pos0, int T) {
     const std::string P = "blk." + std::to_string(il) + ".";
     kb_engram_hash<<<T, 32, 0, b.st>>>(s.hist, b.dbounds + 2, s.eg_map, (int64_t) eg_map.size(), eg_pad, s.eg_mult + (size_t) e * ng,
                                        s.eg_vsz + (size_t) e * ncol, s.eg_off + (size_t) e * ncol, ng, nh, b.eg_ids);
-    kb_engram_rows<<<dim3(ncol, T), 128, 0, b.st>>>(eg_table, b.eg_ids, f32(s, P + "engram_lookup_norm.weight"), b.eg_r,
-                                                    eg_D, ncol, 1.1920929e-07f);
+    const auto* norm = f32(s, P + "engram_lookup_norm.weight");
+    if (eg_disk) {
+        for (int i=0; i<T; i+=EngramDisk::Batch) {
+            const int n = std::min<int>(EngramDisk::Batch,T-i);
+            const auto* table = eg_disk->stage(b.eg_ids + size_t(i)*ncol,n,0,b.st);
+            kb_engram_rows<<<dim3(ncol,n),128,0,b.st>>>(table,eg_disk->indices(),norm,b.eg_r + size_t(i)*ncol*eg_D,
+                                                       eg_D,ncol,1.1920929e-07f);
+        }
+    } else {
+        kb_engram_rows<<<dim3(ncol,T),128,0,b.st>>>(eg_table,b.eg_ids,norm,b.eg_r,eg_D,ncol,1.1920929e-07f);
+    }
     blin(s, b, P + "engram_kv.weight", b.eg_r, ncol * eg_D, b.eg_kv, (hc + 1) * E, T);
     kb_engram_mix<<<T, 1024, 0, b.st>>>(b.X, b.R, b.eg_kv, f32(s, P + "engram_kv_b.weight"), f32(s, P + "engram_gate.weight"),
                                         f32(s, P + "engram_hc_scale.weight"), f32(s, P + "engram_pre_gamma.weight"), E, hc,

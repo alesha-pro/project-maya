@@ -343,6 +343,7 @@ public:
     const std::vector<TensorInfo>& tensors() const { return tensors_; }
     const std::map<std::string, MetaValue>& metadata() const { return meta_; }
     uint32_t version() const { return version_; }
+    const std::string& path() const { return path_; }
     uint64_t data_start() const { return data_start_; }
     uint64_t file_size() const { return size_; }
 
