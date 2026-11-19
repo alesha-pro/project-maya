@@ -79,11 +79,13 @@ int peer_of(int g, int r) const { return paired && (S & (S - 1)) == 0 ? (g ^ r) 
 int cap_num = 3, cap_den = 2;   // expert rows buffered per shard: cap_num/cap_den x the even share (ranges past it)
 bool compact_arena = std::getenv("HY4F_PF_COMPACT") != nullptr;
 int attn_tile = 512;
-// Split the head groups and token scratch independently of the expert prefill chunk.
+// The default path preserves the existing multi-GPU and offload configurations.
 int single_prefill_mode() const {
-    const char* setting=std::getenv("HY4F_SINGLE_PF");
-    if (S!=1 || !setting) return 0;
-    return !std::strcmp(setting,"mqa") ? 2 : !std::strcmp(setting,"exact") ? 1 : 0;
+    if (S != 1) return 0;
+    const char* mode = std::getenv("HY4F_SINGLE_PF");
+    if (!mode) return 0;
+    if (std::strcmp(mode, "mqa") == 0) return 2;
+    return std::strcmp(mode, "exact") == 0 ? 1 : 0;
 }
 bool direct_dsa = std::getenv("HY4F_DIRECT_DSA") != nullptr;
 int mqa_opt = std::getenv("HY4F_PF_MQA") ? std::atoi(std::getenv("HY4F_PF_MQA")) : 0;
