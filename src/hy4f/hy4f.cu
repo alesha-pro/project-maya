@@ -32,6 +32,7 @@
 #include "ggml.h"
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/router_sigmoid.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #ifdef HY4F_VISION
@@ -73,7 +74,10 @@ namespace {
         if (e_ != cudaSuccess) throw std::runtime_error(std::string(#x) + ": " + cudaGetErrorString(e_));               \
     } while (0)
 
-enum : int { T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q8_0 = 8, T_Q3_K = 11, T_Q4_K = 12, T_Q6_K = 14, T_BF16 = 30, T_F8 = 43 };
+enum : int { T_F32 = 0, T_F16 = 1, T_Q4_0 = 2, T_Q8_0 = 8, T_Q3_K = 11, T_Q4_K = 12, T_Q6_K = 14, T_IQ2_XXS = 16,
+             T_IQ2_XS = 17, T_IQ3_XXS = 18, T_IQ3_S = 21, T_IQ2_S = 22, T_BF16 = 30, T_F8 = 43 };
+// the expert types of the tuned Hy4 kernels; any other one runs through Maya's native grouped expert kernels
+inline bool tuned_expert_type(int t) { return t == T_Q3_K || t == T_Q4_K || t == T_Q8_0; }
 
 // Internal device layout, never a GGUF tensor type. Eight successive
 // K-iterations for each warp lane form one aligned vector.
@@ -90,6 +94,11 @@ size_t row_bytes(int type, int64_t n) {
     case T_Q3_K: return (size_t) n / 256 * 110;
     case T_Q4_K: return (size_t) n / 256 * 144;
     case T_Q6_K: return (size_t) n / 256 * 210;
+    case T_IQ2_XXS: return (size_t) n / 256 * 66;
+    case T_IQ2_XS: return (size_t) n / 256 * 74;
+    case T_IQ2_S: return (size_t) n / 256 * 82;
+    case T_IQ3_XXS: return (size_t) n / 256 * 98;
+    case T_IQ3_S: return (size_t) n / 256 * 110;
     default: throw std::runtime_error("hy4f: unsupported tensor type " + std::to_string(type));
     }
 }
@@ -99,7 +108,12 @@ int block_elems(int type) {
     case T_Q8_0: return 32;
     case T_Q3_K:
     case T_Q4_K:
-    case T_Q6_K: return 256;
+    case T_Q6_K:
+    case T_IQ2_XXS:
+    case T_IQ2_XS:
+    case T_IQ2_S:
+    case T_IQ3_XXS:
+    case T_IQ3_S: return 256;
     default: return 1;
     }
 }
@@ -277,6 +291,23 @@ struct Model::Impl {
                 throw std::runtime_error("hy4f: incompatible draft gate/up types");
             draft_tensors[name] = {file.get(), replacement};
         }
+        draft_files.emplace_back(std::move(file));
+    }
+    // HY4F_EXPERT_GGUF: the trunk's routed experts from another GGUF of the same model (another quantization; the
+    // attention, head, Engram and MTP stay the base files')
+    void load_trunk_experts(const char* path) {
+        if (!path || !*path) return;
+        auto file = std::make_unique<strata::GgufFile>(path);
+        for (int il = dense_lead; il < L; ++il)
+            for (const char* part : {"gate", "up", "down"}) {
+                const std::string name = "blk." + std::to_string(il) + ".ffn_" + part + "_exps.weight";
+                const strata::GgufFile* base = nullptr;
+                const auto* original = find(name, &base);
+                const auto* replacement = file->find(name);
+                if (!original || !replacement || original->shape != replacement->shape)
+                    throw std::runtime_error("hy4f: incompatible expert tensor " + name + " in " + path);
+                draft_tensors[name] = {file.get(), replacement};
+            }
         draft_files.emplace_back(std::move(file));
     }
     uint64_t mu_(const std::string& k) const {
@@ -1066,6 +1097,9 @@ struct Model::Impl {
                     const strata::TensorInfo* tg = T(P + "ffn_gate_exps.weight", &fg);
                     const strata::TensorInfo* tu = T(P + "ffn_up_exps.weight", &fu);
                     if (tg->type != tu->type) throw std::runtime_error("hy4f: gate/up expert types differ in " + P);
+                    if (!tuned_expert_type((int) tg->type))
+                        throw std::runtime_error("hy4f: experts of type " + std::to_string((int) tg->type) +
+                                                 " need HY4F_EXPERT_VRAM_MB (their kernels read the offload records)");
                     const int64_t per = (int64_t) tg->shape[1];
                     const size_t rb = row_bytes((int) tg->type, (int64_t) tg->shape[0]), eb = rb * (size_t) per;
                     std::vector<uint8_t> h(2 * eb * (size_t) (e1 - e0));
@@ -1577,6 +1611,7 @@ bool Model::load(const Options& o, std::string& err) {
         d.geometry();
         d.load_draft_experts(std::getenv("HY4F_MTP_EXPERT_GGUF"), false);
         d.load_draft_experts(std::getenv("HY4F_MTP_DOWN_GGUF"), true);
+        d.load_trunk_experts(std::getenv("HY4F_EXPERT_GGUF"));
         d.load_engram();
         HY_CK(cudaHostAlloc((void**) &d.hio, sizeof(Io), cudaHostAllocPortable));
         HY_CK(cudaHostAlloc((void**) &d.hlogits, sizeof(float) * d.V, cudaHostAllocPortable));

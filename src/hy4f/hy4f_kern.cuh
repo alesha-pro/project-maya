@@ -492,6 +492,11 @@ __global__ void k_virt_groups(const int* ng, int* experts, const int* vmap) {
     const int i = threadIdx.x;
     if (i < *ng) experts[i] = vmap[experts[i]];
 }
+// the groups' lattice indices -> the addresses of their [gate | up | down] records
+__global__ void k_group_ptrs(const int* ng, const int* experts, const uint8_t* base, size_t stride, unsigned long long* ptrs) {
+    const int i = threadIdx.x;
+    if (i < *ng) ptrs[i] = (unsigned long long) (base + (size_t) experts[i] * stride);
+}
 // HY4F_ROUTE_STATS: the picks per local expert
 __global__ void k_route_hist(const int* loc, int n, unsigned* count) {
     for (int k = blockIdx.x * blockDim.x + threadIdx.x; k < n; k += gridDim.x * blockDim.x)

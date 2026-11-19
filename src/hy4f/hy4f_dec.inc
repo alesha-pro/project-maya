@@ -118,6 +118,8 @@ struct DShard {
     int *cells = nullptr, *eids = nullptr, *eloc = nullptr;
     unsigned *sel_st = nullptr, *sel_hist = nullptr;
     int *mg_n = nullptr, *mg_exp = nullptr, *mg_off = nullptr, *mg_slot = nullptr;   // the step's expert groups
+    unsigned long long* ne_ptr = nullptr;   // the groups' record addresses and the scratch of the native expert kernels
+    void* ne_scratch = nullptr;
     int* sel_bc = nullptr;
     KdCompactRow* sel_compact = nullptr;
     float *lg = nullptr, *ew = nullptr, *xm = nullptr, *ga16 = nullptr, *dn16 = nullptr, *moe = nullptr, *mu = nullptr,
@@ -241,6 +243,8 @@ void dec_alloc(Shard& s, DShard& d) {
     d.mg_exp = ia(128);
     d.mg_off = ia(129);
     d.mg_slot = ia(128);
+    HY_CK(cudaMalloc(&d.ne_ptr, sizeof(unsigned long long) * 128));
+    HY_CK(cudaMalloc(&d.ne_scratch, kn::native_expert_scratch_bytes((int64_t) DT * n_used, n_ffx)));
     d.lg = dalloc((size_t) DT * n_exp);
     d.ew = dalloc((size_t) DT * K);
     d.eids = ia((size_t) DT * K);
@@ -1008,6 +1012,14 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         execute(d.attention_side,cut,d.mg_n+2);
         HY_CK(cudaEventRecord(d.attention_join,d.attention_side));
         HY_CK(cudaStreamWaitEvent(s.st,d.attention_join));
+    } else if (!tuned_expert_type(gu.type) || !tuned_expert_type(down.type)) {
+        // (i-quant experts: Maya's native grouped expert kernels over the offload's [gate | up | down] records)
+        if (!offload || !grouped) throw std::runtime_error("hy4f: expert type " + std::to_string(gu.type) + " needs the expert offload");
+        k_group_ptrs<<<1, 128, 0, s.st>>>(d.mg_n, d.mg_exp, static_cast<const uint8_t*>(gu.d), s.off.at(il).stride, d.ne_ptr);
+        const kn::NativeExpertLayout layout = kn::native_expert_layout(gu.type, down.type, latent, n_ffx);
+        if (!kn::native_expert_grouped(layout, d.ne_ptr, d.mg_off, d.mg_n, d.mg_slot, d.mg_slot, T * K, T * K, d.xlq,
+                                       d.ne_scratch, d.dn16, s.st, clampv))
+            throw std::runtime_error("hy4f: no native kernel for expert type " + std::to_string(gu.type));
     } else {
         ids_mmvq(gu,d.xlq,d.ga16,latent,2*n_ffx);
         k_swiglu_gu_q8<<<nb(T*K*n_ffx),256,0,s.st>>>(d.ga16,n_ffx,T*K*n_ffx,clampv,d.q16);
