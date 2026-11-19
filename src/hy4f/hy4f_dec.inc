@@ -746,8 +746,14 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     }
     if (side || early) HY_CK(cudaStreamWaitEvent(s.st, d.attention_join));
     const int value_groups = T<=2 && std::getenv("HY4F_VALUE_GROUPS") ? 4 : 1;
+    const bool single_split = S == 1 && split && std::getenv("HY4F_SINGLE_DEC_ATTN");
     if (sw) {
-        if (split && (Hl == 16 || Hl == 32)) {   // (32 heads a card: two GPUs)
+        if (single_split && Hl == 64) {
+            kd_mqa_dec<32,false,1,false,2><<<dim3(NSP,T,2),256,mqd_smem<32>(),s.st>>>(
+                d.qabs,d.qp,qpc,QH,nope,th,s.kv[il],nullptr,0,pp,win,1,0,scale,d.spm,d.spl,d.spacc);
+            kd_mqa_fold<false><<<dim3(Hl,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hl,
+                f32(s,P+"attn_sinks.weight"),d.o,nullptr,0,d.cb,0,1,nullptr);
+        } else if (split && (Hl == 16 || Hl == 32)) {   // (32 heads a card: two GPUs)
             if (Hl == 16)
                 (value_groups==4 ? kd_mqa_dec<16,false,4> : kd_mqa_dec<16>)<<<dim3(NSP*value_groups, T), 256, mqd_smem<16>(), s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, 0, pp,
                                                                        win, 1, 0, scale, d.spm, d.spl, d.spacc, 0, 0, qh, false, 0, 0, nullptr, 0, nullptr);
@@ -845,6 +851,11 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                                                      cb,s.g,S,d.cb_ctr,d.arrive+12,d.o);
             else kd_cb_tail<<<T * Hl, 256, 0, s.st>>>(d.part, T, Hd, kvl, CBW(), s.g * Hl, Hl, f32(s, P + "attn_sinks.weight"),
                                                  cb, s.g, S, d.cb_ctr, d.arrive + 12, d.o, sent);
+        } else if (single_split && Hd == 32) {
+            kd_mqa_dec<32><<<dim3(NSP,T),256,mqd_smem<32>(),s.st>>>(d.qabs,d.qp,qpc,QH,nope,th,s.kv[il],
+                d.cells,n_cap,pp,win,1,0,scale,d.spm,d.spl,d.spacc);
+            kd_mqa_fold<false><<<dim3(Hd,T),256,0,s.st>>>(d.spm,d.spl,d.spacc,NSP,Hd,
+                f32(s,P+"attn_sinks.weight"),d.o,nullptr,0,d.cb,0,1,nullptr);
         } else {
             kb_attn2<<<dim3(Hd, T), 256, 0, s.st>>>(d.qabs, d.qp, qpc, QH, nope, th, s.kv[il], nullptr, d.cells, n_cap, pp, win,
                                                     1, 0, f32(s, P + "attn_sinks.weight"), scale, d.o, nullptr, Hd);
@@ -1294,6 +1305,8 @@ void dec_setup() {
         if (replicate_prefix()) {
             HY_CK(cudaFuncSetAttribute(kd_mqa_dec<16,true,1,true>,cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<16>()));
         }
+        if (S == 1 && std::getenv("HY4F_SINGLE_DEC_ATTN"))
+            HY_CK(cudaFuncSetAttribute((kd_mqa_dec<32,false,1,false,2>),cudaFuncAttributeMaxDynamicSharedMemorySize,(int)mqd_smem<32>()));
         HY_CK(cudaFuncSetAttribute(kd_mqa_dec<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqd_smem<16>()));
         HY_CK(cudaFuncSetAttribute(kd_mqa_dec<32>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqd_smem<32>()));
         if (short_graphs)

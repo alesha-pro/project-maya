@@ -302,7 +302,7 @@ __global__ void __launch_bounds__(256) kb_mqa_attn(const float* __restrict__ qab
 // folds the splits (with the sink, or into the combine's partial).  Same tile math as kb_mqa_attn.
 template <int H> constexpr size_t mqd_smem() { return mqa_smem<H>(); }
 
-template <int H, bool DenseDsa = false, int ValueGroups = 1, bool Replica = false>
+template <int H, bool DenseDsa = false, int ValueGroups = 1, bool Replica = false, int HeadGroups = 1>
 __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs, const float* __restrict__ q, int ldq,
                                                   int qs, int nope, float theta, const uint8_t* __restrict__ kv,
                                                   const int* __restrict__ cells, int n_cap, const int* pos0p, int win,
@@ -325,8 +325,8 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
     const int vg=blockIdx.x % ValueGroups, sp = blockIdx.x / ValueGroups, nsp = gridDim.x / ValueGroups, t = blockIdx.y, pos = *pos0p + t;
     const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5;
     const int logical_shard = Replica ? (int)blockIdx.z : shard;
-    const int head_offset = Replica && !local_queries ? shard * 8 : 0;
-    const int input_heads = Replica ? (local_queries ? 8 : 32) : H;
+    const int head_offset = Replica ? (local_queries ? 0 : shard * 8) : (HeadGroups > 1 ? (int)blockIdx.z * H : 0);
+    const int input_heads = Replica ? (local_queries ? 8 : 32) : H * HeadGroups;
     int n, lo = 0;
     if constexpr (DenseDsa) {
         n = (pos + n_shards - logical_shard) / n_shards;
@@ -360,7 +360,7 @@ __global__ void __launch_bounds__(256) kd_mqa_dec(const float* __restrict__ qabs
         n = s_n;
     }
     const int per = ((n + nsp - 1) / nsp + TR - 1) / TR * TR, rb = min(n, sp * per), re = min(n, rb + per);
-    const size_t pb = (((Replica ? (size_t)blockIdx.z * gridDim.y : 0) + t) * nsp + sp) * H;
+    const size_t pb = (((Replica ? (size_t)blockIdx.z * gridDim.y : 0) + t) * nsp + sp) * (H * HeadGroups) + (HeadGroups > 1 ? (size_t)blockIdx.z * H : 0);
     if (rb == re) {
         if (vg == 0 && tid < H) pm[pb + tid] = -INFINITY, pl[pb + tid] = 0.0f;
         return;  // merge only reads accumulator slices belonging to active splits
