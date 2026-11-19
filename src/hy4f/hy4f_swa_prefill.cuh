@@ -11,7 +11,7 @@ __global__ void kb_mqa_queries(const float* qabs, const float* q, int ldq, int q
     if (c0 >= H*D) return;
     const int h = c0 / D, c = c0 % D;
     float v;
-    if (c < 512) v = qabs[((size_t)t*H+h)*512+c];
+    if (c < 512) v = qabs[(((size_t)t*Groups+blockIdx.z)*H+h)*512+c];
     else {
         int j = c-512, jj=j/2;
         const float* pe = q + (size_t)t*ldq + h*qs + nope + 2*jj;
@@ -23,6 +23,7 @@ __global__ void kb_mqa_queries(const float* qabs, const float* q, int ldq, int q
     dst[(size_t)t*H*D+c0] = __float2half_rn(v*scale);
 }
 
+template<int Groups = 1>
 __global__ void kb_swa_scores(const __half* queries, const __half* kv, int base, int nt, float* scores) {
     using namespace nvcuda;
     constexpr int Q=4, N=32, H=16, D=576, K=144, LD=160;
@@ -36,7 +37,7 @@ __global__ void kb_swa_scores(const __half* queries, const __half* kv, int base,
         for (int i=tid;i<Q*H*(K/8);i+=256) {
             const int row=i/(K/8), c=i%(K/8)*8;
             uint4 v=make_uint4(0,0,0,0);
-            if (row/H<active_q) v=*reinterpret_cast<const uint4*>(queries+((size_t)tb*H+row)*D+k0+c);
+            if (row/H<active_q) v=*reinterpret_cast<const uint4*>(queries+(((size_t)tb+row/H)*H*Groups+blockIdx.z*H+row%H)*D+k0+c);
             *reinterpret_cast<uint4*>(&a[row/H][row%H][c])=v;
         }
         for (int i=tid;i<(N+active_q-1)*(K/8);i+=256) {
@@ -62,12 +63,13 @@ __global__ void kb_swa_scores(const __half* queries, const __half* kv, int base,
         __syncthreads();
     }
     if (ti<active_q)
-        wmma::store_matrix_sync(scores+(size_t)(tb+ti)*H*512+gb+nj,sum,512,wmma::mem_row_major);
+        wmma::store_matrix_sync(scores+((size_t)(tb+ti)*Groups+blockIdx.z)*H*512+gb+nj,sum,512,wmma::mem_row_major);
 }
 
+template<int Groups = 1>
 __global__ void kb_swa_probs(const float* scores, const float* sinks, __half* probs) {
     const int h=threadIdx.x/32, lane=threadIdx.x%32;
-    const size_t i=((size_t)blockIdx.x*16+h)*512+lane;
+    const size_t i=(((size_t)blockIdx.x*Groups+blockIdx.y)*16+h)*512+lane;
     float m=-INFINITY,l=0.f,score[16];
 #pragma unroll
     for (int s=0;s<16;++s) {
@@ -78,12 +80,13 @@ __global__ void kb_swa_probs(const float* scores, const float* sinks, __half* pr
         l=l*(m == -INFINITY ? 0.0f : __expf(m-next))+e;
         m=next;
     }
-    const float end=fmaxf(m,sinks[h]);
-    const float inv=1.0f/(l*__expf(m-end)+__expf(sinks[h]-end));
+    const float end=fmaxf(m,sinks[blockIdx.y*16+h]);
+    const float inv=1.0f/(l*__expf(m-end)+__expf(sinks[blockIdx.y*16+h]-end));
 #pragma unroll
     for (int s=0;s<16;++s) probs[i+s*32]=__float2half_rn(__expf(score[s]-end)*inv);
 }
 
+template<int Groups = 1>
 __global__ void kb_swa_values(const __half* probs, const __half* kv, int base, float* out) {
     using namespace nvcuda;
     constexpr int H=16, D=576, N=128, LD=136;
@@ -92,7 +95,7 @@ __global__ void kb_swa_values(const __half* probs, const __half* kv, int base, f
     for (int i=tid;i<H*64;i+=256) {
         const int h=i/64,c=i%64*8;
         *reinterpret_cast<uint4*>(&p[h][c])=
-            *reinterpret_cast<const uint4*>(probs+((size_t)t*H+h)*512+c);
+            *reinterpret_cast<const uint4*>(probs+(((size_t)t*Groups+blockIdx.z)*H+h)*512+c);
     }
     wmma::fragment<wmma::accumulator,16,16,16,float> acc;
     wmma::fill_fragment(acc,0.f);
@@ -113,6 +116,6 @@ __global__ void kb_swa_values(const __half* probs, const __half* kv, int base, f
         }
         __syncthreads();
     }
-    wmma::store_matrix_sync(out+(size_t)t*H*512+col0+16*w,acc,512,wmma::mem_row_major);
+    wmma::store_matrix_sync(out+((size_t)t*Groups+blockIdx.z)*H*512+col0+16*w,acc,512,wmma::mem_row_major);
 }
 }  // namespace strata::hy4f::kern

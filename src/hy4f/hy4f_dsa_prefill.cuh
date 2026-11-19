@@ -22,6 +22,20 @@ __global__ void kb_dsa_expand(const uint8_t* kv, __half* out) {
     if(col<KV_ROW) *reinterpret_cast<uint4*>(out+(size_t)row*KV_ROW+col)=dsa_half8(kv+(size_t)row*KV_RB,col);
 }
 
+// Single-shard cells are already in the selector's original order and end in -1 padding.
+template<bool Whole>
+__device__ __forceinline__ int dsa_count(int pos, int top_k, int groups, int cap, int shard) {
+    if constexpr (Whole) return pos < top_k ? pos + 1 : min(cap, 4*min(groups,pos/4) + pos%4+1);
+    else return grouped_rows(pos,top_k,groups,cap,shard);
+}
+
+template<bool Whole>
+__device__ __forceinline__ int dsa_row(int j, int pos, int top_k, int groups, const int* cells, const uint16_t* wire) {
+    if constexpr (Whole) return cells[j];
+    else return grouped_kv_row(j,pos,top_k,groups,cells,wire);
+}
+
+template<bool Whole = false>
 __global__ void kb_dsa_scores(const __half* queries, const uint8_t* kv, const int* cells,
                               const uint16_t* wire, int groups, int top_k, int cap, int start,
                               int shard, float* scores, const __half* expanded) {
@@ -32,11 +46,11 @@ __global__ void kb_dsa_scores(const __half* queries, const uint8_t* kv, const in
     __shared__ const __half* fp[N];
     int t=blockIdx.y, pos=start+t, tid=threadIdx.x, warp=tid/32;
     int tile=blockIdx.x*N, split=warp/4, h0=((warp/2)&1)*16, r0=(warp&1)*16;
-    int n=grouped_rows(pos,top_k,groups,cap,shard);
+    int n=dsa_count<Whole>(pos,top_k,groups,cap,shard);
     if (tile >= n) return;
     if (tid<N) {
         int j=tile+tid;
-        const int id=j<n?grouped_kv_row(j,pos,top_k,groups,cells+(size_t)t*cap,
+        const int id=j<n?dsa_row<Whole>(j,pos,top_k,groups,cells+(size_t)t*cap,
             wire ? wire+(size_t)t*((groups+7)/8*8) : nullptr):0;
         ptr[tid]=j<n?kv+(size_t)id*KV_RB:nullptr;
         fp[tid]=j<n && expanded ? expanded+(size_t)id*D:nullptr;
@@ -66,15 +80,16 @@ __global__ void kb_dsa_scores(const __half* queries, const uint8_t* kv, const in
     wmma::store_matrix_sync(sum+(split*H+h0)*N+r0,acc,N,wmma::mem_row_major);
     __syncthreads();
     for(int i=tid;i<H*N;i+=256)
-        scores[((size_t)t*H+i/N)*512+tile+i%N] = (0.f+sum[i])+sum[H*N+i];
+        scores[((size_t)t*H+i/N)*(Whole ? 2048 : 512)+tile+i%N] = (0.f+sum[i])+sum[H*N+i];
 }
 
+template<bool Whole = false>
 __global__ void kb_dsa_probs(const float* scores, int start, int top_k, int groups, int cap,
-                             int shard, __half* probs, float* part, int stride) {
+                             int shard, __half* probs, float* part, int stride, const float* sinks = nullptr) {
     const int t=blockIdx.x,h=threadIdx.x/32+blockIdx.y*8,lane=threadIdx.x%32;
-    const int n=grouped_rows(start+t,top_k,groups,cap,shard);
-    const size_t off=((size_t)t*32+h)*512+lane;
-    float m=-INFINITY,l=0.f,s[16];
+    const int n=dsa_count<Whole>(start+t,top_k,groups,cap,shard);
+    const size_t off=((size_t)t*32+h)*(Whole ? 2048 : 512)+lane;
+    float m=-INFINITY,l=0.f,s[Whole ? 64 : 16];
     for(int r=0;r<n;r+=32) {
         const bool valid=r+lane<n;
         const float v=valid?scores[off+r]:-INFINITY;
@@ -84,14 +99,21 @@ __global__ void kb_dsa_probs(const float* scores, int start, int top_k, int grou
         l=l*(m==-INFINITY?0.f:__expf(m-next))+e;
         m=next;
     }
+    float inv=1.f;
+    if constexpr (Whole) {
+        const float mx=fmaxf(m,sinks[h]);
+        inv=1.f/(l*__expf(m-mx)+__expf(sinks[h]-mx));
+        m=mx;
+    }
     for(int r=0;r<n;r+=32)
-        probs[off+r]=__float2half_rn(r+lane<n && m!=-INFINITY ? __expf(s[r/32]-m):0.f);
-    if(lane==0) {
+        probs[off+r]=__float2half_rn(r+lane<n && m!=-INFINITY ? __expf(s[r/32]-m)*inv:0.f);
+    if(!Whole && lane==0) {
         part[((size_t)t*32+h)*stride+512]=m;
         part[((size_t)t*32+h)*stride+513]=l;
     }
 }
 
+template<bool Whole = false>
 __global__ void kb_dsa_values(const __half* probs,const uint8_t* kv,const int* cells,
                               const uint16_t* wire,int groups,int top_k,int cap,int start,
                               int shard,float* out,int stride,const __half* expanded) {
@@ -101,19 +123,19 @@ __global__ void kb_dsa_values(const __half* probs,const uint8_t* kv,const int* c
     __shared__ const uint8_t* ptr[32];
     __shared__ const __half* fp[32];
     const int t=blockIdx.y,tid=threadIdx.x,w=tid/32,pos=start+t;
-    const int n=grouped_rows(pos,top_k,groups,cap,shard),col=blockIdx.x*C;
+    const int n=dsa_count<Whole>(pos,top_k,groups,cap,shard),col=blockIdx.x*C;
     wmma::fragment<wmma::accumulator,16,16,16,float> acc;
     wmma::fill_fragment(acc,0.f);
     for(int g=0;g<n;g+=32) {
         if(tid<32) {
-            int id=g+tid<n?grouped_kv_row(g+tid,pos,top_k,groups,cells+(size_t)t*cap,
+            int id=g+tid<n?dsa_row<Whole>(g+tid,pos,top_k,groups,cells+(size_t)t*cap,
                 wire?wire+(size_t)t*((groups+7)/8*8):nullptr):0;
             ptr[tid]=g+tid<n?kv+(size_t)id*KV_RB:nullptr;
             fp[tid]=g+tid<n && expanded?expanded+(size_t)id*KV_ROW:nullptr;
         }
         if(tid<128) {
             const int h=tid/4,k=tid%4*8;
-            *reinterpret_cast<uint4*>(&p[h][k])=*reinterpret_cast<const uint4*>(probs+((size_t)t*32+h)*512+g+k);
+            *reinterpret_cast<uint4*>(&p[h][k])=*reinterpret_cast<const uint4*>(probs+((size_t)t*32+h)*(Whole ? 2048 : 512)+g+k);
         }
         __syncthreads();
         const int row=tid/8,c=tid%8*8;

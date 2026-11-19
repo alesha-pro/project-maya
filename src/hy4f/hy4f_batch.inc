@@ -41,6 +41,7 @@ struct BShard {
     int64_t* eg_ids = nullptr;
     float* ar_buf[2] = {nullptr, nullptr};   // reduce-scatter receive [src][ts][E] bf16
     float* ag_buf[2] = {nullptr, nullptr};   // all-gather receive [T][E] fp16
+    float* single_scores = nullptr;
     __half* dsa_half = nullptr;
     __half* yn = nullptr;                    // this shard's normalized slice [ts][E] fp16
     const __half* pending_ag = nullptr;
@@ -223,6 +224,10 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.o = m.take<float>((size_t) TA * Ho * kvl);
         if (std::getenv("HY4F_PF_DSA_HALF") && S==4 && kpool==4 && Hd==32)
             b.dsa_half=m.take<__half>(((C+S-1)/S)*KV_ROW);
+        if (single_prefill_mode()==2 && Hs==64 && Hd==32 && kpool==4 && n_cap<=2048 && std::getenv("HY4F_SINGLE_SPLIT_PF")) {
+            b.single_scores=m.take<float>((size_t)TA*Hd*2048);
+            if (std::getenv("HY4F_SINGLE_DSA_HALF")) b.dsa_half=m.take<__half>((size_t)C*KV_ROW);
+        }
         b.part = S > 1 ? m.take<float>((size_t) TA * Hd * CBW()) : nullptr;
         b.a = compact_arena ? b.qr : m.take<float>((size_t) F * Hmax / S * vh);
         b.ao = compact_arena ? b.x : m.take<float>((size_t) F * E);
@@ -606,14 +611,22 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
               Ha * kvl, kvl, Ha);
         const float* qt = b.qp + (size_t) t0 * qp_ld;
         if (sw) {
-            if ((mqa_opt & 4) && expanded && b.part && Hd >= 16 && Hl == 16 && win == 512 && pos0+t0 >= win-1) {
+            if (b.single_scores && expanded && Hl==64 && win==512 && pos0+t0>=win-1) {
+                auto* qh=reinterpret_cast<__half*>(b.o);
+                auto* ph=reinterpret_cast<__half*>(b.qabs);
+                const int base=pos0+t0-win+1-first_row;
+                kb_mqa_queries<64><<<dim3(nb(64*576),tt),256,0,b.st>>>(b.qabs,qt,(int)qp_ld,QH,nope,th,pos0+t0,scale,qh);
+                kb_swa_scores<4><<<dim3(16,(tt+3)/4,4),256,0,b.st>>>(qh,expanded,base,tt,b.single_scores);
+                kb_swa_probs<4><<<dim3(tt,4),512,0,b.st>>>(b.single_scores,sinks,ph);
+                kb_swa_values<4><<<dim3(4,tt,4),256,0,b.st>>>(ph,expanded,base,b.o);
+            } else if ((mqa_opt & 4) && expanded && b.part && Hd >= 16 && Hl == 16 && win == 512 && pos0+t0 >= win-1) {
                 auto* qh = reinterpret_cast<__half*>(b.o);
                 auto* ph = reinterpret_cast<__half*>(b.qabs);
                 const int base = pos0 + t0 - win + 1 - first_row;
                 kb_mqa_queries<16><<<dim3(nb(16 * 576), tt),256,0,b.st>>>(b.qabs, qt, (int)qp_ld, QH, nope, th, pos0+t0, scale, qh);
-                kb_swa_scores<<<dim3(16, (tt+3)/4),256,0,b.st>>>(qh, expanded, base, tt, b.part);
-                kb_swa_probs<<<tt,512,0,b.st>>>(b.part,sinks+s.g*Hl,ph);
-                kb_swa_values<<<dim3(4,tt),256,0,b.st>>>(ph,expanded,base,b.o);
+                kb_swa_scores<><<<dim3(16, (tt+3)/4),256,0,b.st>>>(qh, expanded, base, tt, b.part);
+                kb_swa_probs<><<<tt,512,0,b.st>>>(b.part,sinks+s.g*Hl,ph);
+                kb_swa_values<><<<dim3(4,tt),256,0,b.st>>>(ph,expanded,base,b.o);
             } else if (Hl == 16)
                 kb_mqa_attn<16><<<tt, 256, mqa_smem<16>(), b.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], b.chunk_cur,
                                                                  nullptr, 0, b.pp_attn, b.toff + t0, win, 1, 0, sinks + s.g * Hl, scale,
@@ -700,7 +713,15 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                 }
                 kb_wait_k<<<1, 32, 0, b.st>>>(b.cl, s.g, S, b.step);
             }
-            if (mqa && S==1) {
+            if (b.single_scores && Hd==32 && n_cap<=2048) {
+                const int start=pos0+t0;
+                auto* qh=reinterpret_cast<__half*>(b.o);
+                auto* ph=reinterpret_cast<__half*>(b.qabs);
+                kb_mqa_queries<32><<<dim3(nb(32*576),tt),256,0,b.st>>>(b.qabs,qt,(int)qp_ld,QH,nope,th,start,scale,qh);
+                kb_dsa_scores<true><<<dim3((n_cap+31)/32,tt),256,0,b.st>>>(qh,s.kv[il],cells,nullptr,groups,top_k,n_cap,start,0,b.single_scores,dsa_half);
+                kb_dsa_probs<true><<<dim3(tt,4),256,0,b.st>>>(b.single_scores,start,top_k,groups,n_cap,0,ph,nullptr,0,sinks);
+                kb_dsa_values<true><<<dim3(8,tt),256,0,b.st>>>(ph,s.kv[il],cells,nullptr,groups,top_k,n_cap,start,0,b.o,512,dsa_half);
+            } else if (mqa && S==1) {
                 kb_mqa_attn<32><<<tt,256,mqa_smem<32>(),b.st>>>(b.qabs,qt,(int)qp_ld,QH,nope,th,s.kv[il],
                         nullptr,cells,n_cap,b.pp,t0,win,1,0,sinks,scale,b.o,nullptr,CBW());
             } else if (mqa) {
@@ -709,9 +730,9 @@ void b_attention(Shard& s, BShard& b, int il, int pos0, int T) {
                     auto* ph = reinterpret_cast<__half*>(b.o);
                     const int start = pos0 + t0;
                     kb_mqa_queries<32><<<dim3(nb(32*576),tt),256,0,b.st>>>(b.qabs,qt,(int)qp_ld,QH,nope,th,start,scale,qh);
-                    kb_dsa_scores<<<dim3(16,tt),256,0,b.st>>>(qh,s.kv[il],cells,selected,groups,top_k,n_cap,start,s.g,b.qabs,dsa_half);
-                    kb_dsa_probs<<<dim3(tt,4),256,0,b.st>>>(b.qabs,start,top_k,groups,n_cap,s.g,ph,b.part,CBW());
-                    kb_dsa_values<<<dim3(8,tt),256,0,b.st>>>(ph,s.kv[il],cells,selected,groups,top_k,n_cap,start,s.g,b.part,CBW(),dsa_half);
+                    kb_dsa_scores<><<<dim3(16,tt),256,0,b.st>>>(qh,s.kv[il],cells,selected,groups,top_k,n_cap,start,s.g,b.qabs,dsa_half);
+                    kb_dsa_probs<><<<dim3(tt,4),256,0,b.st>>>(b.qabs,start,top_k,groups,n_cap,s.g,ph,b.part,CBW());
+                    kb_dsa_values<><<<dim3(8,tt),256,0,b.st>>>(ph,s.kv[il],cells,selected,groups,top_k,n_cap,start,s.g,b.part,CBW(),dsa_half);
                 } else kb_mqa_attn<32><<<tt, 256, mqa_smem<32>(), b.st>>>(b.qabs, qt, (int) qp_ld, QH, nope, th, s.kv[il], nullptr,
                                                                  cells, n_cap, b.pp, t0, win, S, s.g, nullptr, scale,
                                                                  nullptr, b.part, CBW(), dsa_half, 0, mqa_opt & 1, direct ? top_k : 0, groups, selected);
