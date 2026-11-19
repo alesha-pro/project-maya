@@ -6,6 +6,8 @@
 struct BShard {
     float* unpacked_router = nullptr;
     int Tmax = 0;
+    int layer_tile = 0;
+    int* tile_bounds = nullptr;
     cudaStream_t st = nullptr;   // this micro-batch's stream (A: the shard's stream, B: its own)
     // the SWA chunk buffer as this pass sees it (micro-batches share one per layer parity): kv rows written at chunk_off,
     // the attention's positions = *pp_attn + toff + t, the ring written for ring_T rows (0: another pass does it)
@@ -121,6 +123,11 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     }
     if (S == 1 && !single_prefill_mode()) attn_tile = Tmax;
     const int T = Tmax, K = n_used, QH = nope + rope, Hmax = std::max(Hd, Hs);
+    const char* tile_setting = std::getenv("HY4F_SINGLE_LAYER_TILE");
+    b.layer_tile = offload && compact_arena && single_prefill_mode() && tile_setting
+        ? std::clamp(std::atoi(tile_setting), 1, T) : T;
+    const int F = b.layer_tile;
+    const bool sliced = F < T;
     const int64_t C = o.max_context;
     b.mmq = new strata::prefill::mmq::Context();
     HY_CK(cudaFuncSetAttribute(kb_mqa_attn<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int) mqa_smem<16>()));
@@ -152,20 +159,22 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
     qp_ld = std::max((size_t) Hd * QH + (size_t) IH * IK, (size_t) Hs / S * QH);
     xm_ld = (size_t) latent + 2 * n_ffx / S;
     const size_t q8a = std::max({strata::prefill::mmq::q8_bytes(b.cap, std::max(latent, n_ffx)),
-                                 strata::prefill::mmq::q8_bytes(T, std::max({E, Hmax / S * vh, n_ff / S, 4096})),
-                                 strata::prefill::mmq::q8_bytes(T, eg_D * (eg_ngram - 1) * eg_heads)});
+                                 strata::prefill::mmq::q8_bytes(F, std::max({E, Hmax / S * vh, n_ff / S, 4096})),
+                                 strata::prefill::mmq::q8_bytes(T, std::max(2*E, n_ffx / S)),
+                                 strata::prefill::mmq::q8_bytes(F, eg_D * (eg_ngram - 1) * eg_heads)});
     const int ts = (T + S - 1) / S, ncol = (eg_ngram - 1) * eg_heads;
     const int Ha = std::max(Hd, Hs / S), Ho = S > 1 ? Hmax / S : Hmax;
     const int TA = std::min(T, attn_tile);
     // persistent
     auto persistent = [&](Bump& m) {
         b.dbounds = m.take<int>(4);   // {0, T, pos0, -}
+        if (sliced) b.tile_bounds = m.take<int>(4);
         b.iota = m.take<int>((size_t) T * K + strata::prefill::mmq::IDS_PAD);
         b.toks = m.take<int>(T);
         const size_t pack_rs = (dma_mask & 1) ? (size_t)T * E * sizeof(__nv_bfloat16) : 0;
         const size_t pack_cb = (dma_mask & 4) ? (size_t)TA * Hd * CB_SLOT : 0;
         b.xq = m.take<uint8_t>(std::max({q8a, pack_rs, pack_cb}));
-        b.xq2 = m.take<uint8_t>(q8a);
+        b.xq2 = m.take<uint8_t>(sliced ? strata::prefill::mmq::q8_bytes(b.cap, n_ffx) : q8a);
         b.X = m.take<float>((size_t) T * hc * E);
         b.R = b.X;   // (X = R + post * y and R = X: the same values everywhere in the batched path)
         b.x = m.take<float>((size_t) T * E);
@@ -173,7 +182,7 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.hcp = m.take<float>((size_t) T * 8 * HC_SPLIT);
         b.hcs = m.take<float>((size_t) T * HC_SPLIT);
         b.score = m.take<float>((size_t) score_tile * (C / kpool + 1));
-        b.chunk = m.take<uint8_t>((size_t) T * KV_RB);
+        b.chunk = m.take<uint8_t>((size_t) F * KV_RB);
         b.ew = m.take<float>((size_t) T * K);
         b.eids = m.take<int>((size_t) T * K);
         b.mb = m.take<int>(nl_max + 1);
@@ -184,11 +193,13 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.eg_ids = m.take<int64_t>((size_t) T * ncol);
         b.emask = m.take<int>(T);
         // exchanges: one buffer each (the alternation RS -> AG -> RS .. and the waits order every reuse)
-        b.ar_buf[0] = b.ar_buf[1] = m.take<float>((size_t) S * ts * E / 2 + 64);
-        b.ag_buf[0] = b.ag_buf[1] = m.take<float>((size_t) T * E / 2 + 64);
-        b.cb_buf[0] = b.cb_buf[1] = m.take<float>(std::getenv("HY4F_CB32") ? (size_t) S * TA * (Hd / S) * CBW()
-                                                                           : (size_t) S * TA * (Hd / S) * CB_SLOT / 4);
-        b.yn = m.take<__half>((size_t) ts * E);
+        if (!sliced) {
+            b.ar_buf[0] = b.ar_buf[1] = m.take<float>((size_t) S * ts * E / 2 + 64);
+            b.ag_buf[0] = b.ag_buf[1] = m.take<float>((size_t) T * E / 2 + 64);
+            b.cb_buf[0] = b.cb_buf[1] = m.take<float>(std::getenv("HY4F_CB32") ? (size_t) S * TA * (Hd / S) * CBW()
+                                                                               : (size_t) S * TA * (Hd / S) * CB_SLOT / 4);
+            b.yn = m.take<__half>((size_t) ts * E);
+        }
         b.ag_flag = m.take<int>(4);
         b.ar_flag = m.take<int>(4);
         b.cb_flag = m.take<int>(4);
@@ -205,19 +216,19 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.hold = m.take<float>(E);
     };
     auto attn = [&](Bump& m) {
-        b.xp = m.take<float>((size_t) T * xp_ld);
-        b.qr = m.take<float>((size_t)T * (compact_arena ? std::max(q_lora, Hmax / S * vh) : q_lora));
-        b.qp = m.take<float>((size_t) T * qp_ld);
+        b.xp = m.take<float>((size_t) F * xp_ld);
+        b.qr = m.take<float>((size_t)F * (compact_arena ? std::max(q_lora, Hmax / S * vh) : q_lora));
+        b.qp = m.take<float>((size_t) F * qp_ld);
         b.qabs = m.take<float>((size_t) TA * Ha * kvl);
         b.o = m.take<float>((size_t) TA * Ho * kvl);
         if (std::getenv("HY4F_PF_DSA_HALF") && S==4 && kpool==4 && Hd==32)
             b.dsa_half=m.take<__half>(((C+S-1)/S)*KV_ROW);
         b.part = S > 1 ? m.take<float>((size_t) TA * Hd * CBW()) : nullptr;
-        b.a = compact_arena ? b.qr : m.take<float>((size_t) T * Hmax / S * vh);
-        b.ao = compact_arena ? b.x : m.take<float>((size_t) T * E);
-        b.ikn = m.take<float>((size_t) T * IK);
-        b.ivg = m.take<float>((size_t) T * 2 * IK);
-        b.iw = m.take<float>((size_t) T * IH);
+        b.a = compact_arena ? b.qr : m.take<float>((size_t) F * Hmax / S * vh);
+        b.ao = compact_arena ? b.x : m.take<float>((size_t) F * E);
+        b.ikn = m.take<float>((size_t) F * IK);
+        b.ivg = m.take<float>((size_t) F * 2 * IK);
+        b.iw = m.take<float>((size_t) F * IH);
         b.cells = m.take<int>((size_t) TA * n_cap);
         const char* select = std::getenv("HY4F_PF_SELECT");
         if (select && std::atoi(select) && C >= 98304) {
@@ -238,8 +249,8 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
                                           (size_t)T * 2 * E, (size_t)T * n_exp});
             b.lg = b.gu = b.dn = experts.take<float>(work);
             b.mu = final.take<float>((size_t)T * E);
-            b.shh = final.take<float>((size_t)T * std::max(n_ffx / S, n_ff / S));
-            b.shd = b.ffo = final.take<float>((size_t)T * std::max(E, 2 * n_ff / S));
+            b.shh = final.take<float>(std::max((size_t)T * (n_ffx / S), (size_t)F * (n_ff / S)));
+            b.shd = b.ffo = final.take<float>(std::max((size_t)T * E, (size_t)F * (2 * n_ff / S)));
             m.off = std::max(experts.off, final.off);
             return;
         }
@@ -254,8 +265,8 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.ffo = m.take<float>((size_t) T * E);
     };
     auto engr = [&](Bump& m) {
-        b.eg_r = m.take<float>((size_t) T * ncol * eg_D);
-        b.eg_kv = m.take<float>((size_t) T * (hc + 1) * E);
+        b.eg_r = m.take<float>((size_t) F * ncol * eg_D);
+        b.eg_kv = m.take<float>((size_t) F * (hc + 1) * E);
     };
     Bump m0, ma, mf, me;
     persistent(m0);
@@ -904,6 +915,37 @@ void b_ffn(Shard& s, BShard& b, int il, int T) {
     b_ar_post(s, b, b.ffo, P + "post_ffw_norm.weight", T);
 }
 
+// Attention and the dense lead consume only one token tile at a time.
+// Routed experts still see all tokens, amortizing one host transfer over the full chunk.
+void b_layer(Shard& s, BShard& b, int il, int start, int T) {
+    const bool sliced = T > b.layer_tile;
+    for (int t = 0; t < T; t += b.layer_tile) {
+        const int n = std::min(T - t, b.layer_tile);
+        BShard tile;
+        BShard* active = &b;
+        if (sliced) {
+            tile = b;
+            tile.dbounds = b.tile_bounds;
+            kb_tile_bounds<<<1, 1, 0, b.st>>>(tile.dbounds, start + t, n);
+            tile.X = tile.R = b.X + (size_t)t * hc * E;
+            if (b.mtp) tile.mr = b.mr + (size_t)t * E;
+            tile.emask = b.emask + t;
+            tile.pp = tile.pp_attn = tile.dbounds + 2;
+            tile.chunk_cur = b.chunk;
+            tile.toff = tile.chunk_off = 0;
+            tile.ring_T = n;
+            active = &tile;
+        }
+        if (!b.mtp) {
+            for (size_t e = 0; e < eg_layers.size(); ++e)
+                if (eg_layers[e] == il) b_engram(s, *active, (int)e, il, start + t, n);
+        }
+        b_attention(s, *active, il, start + t, n);
+        if (il < dense_lead) b_ffn(s, *active, il, n);
+    }
+    if (il >= dense_lead && !(b.mtp && mtp_kv_only)) b_ffn(s, b, il, T);
+}
+
 // one chunk on one shard: tokens b.toks (already on the device), positions pos0 ..; logits of the last token
 struct Span {   // embedding rows over the chunk's token rows [t0, t0 + n) (host [n][E])
     int t0, n;
@@ -925,12 +967,7 @@ void b_chunk(Shard& s, BShard& b, int pos0, int T, bool want_logits, const std::
         HY_CK(cudaMemcpyAsync(b.gu, sp.rows, sizeof(float) * (size_t) sp.n * E, cudaMemcpyHostToDevice, b.st));
         kb_embed_rows<<<dim3(nb(E), sp.n), 256, 0, b.st>>>(b.gu, sp.t0, b.dbounds + 2, b.X, E, hc, s.hist, b.emask);
     }
-    for (int il = 0; il < L; ++il) {
-        for (size_t e = 0; e < eg_layers.size(); ++e)
-            if (eg_layers[e] == il) b_engram(s, b, (int) e, il, pos0, T);
-        b_attention(s, b, il, pos0, T);
-        b_ffn(s, b, il, T);
-    }
+    for (int il = 0; il < L; ++il) b_layer(s, b, il, pos0, T);
     // the final hidden states (hc head + output norm): every row when the MTP layer follows, else the last one
     const int th = has_mtp ? T : 1;
     b_norm_in(s, b, "", "output_hc", "output_norm.weight", hc, 0.0f, th, (size_t) (T - th));
@@ -973,10 +1010,7 @@ void b_mtp(Shard& s, BShard& b, const float* hrow0, int nx, const int* toks, int
     blin(s, b, P + "nextn.eh_proj.weight", cat, 2 * E, b.mr, E, Tm);
     b.mtp = true;
     b.pp = b.dbounds + 3;
-    b_attention(s, b, L, mpos0, Tm);
-    // The next request consumes the MTP KV cache, pooled keys and open group.
-    // Draft generation seeds its residual from the trunk hidden state.
-    if (!mtp_kv_only) b_ffn(s, b, L, Tm);
+    b_layer(s, b, L, mpos0, Tm);
     b.mtp = false;
     b.pp = b.dbounds + 2;
 }

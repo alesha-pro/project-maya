@@ -10,6 +10,12 @@
 namespace strata::hy4f {
 namespace kern {
 
+__global__ void kb_tile_bounds(int* bounds, int start, int rows) {
+    bounds[0] = 0;
+    bounds[1] = rows;
+    bounds[2] = bounds[3] = start;
+}
+
 __global__ void kb_embed(const uint8_t* emb, size_t rb, const int* toks, const int* pos0p, float* X, float* R, int E, int hc,
                          int* hist) {
     const int pos0 = *pos0p;
