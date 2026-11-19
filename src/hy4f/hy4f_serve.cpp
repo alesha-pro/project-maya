@@ -513,14 +513,16 @@ int serve(Model& m, const ServeOptions& so) {
     const bool host_supported = CH == int(HostPrefixIndex::block);
     const int host_slots = host_setting && host_supported &&
         (std::strcmp(host_setting, "2") == 0 || std::strcmp(host_setting, "3") == 0) ? host_setting[0] - '0' : 0;
-    HostPrefixIndex host_keys(host_slots, std::getenv("HY4F_DEEP_HOST_PREFIX") != nullptr);
+    const char* fine_setting = std::getenv("HY4F_FINE_HOST_PREFIX");
+    HostPrefixIndex host_keys(host_slots, std::getenv("HY4F_DEEP_HOST_PREFIX") != nullptr,
+                              fine_setting && std::strcmp(fine_setting, "1") == 0);
     if (host_setting && !host_slots)
         std::fprintf(stderr, "maya hy4f serve: host prefix cache requires slots 2 or 3 and chunk 2048\n");
     const char* reserve = std::getenv("HY4F_HOST_PREFIX_PREALLOC");
     if (host_slots && reserve && std::strcmp(reserve, "1") == 0) {
         const double started = now_ms();
         const bool ok = m.preallocate_host_prefixes(host_slots, HostPrefixIndex::checkpoint(C),
-                                                    host_keys.deep_checkpoint(C), err);
+                                                    host_keys.deep_checkpoint(C), err, host_keys.max_delta(C));
         std::fprintf(stderr, "maya hy4f serve: host prefix prealloc before READY ms=%.1f status=%s\n",
                      now_ms() - started, ok ? "ready" : "on-demand");
         if (!ok) std::fprintf(stderr, "maya hy4f serve: host prefix prealloc failed (%s)\n", err.c_str());
@@ -660,6 +662,7 @@ int serve(Model& m, const ServeOptions& so) {
         const bool cold_aligned = from == 0 || host_restored || ring_cold_aligned;
         const size_t host_checkpoint = text_cache && cold_aligned ? HostPrefixIndex::checkpoint(n) : 0;
         const size_t deep_checkpoint = text_cache && cold_aligned ? host_keys.deep_checkpoint(n) : 0;
+        const size_t fine_checkpoint = text_cache && cold_aligned ? host_keys.fine_checkpoint(n) : 0;
         state.resize(from);
         held.erase(std::remove_if(held.begin(), held.end(), [&](const Held& q) { return q.start + q.n > (long long) from; }),
                    held.end());
@@ -715,14 +718,16 @@ int serve(Model& m, const ServeOptions& so) {
                 fatal("prefill at " + std::to_string(a) + ": " + err, 0, n);
             state.insert(state.end(), r.ids.begin() + (long) a, r.ids.begin() + (long) a + T);
             a += (size_t) T;
-            if (a == host_checkpoint || a == deep_checkpoint) {
-                const int slot = host_keys.destination(state);
+            if (a == host_checkpoint || a == deep_checkpoint || a == fine_checkpoint) {
+                const bool fine = a == fine_checkpoint;
+                const int parent = fine ? host_keys.fine_parent(state) : -1;
+                const int slot = fine && parent < 0 ? -1 : host_keys.destination(state, parent);
                 if (slot >= 0) {
                     const double started = now_ms();
                     host_keys.clear(slot);
                     double d2h_ms = 0;
-                    if (m.save_host_prefix(slot, err, &d2h_ms)) {
-                        host_keys.publish(slot, state);
+                    if (m.save_host_prefix(slot, err, &d2h_ms, parent)) {
+                        host_keys.publish(slot, state, parent);
                         std::fprintf(stderr, "maya hy4f serve: host prefix saved slot=%d rows=%zu ms=%.1f d2h_ms=%.1f\n",
                                      slot, a, now_ms() - started, d2h_ms);
                     } else {

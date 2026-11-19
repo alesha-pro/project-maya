@@ -1650,11 +1650,14 @@ struct Model::HostPrefix {
     struct Buffer { uint8_t* ptr = nullptr; size_t capacity = 0; };
     struct Region { void* device; size_t bytes; };
     std::vector<Buffer> buffers;
-    int64_t pos = 0, capacity_rows = 0;
+    int64_t pos = 0, capacity_rows = 0, begin = 0;
+    int parent = -1;
+    uint64_t generation = 0, parent_generation = 0;
+    bool delta_capacity = false;
     explicit HostPrefix(int shards) : buffers(shards) {}
     ~HostPrefix() { for (auto& b : buffers) if (b.ptr) cudaFreeHost(b.ptr); }
 
-    static std::vector<Region> regions(Impl& d, Shard& s, int64_t pos) {
+    static std::vector<Region> regions(Impl& d, Shard& s, int64_t pos, int64_t begin = 0) {
         std::vector<Region> regions;
         for (int il = 0; il < d.L + int(d.has_mtp); ++il) {
             auto ring = serve_ring(s, il, d.swa[il] != 0, d.win, d.kpool, d.IK);
@@ -1662,20 +1665,25 @@ struct Model::HostPrefix {
             if (d.swa[il]) continue;
             // Trunk positions [0,pos); the MTP prefills pairs [0,pos-1).
             const size_t rows = size_t(pos - (il == d.L));
+            const size_t first = begin ? size_t(begin - (il == d.L)) : 0;
             const size_t owned = (rows + d.S - 1 - s.g) / d.S;
-            regions.push_back({s.kv.at(il), owned * KV_RB});
-            regions.push_back({s.pooled.at(il), rows / d.kpool * d.IK * sizeof(__half)});
+            const size_t owned_before = (first + d.S - 1 - s.g) / d.S;
+            regions.push_back({s.kv.at(il) + owned_before * KV_RB, (owned - owned_before) * KV_RB});
+            const size_t pools_before = first / d.kpool;
+            regions.push_back({s.pooled.at(il) + pools_before * d.IK,
+                               (rows / d.kpool - pools_before) * d.IK * sizeof(__half)});
             auto replica = s.prefix_kv.find(il);
-            if (replica != s.prefix_kv.end())
+            if (!begin && replica != s.prefix_kv.end())
                 regions.push_back({replica->second, std::min(rows, size_t(d.top_k)) * KV_RB});
         }
-        regions.push_back({s.hist, size_t(pos) * sizeof(int)});
+        regions.push_back({s.hist + begin, size_t(pos - begin) * sizeof(int)});
         if (d.has_mtp) regions.push_back({d.bsh[s.g].hprev, size_t(d.E) * sizeof(float)});
         return regions;
     }
 
-    void reserve(Impl& d, int i, int64_t rows) {
-        if (rows <= capacity_rows) return;
+    void reserve(Impl& d, int i, int64_t rows, int64_t begin = 0) {
+        const int64_t count = rows - begin;
+        if (count <= capacity_rows && delta_capacity == bool(begin)) return;
         capacity_rows = 0;  // A failed grow can leave different capacities on different shards.
         std::vector<double> alloc_ms(d.S);
         using clock = std::chrono::steady_clock;
@@ -1691,7 +1699,7 @@ struct Model::HostPrefix {
         try {
             d.launch_parallel([&](Shard& s) {
                 size_t bytes = 0;
-                for (const auto& r : regions(d, s, rows)) bytes += r.bytes;
+                for (const auto& r : regions(d, s, rows, begin)) bytes += r.bytes;
                 auto& b = buffers[s.g];
                 if (bytes <= b.capacity) return;
                 if (b.ptr) HY_CK(cudaFreeHost(b.ptr));
@@ -1707,25 +1715,37 @@ struct Model::HostPrefix {
                 b = {ptr, bytes};
             });
         } catch (...) { report(false); throw; }
-        capacity_rows = rows;
+        capacity_rows = count;
+        delta_capacity = bool(begin);
         report(true);
     }
 };
 
-bool Model::preallocate_host_prefixes(int slots, int64_t short_rows, int64_t deep_rows, std::string& err) {
+bool Model::preallocate_host_prefixes(int slots, int64_t short_rows, int64_t deep_rows, std::string& err, int64_t fine_rows) {
     try {
         if (!host_prefixes_.empty() || (slots != 2 && slots != 3) || d_->bsh.empty() ||
-            short_rows < 0 || deep_rows < 0 || short_rows >= max_context() || deep_rows >= max_context())
+            short_rows < 0 || deep_rows < 0 || short_rows >= max_context() || deep_rows >= max_context() ||
+            fine_rows < 0 || fine_rows > 6144 || (fine_rows && (short_rows != 32768 || short_rows + fine_rows >= max_context())))
             throw std::runtime_error("invalid host prefix reservation");
         // Publish the whole reservation only when it fits. On failure the temporaries unpin
         // every successful allocation, including other shards of the incomplete slot.
-        std::vector<std::shared_ptr<HostPrefix>> pending;
-        for (int64_t rows : {short_rows, deep_rows}) {
-            if (!rows) continue;
-            for (int i = 0; i < slots; ++i) {
-                auto slot = std::make_shared<HostPrefix>(d_->S);
-                slot->reserve(*d_, int(pending.size()), rows);
-                pending.push_back(std::move(slot));
+        std::vector<std::shared_ptr<HostPrefix>> pending((deep_rows || fine_rows) ? 2 * slots : slots);
+        if (fine_rows) pending.resize(2 * slots + 2);
+        auto reserve = [&](int index, int64_t end, int64_t begin = 0) {
+            if (!end) return;
+            auto slot = std::make_shared<HostPrefix>(d_->S);
+            slot->reserve(*d_, index, end, begin);
+            pending[index] = std::move(slot);
+        };
+        for (int i = 0; i < slots; ++i) reserve(i, short_rows);
+        for (int i = 0; i < slots; ++i) reserve(slots + i, deep_rows);
+        if (fine_rows) {
+            try {
+                for (int i = 0; i < 2; ++i) reserve(2 * slots + i, short_rows + fine_rows, short_rows);
+            } catch (const std::exception& e) {
+                // Keep the established anchor reservations. Optional delta buffers can grow on demand.
+                pending.resize(2 * slots);
+                std::fprintf(stderr, "maya hy4f serve: fine host prealloc on-demand (%s)\n", e.what());
             }
         }
         host_prefixes_.swap(pending);
@@ -1733,10 +1753,10 @@ bool Model::preallocate_host_prefixes(int slots, int64_t short_rows, int64_t dee
     } catch (const std::exception& e) { err = e.what(); return false; }
 }
 
-void Model::transfer_host_prefix(HostPrefix& slot, int64_t pos, bool save) {
+void Model::transfer_host_prefix(HostPrefix& slot, int64_t pos, bool save, int64_t begin) {
     Impl& d = *d_;
     d.launch_parallel([&](Shard& s) {
-        auto regions = HostPrefix::regions(d, s, pos);
+        auto regions = HostPrefix::regions(d, s, pos, begin);
         auto& buffer = slot.buffers[s.g];
         size_t bytes = 0;
         for (const auto& r : regions) bytes += r.bytes;
@@ -1758,17 +1778,33 @@ void Model::transfer_host_prefix(HostPrefix& slot, int64_t pos, bool save) {
     });
 }
 
-bool Model::save_host_prefix(int i, std::string& err, double* d2h_ms) {
+bool Model::save_host_prefix(int i, std::string& err, double* d2h_ms, int parent) {
     try {
-        if (i < 0 || i >= 6 || d_->pos_next < 4096 || d_->pos_next >= d_->o.max_context || d_->pos_next % 2048 || d_->bsh.empty())
+        if (i < 0 || i >= 8 || d_->pos_next < 4096 || d_->pos_next >= d_->o.max_context || d_->pos_next % 2048 || d_->bsh.empty())
             throw std::runtime_error("invalid host prefix checkpoint");
+        int64_t begin = 0;
+        uint64_t parent_generation = 0;
+        if (parent >= 0) {
+            if (parent == i || size_t(parent) >= host_prefixes_.size() || !host_prefixes_[parent])
+                throw std::runtime_error("host prefix delta has no anchor");
+            const auto& anchor = *host_prefixes_[parent];
+            begin = anchor.pos;
+            if (anchor.parent >= 0 || begin < 32768 || begin % 8192 ||
+                d_->pos_next <= begin || d_->pos_next - begin > 6144)
+                throw std::runtime_error("invalid host prefix delta boundary");
+            parent_generation = anchor.generation;
+        }
         if (host_prefixes_.size() <= size_t(i)) host_prefixes_.resize(i + 1);
         auto& slot = host_prefixes_[i];
         if (!slot) slot = std::make_shared<HostPrefix>(d_->S);
         slot->pos = 0;
-        slot->reserve(*d_, i, d_->pos_next);
+        ++slot->generation;
+        slot->parent = parent;
+        slot->begin = begin;
+        slot->parent_generation = parent_generation;
+        slot->reserve(*d_, i, d_->pos_next, begin);
         const auto start = std::chrono::steady_clock::now();
-        transfer_host_prefix(*slot, d_->pos_next, true);
+        transfer_host_prefix(*slot, d_->pos_next, true, begin);
         if (d2h_ms)
             *d2h_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
         slot->pos = d_->pos_next;
@@ -1780,6 +1816,12 @@ bool Model::load_host_prefix(int i, int64_t pos, std::string& err) {
     try {
         if (i < 0 || size_t(i) >= host_prefixes_.size() || !host_prefixes_[i] || host_prefixes_[i]->pos != pos || pos <= 0)
             throw std::runtime_error("host prefix missing");
+        const auto& slot = host_prefixes_[i];
+        if (slot->parent >= 0) {
+            const auto& anchor = host_prefixes_.at(slot->parent);
+            if (!anchor || !anchor->pos || anchor->pos != slot->begin || anchor->generation != slot->parent_generation)
+                throw std::runtime_error("host prefix delta anchor expired");
+        }
         // A different branch owns the live rings now. Invalidate both old marks before the first write.
         prefix_pos_ = -1;
         if (snap_) snap_->pos = -1;
@@ -1791,7 +1833,9 @@ bool Model::load_host_prefix(int i, int64_t pos, std::string& err) {
             d_->sparse_high = 0;
         }
         d_->packed_index_groups = -1;
-        transfer_host_prefix(*host_prefixes_[i], pos, false);
+        if (slot->parent >= 0)
+            transfer_host_prefix(*host_prefixes_[slot->parent], slot->begin, false);
+        transfer_host_prefix(*slot, pos, false, slot->begin);
         d_->pos_next = hw_ = pos;
         d_->sparse_high = (int)std::min<int64_t>(pos,d_->sparse_limit);
         return true;
