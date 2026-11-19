@@ -4,6 +4,7 @@
 // exchanges as eager push / wait kernels with a host step counter.  Launched eagerly from the per-shard threads.
 
 struct BShard {
+    bool rcap = false;   // HY4F_RESID_DUMP: this chunk records the last row's streams (shard 0, logits chunk)
     float* unpacked_router = nullptr;
     int Tmax = 0;
     int layer_tile = 0;
@@ -548,8 +549,19 @@ void b_ar_post(Shard& s, BShard& b, const float* y, const std::string& norm, int
         kb_ag_post<<<T, 1024, 0, b.st>>>(E, b.ag, s.g, S, b.step, X, X, post, hcn);
 }
 
+// the residual entering trunk layer il (hc_attn) or leaving the last one (output_hc), last row of the call
 void b_norm_in(Shard& s, BShard& b, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
                float mag, int T, size_t t0 = 0) {
+    b_norm_in_(s, b, P, k, norm, n_mix, mag, T, t0);
+    if (!b.rcap || b.mtp || T <= 0) return;
+    const int il = k == "hc_attn" ? std::atoi(P.c_str() + 4) : k == "output_hc" ? L : -1;
+    if (il < 0 || il > L) return;
+    HY_CK(cudaMemcpyAsync(cap_host + (size_t) il * hc * E, b.X + (t0 + (size_t) T - 1) * hc * E, sizeof(float) * hc * E,
+                          cudaMemcpyDeviceToHost, b.st));
+}
+
+void b_norm_in_(Shard& s, BShard& b, const std::string& P, const std::string& k, const std::string& norm, int n_mix,
+                float mag, int T, size_t t0 = 0) {
     if (S==1 && hc==4 && E==3072 && HC_SPLIT==16 && n_mix<=8 && std::getenv("HY4F_SINGLE_COMBINE")) {
         kb_hc_norm_fused<false><<<T,1024,0,b.st>>>(b.X+t0*hc*E,nullptr,nullptr,
             f32(s,P+k+"_fn.weight"),f32(s,P+k+"_scale.weight"),f32(s,P+k+"_base.weight"),
@@ -1074,6 +1086,8 @@ void b_chunk(Shard& s, BShard& b, int pos0, int T, bool want_logits, const std::
     b.hb[3] = pos0 > 0 ? pos0 - 1 : 0;   // the MTP rows' first position (it lags the trunk by one)
     HY_CK(cudaMemcpyAsync(b.dbounds, b.hb, sizeof(int) * 4, cudaMemcpyHostToDevice, b.st));
     b.mtp = false;
+    b.rcap = cap_env && want_logits && s.g == 0;
+    if (b.rcap && !cap_host) HY_CK(cudaMallocHost((void**) &cap_host, sizeof(float) * (size_t) (L + 1) * hc * E));
     b.pp = b.dbounds + 2;
     b.chunk_cur = b.chunk, b.chunk_off = 0, b.pp_attn = b.pp, b.toff = 0, b.ring_T = T;
     const DW& emb = s.w.at("token_embd.weight");
@@ -1087,6 +1101,16 @@ void b_chunk(Shard& s, BShard& b, int pos0, int T, bool want_logits, const std::
     // the final hidden states (hc head + output norm): every row when the MTP layer follows, else the last one
     const int th = has_mtp ? T : 1;
     b_norm_in(s, b, "", "output_hc", "output_norm.weight", hc, 0.0f, th, (size_t) (T - th));
+    if (b.rcap) {   // one record: int32 {layers + 1, hc, E, positions so far}, then [layers + 1][hc][E] f32
+        HY_CK(cudaStreamSynchronize(b.st));
+        if (FILE* f = std::fopen(cap_env, "ab")) {
+            const int32_t hdr[4] = {L + 1, hc, E, pos0 + T};
+            std::fwrite(hdr, sizeof(hdr), 1, f);
+            std::fwrite(cap_host, sizeof(float), (size_t) (L + 1) * hc * E, f);
+            std::fclose(f);
+        }
+        b.rcap = false;
+    }
     const float* hlast = b.x + (size_t) (th - 1) * E;
     if (want_logits) {
         {

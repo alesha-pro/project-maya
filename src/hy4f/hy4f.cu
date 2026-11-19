@@ -254,6 +254,8 @@ struct Model::Impl {
     // HY4F_EXPERT_ADAPT: the VRAM set follows the routing - a cold resident and a hot host expert trade places
     bool scratch_cache = false, scratch_active = false;
     const bool adapt_scratch = std::getenv("HY4F_SINGLE_ADAPT_WORKSPACE") != nullptr;
+    const char* cap_env = std::getenv("HY4F_RESID_DUMP");   // residual capture for refusal directions (b_norm_in)
+    float* cap_host = nullptr;
     bool adapt = false;
     double adapt_horizon = 1024;                   // tokens after which an old pick weighs 1/e
     double adapt_pf_weight = 0;                    // (a prompt's routing does not predict the answer's: measured)
