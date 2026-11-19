@@ -33,7 +33,7 @@ class CheckpointEngine(ResumingEngine):
             yield None
             if self.signal:
                 self.last = dict(finish="prefill_yield", prompt_tokens=len(ids), prompt_ms=60, decode_ms=0,
-                                 generated=0, reused=0, prefill_order=37)
+                                 generated=0, reused=0, prefill_order=37, prefill_read=4096)
                 return
         if not long:
             self.short.set()
@@ -115,6 +115,10 @@ class PrefillYield(unittest.TestCase):
         self.assertEqual(output["b"], "short result")
         self.assertEqual(svc.fifo.waiting(), 0)
         self.assertFalse(svc.fifo.locked())
+        if abort:
+            partial = next(row for row in svc.history if row["prompt_tokens"] > 8192)
+            self.assertEqual((partial["prompt_ms"], partial["engine_generated"], partial["reused"]), (60, 0, 0))
+            self.assertEqual(partial["prefill_tok_s"], round(4096 / .06, 1))
         return engine, output
 
     def test_resume_preserves_prompt_and_seed(self):

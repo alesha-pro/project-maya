@@ -1293,6 +1293,8 @@ class StrataEngine:
 
         if self.last["finish"] == "prefill_yield" and len(f) == 12:
             self.last["prefill_order"] = int(f[11])
+            if self.progress and self.progress[1] == self.last["prompt_tokens"]:
+                self.last["prefill_read"] = self.progress[0]
 
     def _asked_end(self) -> int:
         """How many times the server told the engine to cut whatever runs (STOP for all, QUIT, WRAP): a request
@@ -4364,6 +4366,9 @@ class Service:
                         if all(k in sg for sg in segments):
                             merged[k] = sum(sg[k] for sg in segments)
                     self.engine.last = merged
+                if segments and segments[0].get("finish") == "prefill_yield":
+                    # The reader may disconnect while its short waiter owns engine.last.
+                    stat.interrupted_last = self.engine.last
             if closed:                                  # the budget, at a sentence's or line's end: the thinking ends
                 later = len(produced) - soft
                 canon = self._closed_as_rendered(ids, produced, think_end)
@@ -4898,6 +4903,9 @@ class Service:
                     # only this request's DONE counts: same object means no DONE arrived (death, error, disconnect)
                     last = dict(getattr(self.engine, "last", {}) or {}) \
                         if getattr(self.engine, "last", None) is not engine_last0 else {}
+                    if getattr(stat, "interrupted_last", None) is not None:
+                        last = stat.interrupted_last
+                    prompt_read = last.get("prefill_read", len(ids))
                     started = my_started
                     loaded = str((getattr(self.engine, "info", {}) or {}).get("cvec", 0)) not in ("0", "", "None")
                     hit_rate = round(last["hits"] / last["lookups"], 3) if last.get("lookups") else None
@@ -4906,8 +4914,8 @@ class Service:
                         if loaded else None,
                         "time": started, "duration_s": round(time.time() - started, 1), "finish": finish,
                         "api": (sampling or {}).get("_api"),
-                        "prefill_tok_s": round((len(ids) - (last.get("reused") or 0)) / (last["prompt_ms"] / 1000), 1)
-                        if last.get("prompt_ms") and len(ids) > (last.get("reused") or 0) else None,
+                        "prefill_tok_s": round((prompt_read - (last.get("reused") or 0)) / (last["prompt_ms"] / 1000), 1)
+                        if last.get("prompt_ms") and prompt_read > (last.get("reused") or 0) else None,
                         "prompt_tokens": len(ids), "reused": last.get("reused"), "output_tokens": n,
                         "engine_generated": last.get("generated"),
                         "prompt_ms": last.get("prompt_ms"), "decode_ms": last.get("decode_ms"),
@@ -4930,7 +4938,7 @@ class Service:
                     t["decode_ms"] += last.get("decode_ms") or 0.0
                     fresh = getattr(self.engine, "last", None)
                     if fresh is not None and fresh is not before:      # the engine's clock for THIS request
-                        timings = request_timings(len(ids), n, last)
+                        timings = request_timings(prompt_read, n, last)
                         self.last_timings = dict(timings, at=int(time.time())) if timings else None
                     self.last_request_at = time.time()
                     now = time.time()
