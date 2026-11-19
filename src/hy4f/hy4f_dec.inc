@@ -456,8 +456,8 @@ void d_engram_mix(Shard& s, DShard& d, int il, int T, bool split_hc) {
 }
 
 void d_indexer_cache(Shard& s, DShard& d, const std::string& P, int il, const int* pp, int T,
-                     int xpc, int oik, float th, cudaStream_t stream) {
-    kb_rms<<<T, 128, 0, stream>>>(d.xp + oik, xpc, f32(s, P + "indexer.k_norm.weight"), IK, eps, d.ikn, IK);
+                     const float* input, int stride, float th, cudaStream_t stream) {
+    kb_rms<<<T, 128, 0, stream>>>(input, stride, f32(s, P + "indexer.k_norm.weight"), IK, eps, d.ikn, IK);
     const DW& ivw = s.w.at(P + "ivg");
     kb_q8_gemv<<<dim3(nb(2 * IK * 32), T), 256, 0, stream>>>((const uint8_t*) ivw.d, d.ikn, IK, d.ivg, 2 * IK, IK, 2 * IK);
     kb_pool_groups<<<T / kpool + 1, 128, 0, stream>>>(d.ivg, s.ring[il], pp, T, f32(s, P + "indexer_compressor_ape.weight"),
@@ -466,12 +466,22 @@ void d_indexer_cache(Shard& s, DShard& d, const std::string& P, int il, const in
     kb_ring_chunk<<<IRING, 256, 0, stream>>>(d.ivg, s.ring[il], T, pp, IK, kpool);
 }
 
-void d_indexer_select(Shard& s, DShard& d, const std::string& P, int il, const int* pp,
-                      int T, int qpc, int QH, float th, cudaStream_t st, float* local_iq = nullptr) {
-    float* iq = local_iq ? local_iq : d.qp + (size_t) Hd * QH;
-    kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, st>>>(iq, qpc, IH, IK, IK - rope, rope, pp, th);
+void d_indexer_weights(Shard& s, DShard& d, const std::string& P, int T, cudaStream_t st) {
     kb_f32_gemv<<<dim3(nb(IH * 32), T), 256, 0, st>>>(f32(s, P + "indexer.proj.weight"), d.x, E, d.iw, IH, E, IH,
                                                         1.0f / std::sqrt((float) (IK * IH)));
+}
+
+void d_indexer_rope(float* iq, int qpc, int T, const int* pp, float th, cudaStream_t st) {
+    kb_rope<<<dim3(nb(IH * rope / 2), T), 256, 0, st>>>(iq, qpc, IH, IK, IK - rope, rope, pp, th);
+}
+
+void d_indexer_select(Shard& s, DShard& d, const std::string& P, int il, const int* pp,
+                      int T, int qpc, int QH, float th, cudaStream_t st, float* local_iq = nullptr, bool query_ready = false) {
+    float* iq = local_iq ? local_iq : d.qp + (size_t) Hd * QH;
+    if (!query_ready) {
+        d_indexer_rope(iq,qpc,T,pp,th,st);
+        d_indexer_weights(s,d,P,T,st);
+    }
     const int ld_sc = (int) (o.max_context / kpool + 1);
     if (IH == 16 && IK == 128 && T <= 4 && std::getenv("HY4F_DEC_SCORE_TILE")) {
         const auto kernel = T == 1 ? kd_score_tile<1> : T == 2 ? kd_score_tile<2> : kd_score_tile<4>;
@@ -500,7 +510,44 @@ void d_indexer_select(Shard& s, DShard& d, const std::string& P, int il, const i
     }
 }
 
-void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false, bool dense_dsa = false, const int* last_pos = nullptr, bool sparse_dsa = false) {
+// Full context-parallel graph. Read each x projection row once on one of three
+// branches. FFN slot storage is free from the preceding residual through the
+// attention join; keep the normalized query there while all branches read xq.
+void d_early_index_inputs(Shard& s, DShard& d, const std::string& P, int il, const int* pp,
+                          int T, int xpc, int qpc, float th) {
+    const DW& xw=s.w.at(P+"xproj"), &qw=s.w.at(P+"qproj");
+    const auto* xrows=static_cast<const uint8_t*>(xw.d);
+    const auto* qrows=static_cast<const uint8_t*>(qw.d);
+    const auto queries=d.side, keys=d.attention_side;
+    float* iq=d.qp+(size_t)T*qpc;
+    const int niq=IH*IK;
+
+    HY_CK(cudaEventRecord(d.attention_fork,s.st));
+    HY_CK(cudaStreamWaitEvent(queries,d.attention_fork));
+    HY_CK(cudaStreamWaitEvent(keys,d.attention_fork));
+
+    kn::native_q8_0_mmvq(xrows,d.xq,d.qr,E,q_lora,T,queries);
+    kd_rms_q81<1><<<T,1024,0,queries>>>(d.qr,q_lora,f32(s,P+"attn_q_a_norm.weight"),
+                                          q_lora,eps,nullptr,d.xlq);
+    HY_CK(cudaEventRecord(d.projected,queries));
+    kn::native_q8_0_mmvq(qrows+(size_t)qpc*qw.rb,d.xlq,iq,q_lora,niq,T,queries);
+    d_indexer_rope(iq,niq,T,pp,th,queries);
+    HY_CK(cudaEventRecord(d.shared_done,queries));
+
+    // ivg holds the compact raw index input until k_norm consumes it. The
+    // following projection then replaces it with the pool values and gates.
+    kn::native_q8_0_mmvq(xrows+(size_t)(q_lora+xpc)*xw.rb,d.xq,d.ivg,E,IK,T,keys);
+    d_indexer_cache(s,d,P,il,pp,T,d.ivg,IK,th,keys);
+    d_indexer_weights(s,d,P,T,keys);
+    HY_CK(cudaStreamWaitEvent(keys,d.shared_done));
+    d_indexer_select(s,d,P,il,pp,T,niq,0,th,keys,iq,true);
+    HY_CK(cudaEventRecord(d.attention_join,keys));
+
+    // The contiguous KV and gate rows keep their relative layout in xp.
+    kn::native_q8_0_mmvq(xrows+(size_t)q_lora*xw.rb,d.xq,d.xp,E,xpc,T,s.st);
+}
+
+void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bool ready = false, bool dense_dsa = false, const int* last_pos = nullptr, bool sparse_dsa = false, bool early_inputs = false) {
     const std::string P = "blk." + std::to_string(il) + ".";
     const bool sw = swa[il] != 0;
     const int Hl = sw ? Hs / S : Hd / S, QH = nope + rope;
@@ -510,8 +557,15 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                                std::getenv("HY4F_LOCAL_QUERY");
     const int query_first = local_queries ? s.g * Hl : 0;
     const int Ha = (sw || local_queries) ? Hl : Hd;
-    const int xpc = rows_of(s,P+"xproj"), qpc = !sw && (dense_dsa || (sparse_dsa && local_queries)) ? Ha * QH : rows_of(s,P+"qproj");
-    const int oq = 0, okv = q_lora, og = q_lora + KV_ROW, oik = og + Hl * vh;
+    const int xrows=rows_of(s,P+"xproj"), qrows=rows_of(s,P+"qproj");
+    const bool early=early_inputs && !sw && !mtp && !dense_dsa && !sparse_dsa && !last_pos &&
+        (T==2 || T==3) && d.side && d.attention_side && fuse_rms_q81 && q_lora==1024 &&
+        S==4 && E==3072 && Hd==32 && IH==16 && IK==128 && n_used*latent>=q_lora &&
+        s.w.at(P+"xproj").type==T_Q8_0 && s.w.at(P+"qproj").type==T_Q8_0 &&
+        xrows==q_lora+KV_ROW+Hl*vh+IK && qrows==Hd*QH+IH*IK;
+    const int xpc=early ? xrows-q_lora-IK : xrows;
+    const int qpc=early || (!sw && (dense_dsa || (sparse_dsa && local_queries))) ? Ha*QH : qrows;
+    const int oq=0, okv=early ? 0 : q_lora, og=okv+KV_ROW, oik=og+Hl*vh;
     if (!ready) {
         if (mtp && fuse_rms_q81 && E == 3072) {
             kd_rms_q81<3><<<T, 1024, 0, s.st>>>(d.mr, E, f32(s, P + "attn_norm.weight"), E, eps, d.x, d.xq);
@@ -523,10 +577,11 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     }
     if (d.hc_side && !mtp && fuse_ok())
         d_hc_prepare(s,d,hc_next(s,P,"hc_ffn",P+"ffn_norm.weight",2*hc,hc_mag),T);
-    dec_mmvq(s, P + "xproj", d.xq, d.xp, T);
+    if (early) d_early_index_inputs(s,d,P,il,pp,T,xpc,qpc,th);
+    else dec_mmvq(s, P + "xproj", d.xq, d.xp, T);
     // KV and the pooled index keys depend only on xproj. Compute them on
     // another graph branch during the query projection and absorption.
-    const auto side = d.attention_side;
+    const auto side = early ? nullptr : d.attention_side;
     const auto keys = side ? side : s.st;
     if (side) {
         HY_CK(cudaEventRecord(d.attention_fork, s.st));
@@ -541,7 +596,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     else
         kb_kv_prep<<<T, 576, 0, keys>>>(d.xp + okv, xpc, f32(s, P + "attn_kv_a_norm.weight"), kvl, rope, eps, th, s.kv[il], pp,
                                     sw ? 3 : 2, S, s.g, win + RING_PAD);
-    if (!sw) d_indexer_cache(s, d, P, il, pp, T, xpc, oik, th, keys);
+    if (!sw && !early) d_indexer_cache(s,d,P,il,pp,T,d.xp+oik,xpc,th,keys);
     if (side) HY_CK(cudaEventRecord(d.attention_join, side));
     if (last_pos) {
         // All accepted rows contribute keys and indexer state. Only the final
@@ -553,7 +608,9 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         pp = last_pos;
         T = 1;
     }
-    if (fuse_rms_q81 && q_lora == 1024) {
+    if (early) {
+        HY_CK(cudaStreamWaitEvent(s.st,d.projected));
+    } else if (fuse_rms_q81 && q_lora == 1024) {
         kd_rms_q81<1><<<T, 1024, 0, s.st>>>(d.xp + oq, xpc, f32(s, P + "attn_q_a_norm.weight"),
                                             q_lora, eps, nullptr, d.xq);
     } else {
@@ -562,7 +619,10 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
     }
     float* local_iq = nullptr;
     int index_stride = qpc;
-    if (!sw && (dense_dsa || (sparse_dsa && local_queries))) {
+    if (early) {
+        const DW& q=s.w.at(P+"qproj");
+        kn::native_q8_0_mmvq(q.d,d.xlq,d.qp,q_lora,qpc,T,s.st);
+    } else if (!sw && (dense_dsa || (sparse_dsa && local_queries))) {
         const DW& q = s.w.at(P + "qproj");
         const auto* weights=static_cast<const uint8_t*>(q.d)+(size_t)query_first*QH*q.rb;
         kn::native_q8_0_mmvq(weights, d.xq, d.qp, (int) q.ne[0], qpc, T, s.st);
@@ -615,7 +675,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
         else if (Ha == 16) kb_mqa_queries<16><<<grid,256,0,s.st>>>(d.qabs,d.qp,qpc,QH,nope,th,0,scale,qh,pp);
         else kb_mqa_queries<8><<<grid,256,0,s.st>>>(d.qabs,d.qp,qpc,QH,nope,th,0,scale,qh,pp);
     }
-    if (side) HY_CK(cudaStreamWaitEvent(s.st, d.attention_join));
+    if (side || early) HY_CK(cudaStreamWaitEvent(s.st, d.attention_join));
     const int value_groups = T<=2 && std::getenv("HY4F_VALUE_GROUPS") ? 4 : 1;
     if (sw) {
         if (split && Hl == 16) {
@@ -631,7 +691,7 @@ void d_attention(Shard& s, DShard& d, int il, const int* pp, int T, bool mtp, bo
                                                     0, f32(s, P + "attn_sinks.weight") + s.g * Hl, scale, d.o, nullptr, Hl);
         }
     } else {
-        if (!dense_dsa && !async_select)
+        if (!dense_dsa && !async_select && !early)
             d_indexer_select(s,d,P,il,pp,T,index_stride,QH,th,s.st,local_iq);
         if (!mtp && !dfs.empty() && df_slot[il] >= 0)   // (the DFly drafter reads this layer's top-k of every row)
             HY_CK(cudaMemcpyAsync(dfs[s.g].snap + (size_t) df_slot[il] * DT * n_cap, d.cells, sizeof(int) * T * n_cap,
@@ -922,7 +982,7 @@ void verify_head_ops(Shard& s,DShard& d,int T,HeadMode mode) {
     HY_CK(cudaMemcpyAsync(hargi + (size_t) s.g * DT, d.argi, sizeof(int) * T, cudaMemcpyDeviceToHost, s.st));
 }
 
-void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_dsa = false) {
+void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_dsa = false, bool early_inputs = false) {
     HY_CK(cudaMemcpyAsync(d.dio_v, hio_v, sizeof(IoT), cudaMemcpyHostToDevice, s.st));
     const int* pp = &d.dio_v->pos;
     if (dense_dsa) kd_dense_cells<<<dim3(nb(n_cap), T), 256, 0, s.st>>>(pp, n_cap, d.cells);
@@ -951,7 +1011,7 @@ void verify_ops(Shard& s, DShard& d, int T, bool dense_dsa = false, bool sparse_
             for (size_t e = 0; e < eg_layers.size(); ++e)
                 if (eg_layers[e] == il + 1) d_engram_fork(s, d, (int)e, il + 1, pp, T);
         }
-        d_attention(s, d, il, pp, T, false, ready, dense_dsa, nullptr, sparse_dsa);
+        d_attention(s, d, il, pp, T, false, ready, dense_dsa, nullptr, sparse_dsa, early_inputs);
         HcNext nx;
         const HcNext* nxp = nullptr;
         if (fuse && il + 1 < L && !has_engram(il + 1)) {
@@ -1092,7 +1152,9 @@ void dec_setup() {
                 // verify rows must equal plain steps (spec == greedy), so T >= 5 takes the exact layout)
                 kn::native_mmvq_set_multi_exact(T >= 5 && !std::getenv("HY4F_FAST_T56"));
                 HY_CK(cudaStreamBeginCapture(s.st, cudaStreamCaptureModeThreadLocal));
-                verify_ops(s, d, T, dense_dsa, sparse_dsa);
+                const bool early_inputs=mode==0 && short_graphs && sparse_limit &&
+                    std::getenv("HY4F_INDEX_INPUT") && std::getenv("HY4F_INDEX_OVERLAP");
+                verify_ops(s, d, T, dense_dsa, sparse_dsa, early_inputs);
                 HY_CK(cudaStreamEndCapture(s.st, &gr));
                 kn::native_mmvq_set_multi_exact(false);
                 d.gv[T].capture(gr, mode, short_graphs);
