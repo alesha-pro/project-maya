@@ -436,7 +436,7 @@ void d_engram_fork(Shard& s, DShard& d, int e, int il, const int* pp, int T) {
 void d_engram_mix(Shard& s, DShard& d, int il, int T, bool split_hc) {
     const std::string P = "blk." + std::to_string(il) + ".";
     const dim3 grid(T, split_hc ? hc : 1);
-    kb_engram_mix<<<grid, 1024, 0, s.st>>>(d.X, d.X, d.eg_kv, f32(s, P + "engram_kv_b.weight"), f32(s, P + "engram_gate.weight"),
+    (split_hc ? kb_engram_mix<true> : kb_engram_mix<false>)<<<grid, 1024, 0, s.st>>>(d.X, d.X, d.eg_kv, f32(s, P + "engram_kv_b.weight"), f32(s, P + "engram_gate.weight"),
                                         f32(s, P + "engram_hc_scale.weight"), f32(s, P + "engram_pre_gamma.weight"), E, hc,
                                         1.1920929e-07f, nullptr);
 }

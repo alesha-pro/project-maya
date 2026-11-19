@@ -48,6 +48,7 @@ __global__ void kb_engram_rows(const uint8_t* table, const int64_t* ids, const f
     const float k = rsqrtf(block_sum(v * v) / D + eps);
     if (d < D) r[((size_t) t * ncol + col) * D + d] = v * k * lnorm[(size_t) col * D + d];
 }
+template<bool Split = false>
 __global__ void kb_engram_mix(float* X, float* R, const float* kv, const float* kvb, const float* gw, const float* hcs,
                               const float* gamma, int E, int hc, float eps, const int* mask) {
     const int t = blockIdx.x;
@@ -63,7 +64,7 @@ __global__ void kb_engram_mix(float* X, float* R, const float* kv, const float* 
         s += v * v;
     }
     const float kv_ = rsqrtf(block_sum(s) / E + eps);
-    for (int i = blockIdx.y; i < hc; i += gridDim.y) {
+    for (int i = Split ? (int)blockIdx.y : 0; i < hc; i += Split ? hc : 1) {
         float* x = X + (size_t) i * E;
         const float* k = kv + (size_t) i * E;
         const float* kb = kvb + (size_t) i * E;
