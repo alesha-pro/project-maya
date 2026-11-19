@@ -121,6 +121,9 @@ struct DShard {
     unsigned long long* ne_ptr = nullptr;   // the groups' record addresses and the scratch of the native expert kernels
     int *ha_n = nullptr, *ha_exp = nullptr, *ha_off = nullptr, *ha_slot = nullptr;   // hybrid: the hot groups
     int *hb_n = nullptr, *hb_off = nullptr, *hb_slot = nullptr;                      // ... and the cold ones (ne_ptr)
+    LaneMail* mail = nullptr;       // HY4F_CPU_LANE: the shard's mailbox, the request counter, the layer's host slots
+    unsigned* lane_seq = nullptr;
+    int* lane_info = nullptr;
     void* ne_scratch = nullptr;
     int* sel_bc = nullptr;
     KdCompactRow* sel_compact = nullptr;
@@ -248,6 +251,11 @@ void dec_alloc(Shard& s, DShard& d) {
     HY_CK(cudaMalloc(&d.ne_ptr, sizeof(unsigned long long) * 128));
     d.ha_n = ia(4), d.ha_exp = ia(128), d.ha_off = ia(129), d.ha_slot = ia(128);
     d.hb_n = ia(4), d.hb_off = ia(129), d.hb_slot = ia(128);
+    if (!lanes.empty()) {
+        d.mail = lanes[s.g]->mail;
+        d.lane_seq = reinterpret_cast<unsigned*>(ia(4));
+        d.lane_info = ia(2 + LANE_SLOTS);
+    }
     HY_CK(cudaMalloc(&d.ne_scratch, kn::native_expert_scratch_bytes((int64_t) DT * n_used, n_ffx)));
     d.lg = dalloc((size_t) DT * n_exp);
     d.ew = dalloc((size_t) DT * K);
@@ -941,10 +949,13 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     const bool mp = T > 4;   // (more than 4 slots per expert possible: the multi-pass copy of the grouped kernel)
     const auto& gu = s.w.at(P + "ffn_gu_exps");
     const auto& down = s.w.at(P + "ffn_down_exps.weight");
+    // HY4F_CPU_LANE: this layer has experts in host memory - the host threads compute them
+    const OffLayer* ofl = offload ? &s.off.at(il) : nullptr;
+    const bool lane_on = ofl && d.mail && ofl->n_res < ofl->n;
     const char* setting = std::getenv("HY4F_EXPERT_PIPE");
     const int pipe_mode = setting ? std::atoi(setting) : 0;
     const bool pipeline = (pipe_mode == 1 || (pipe_mode == 2 && gu.type == T_Q4_K)) &&
-        !mtp && !q3_pair_layout && grouped && d.side && d.attention_side && !(offload && s.off.at(il).hybrid) &&
+        !mtp && !q3_pair_layout && grouped && d.side && d.attention_side && !(ofl && ofl->hybrid) && !lane_on &&
         T >= 2 && T <= 4 && K == 16 && latent == 1536 && n_ffx == 1536 &&
         (gu.type == T_Q3_K || gu.type == T_Q4_K) && down.type == T_Q4_K &&
         std::getenv("HY4F_GROUP_MATCH");
@@ -965,7 +976,7 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     if (offload) {   // the groups' local experts -> their places on the layer's weight lattice (VRAM or host)
         if (!grouped) throw std::runtime_error("hy4f: the expert offload needs the grouped expert kernels");
         const OffLayer& ol = s.off.at(il);
-        if (!ol.hybrid) k_virt_groups<<<1, 128, 0, s.st>>>(d.mg_n, d.mg_exp, ol.vmap);
+        if (!ol.hybrid && !lane_on) k_virt_groups<<<1, 128, 0, s.st>>>(d.mg_n, d.mg_exp, ol.vmap);
     }
     auto ids_mmvq = [&](const DW& w, const void* xq, float* y, int n_in, int n_out, const int* g_n = nullptr,
                         const int* g_exp = nullptr, const int* g_off = nullptr, const int* g_slot = nullptr) {
@@ -1002,6 +1013,14 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         else throw std::runtime_error("hy4f: expert type " + std::to_string(w.type));
     };
     if (d.side) HY_CK(cudaStreamWaitEvent(s.st, d.projected));
+    // the groups the device runs (the lane takes the host ones out of the list)
+    const int *g_n = d.mg_n, *g_exp = d.mg_exp, *g_off = d.mg_off, *g_slot = d.mg_slot;
+    if (lane_on && !ofl->hybrid) {
+        k_split_lane<<<1, 256, 0, s.st>>>(d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, ofl->n_res, ofl->n_res, ofl->vmap, nullptr,
+                                          d.ha_n, d.ha_exp, d.ha_off, d.ha_slot, d.hb_n, d.ne_ptr, d.hb_off, d.hb_slot,
+                                          d.mail, d.lane_seq, d.lane_info, d.xm, xmc, T, il);
+        g_n = d.ha_n, g_exp = d.ha_exp, g_off = d.ha_off, g_slot = d.ha_slot;
+    }
     if (pipeline) {
         // Split whole experts so a group's down pass can begin while the other
         // stream is still projecting gate/up. Offsets index the same slot list.
@@ -1028,8 +1047,13 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         const OffLayer& ol = s.off.at(il);
         if (!grouped || !kn::hy4_iq_supported(ol.cold_gu) || !kn::hy4_iq_supported(ol.cold_dn) || latent != 1536 || n_ffx != 1536 || T > 4)
             throw std::runtime_error("hy4f: the hybrid experts need grouped kernels, IQ2 cold experts and at most 4 rows");
-        k_split_tiers<<<1, 32, 0, s.st>>>(d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, ol.n_hot, ol.cptr, d.ha_n, d.ha_exp, d.ha_off,
-                                          d.ha_slot, d.hb_n, d.ne_ptr, d.hb_off, d.hb_slot);
+        if (lane_on)
+            k_split_lane<<<1, 256, 0, s.st>>>(d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, ol.n_hot, ol.n_res, nullptr, ol.cptr,
+                                              d.ha_n, d.ha_exp, d.ha_off, d.ha_slot, d.hb_n, d.ne_ptr, d.hb_off, d.hb_slot,
+                                              d.mail, d.lane_seq, d.lane_info, d.xm, xmc, T, il);
+        else
+            k_split_tiers<<<1, 32, 0, s.st>>>(d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, ol.n_hot, ol.cptr, d.ha_n, d.ha_exp, d.ha_off,
+                                              d.ha_slot, d.hb_n, d.ne_ptr, d.hb_off, d.hb_slot);
         if (ol.n_hot) ids_mmvq(gu, d.xlq, d.ga16, latent, 2 * n_ffx, d.ha_n, d.ha_exp, d.ha_off, d.ha_slot);
         kn::hy4_iq_grouped(ol.cold_gu, d.ne_ptr, 0, 2 * n_ffx, d.hb_n, d.hb_off, d.hb_slot, d.xlq, d.ga16, moe_blocks, s.st);
         k_swiglu_gu_q8<<<nb(T*K*n_ffx),256,0,s.st>>>(d.ga16,n_ffx,T*K*n_ffx,clampv,d.q16);
@@ -1039,22 +1063,23 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
         // (i-quant experts: Maya's native grouped expert kernels over the offload's [gate | up | down] records)
         if (!offload || !grouped) throw std::runtime_error("hy4f: expert type " + std::to_string(gu.type) + " needs the expert offload");
         const OffLayer& ol = s.off.at(il);
-        k_group_ptrs<<<1, 128, 0, s.st>>>(d.mg_n, d.mg_exp, static_cast<const uint8_t*>(gu.d), ol.stride, d.ne_ptr);
+        k_group_ptrs<<<1, 128, 0, s.st>>>(g_n, g_exp, static_cast<const uint8_t*>(gu.d), ol.stride, d.ne_ptr);
         const kn::NativeExpertLayout layout = kn::native_expert_layout(gu.type, down.type, latent, n_ffx);
         if (kn::hy4_iq_supported(gu.type) && kn::hy4_iq_supported(down.type) && latent == 1536 && n_ffx == 1536 && T <= 4 &&
             !std::getenv("HY4F_IQ_GENERIC")) {
             // (the Hy4 kernels: gate | up as one 3072-row matrix, SwiGLU, down - the K-quant path's three stages)
-            kn::hy4_iq_grouped(gu.type, d.ne_ptr, 0, 2 * n_ffx, d.mg_n, d.mg_off, d.mg_slot, d.xlq, d.ga16, moe_blocks, s.st);
+            kn::hy4_iq_grouped(gu.type, d.ne_ptr, 0, 2 * n_ffx, g_n, g_off, g_slot, d.xlq, d.ga16, moe_blocks, s.st);
             k_swiglu_gu_q8<<<nb(T*K*n_ffx),256,0,s.st>>>(d.ga16,n_ffx,T*K*n_ffx,clampv,d.q16);
-            kn::hy4_iq_grouped(down.type, d.ne_ptr, ol.gu_bytes, latent, d.mg_n, d.mg_off, d.mg_slot, d.q16, d.dn16, moe_blocks, s.st);
-        } else if (!kn::native_expert_grouped(layout, d.ne_ptr, d.mg_off, d.mg_n, d.mg_slot, d.mg_slot, T * K, T * K, d.xlq,
+            kn::hy4_iq_grouped(down.type, d.ne_ptr, ol.gu_bytes, latent, g_n, g_off, g_slot, d.q16, d.dn16, moe_blocks, s.st);
+        } else if (!kn::native_expert_grouped(layout, d.ne_ptr, g_off, g_n, g_slot, g_slot, T * K, T * K, d.xlq,
                                        d.ne_scratch, d.dn16, s.st, clampv))
             throw std::runtime_error("hy4f: no native kernel for expert type " + std::to_string(gu.type));
     } else {
-        ids_mmvq(gu,d.xlq,d.ga16,latent,2*n_ffx);
+        ids_mmvq(gu,d.xlq,d.ga16,latent,2*n_ffx,g_n,g_exp,g_off,g_slot);
         k_swiglu_gu_q8<<<nb(T*K*n_ffx),256,0,s.st>>>(d.ga16,n_ffx,T*K*n_ffx,clampv,d.q16);
-        ids_mmvq(down,d.q16,d.dn16,n_ffx,latent);
+        ids_mmvq(down,d.q16,d.dn16,n_ffx,latent,g_n,g_exp,g_off,g_slot);
     }
+    if (lane_on) k_wait_lane<<<1, 256, 0, s.st>>>(d.mail, d.lane_seq, d.lane_info, d.dn16);
     // d.q16 is dead after the expert down projection. Reuse it for the
     // shorter shared-expert activation so both inputs survive concurrently.
     const int fused_fl = d.side ? 0 : fl;

@@ -33,6 +33,7 @@
 #include "strata/kernels/bf16_gemv.hpp"
 #include "strata/kernels/native_mmvq.hpp"
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/cpu/native_expert.hpp"
 #include "strata/kernels/router_sigmoid.hpp"
 #include "strata/prefill/moe_mmq.hpp"
 #ifdef HY4F_VISION
@@ -60,6 +61,8 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <immintrin.h>
+#include <memory>
 
 namespace strata::hy4f {
 
@@ -1150,6 +1153,10 @@ struct Model::Impl {
                          (unsigned long long) st_picks, st_picks ? (double) st_hits / st_picks : 0.0,
                          st_picks ? (double) st_hot / st_picks : 0.0, (unsigned long long) st_pf,
                          st_pf ? (double) st_pf_hit / st_pf : 0.0, (unsigned long long) st_swaps, st_swap_s);
+        for (const auto& ln : lanes)
+            std::fprintf(stderr, "hy4f: CPU lane %d: %llu requests, %llu expert groups, %llu slots, %.2f s busy (%.3f ms a request)\n",
+                         ln->g, (unsigned long long) ln->n_req, (unsigned long long) ln->n_groups,
+                         (unsigned long long) ln->n_slots, ln->busy, ln->n_req ? 1e3 * ln->busy / ln->n_req : 0.0);
         if (route_stats.empty()) return;
         std::FILE* f = std::fopen(route_stats.c_str(), "w");
         if (!f) return;
@@ -1673,6 +1680,7 @@ struct Model::Impl {
     }
     ~Impl() {
         dump_route_stats();
+        lane_stop();
         if (pool) {
             {
                 std::lock_guard<std::mutex> lk(pool->m);
@@ -1722,6 +1730,7 @@ struct Model::Impl {
 #include "hy4f_batch.inc"
 #include "hy4f_partial.inc"
 #include "hy4f_dec.inc"
+#include "hy4f_lane.inc"
 #include "hy4f_dfly.inc"
 
     void capture() {
@@ -1814,6 +1823,7 @@ bool Model::load(const Options& o, std::string& err) {
             HY_CK(cudaSetDevice(s.dev));
             HY_CK(cudaDeviceSynchronize());
         }
+        d.lane_start();
         if (d.graphs && std::getenv("HY4F_OLD_DECODE")) d.capture();
         if (d.graphs) d.dec_setup();
         if (o.verbose)

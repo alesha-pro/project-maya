@@ -497,6 +497,98 @@ __global__ void k_group_ptrs(const int* ng, const int* experts, const uint8_t* b
     const int i = threadIdx.x;
     if (i < *ng) ptrs[i] = (unsigned long long) (base + (size_t) experts[i] * stride);
 }
+// HY4F_CPU_LANE: one shard's mailbox between the device and the host threads that compute the experts held in host
+// memory (host-mapped pinned memory; hy4f_lane.inc).  The device writes everything, then `req`; the host answers into
+// y, then `ack` = that request.
+constexpr int LANE_T = 6, LANE_SLOTS = 96, LANE_DIM = 1536;
+struct LaneMail {
+    unsigned req, ack;
+    int layer, T, n_groups, n_slots;
+    int gexp[LANE_SLOTS];        // the group's local expert
+    int goff[LANE_SLOTS + 1];    // its slots gslot[goff[g] .. goff[g+1])
+    int gslot[LANE_SLOTS];       // slot = token * K + pick
+    float x[LANE_T][LANE_DIM];   // the tokens' latent inputs
+    float y[LANE_SLOTS][LANE_DIM];   // the slots' expert outputs, in gslot order
+};
+// The step's groups split three ways.  Locals below n_hot: list A (index vmap[e], or e without a table).  Locals in
+// [n_hot, n_res): list B (their record addresses cptr[e]).  The rest (host experts): into the mail with the tokens'
+// inputs - or, without a mail, to A / B as VRAM ones (the kernels then read the host records in place).
+// info: [0] the mail's groups, [1] its slots, [2 ..] the slots.
+__global__ void k_split_lane(const int* ng, const int* experts, const int* off, const int* slots, int n_hot, int n_res,
+                             const int* vmap, const unsigned long long* cptr, int* an, int* aexp, int* aoff, int* aslot,
+                             int* bn, unsigned long long* bptr, int* boff, int* bslot, LaneMail* mail, unsigned* seq,
+                             int* info, const float* x, int ldx, int T, int layer) {
+    __shared__ int n_mail;
+    if (threadIdx.x == 0) {
+        int na = 0, nb = 0, nm = 0, sa = 0, sb = 0, sm = 0;
+        const int n = *ng;
+        for (int g = 0; g < n; ++g) {
+            const int e = experts[g], s0 = off[g], s1 = off[g + 1];
+            const bool held = e < n_res || !mail;
+            if (held && (e < n_hot || !cptr)) {
+                aexp[na] = vmap ? vmap[e] : e;
+                aoff[na++] = sa;
+                for (int i = s0; i < s1; ++i) aslot[sa++] = slots[i];
+            } else if (held) {
+                bptr[nb] = cptr[e];
+                boff[nb++] = sb;
+                for (int i = s0; i < s1; ++i) bslot[sb++] = slots[i];
+            } else {
+                mail->gexp[nm] = e;
+                mail->goff[nm++] = sm;
+                for (int i = s0; i < s1; ++i) {
+                    info[2 + sm] = slots[i];
+                    mail->gslot[sm++] = slots[i];
+                }
+            }
+        }
+        aoff[na] = sa;
+        boff[nb] = sb;
+        *an = na;
+        *bn = nb;
+        info[0] = nm;
+        info[1] = sm;
+        n_mail = nm;
+        if (nm) {
+            mail->goff[nm] = sm;
+            mail->n_groups = nm;
+            mail->n_slots = sm;
+            mail->layer = layer;
+            mail->T = T;
+        }
+    }
+    __syncthreads();
+    if (!n_mail) return;
+    for (int i = threadIdx.x; i < T * LANE_DIM; i += blockDim.x)
+        mail->x[i / LANE_DIM][i % LANE_DIM] = x[(size_t) (i / LANE_DIM) * ldx + i % LANE_DIM];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        const unsigned s = *seq + 1;
+        *seq = s;
+        *(volatile unsigned*) &mail->req = s;
+    }
+}
+// waits for the host's answer to the layer's request and copies the slots' outputs into dn[slot]
+__global__ void k_wait_lane(const LaneMail* mail, const unsigned* seq, const int* info, float* dn) {
+    if (info[0] == 0) return;
+    if (threadIdx.x == 0) {
+        const unsigned s = *seq;
+        unsigned spins = 0;
+        while (*(volatile const unsigned*) &mail->ack != s && ++spins < 200000000u) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
+            __nanosleep(100);
+#endif
+        }
+        __threadfence_system();
+    }
+    __syncthreads();
+    const int ns = info[1];
+    for (int i = threadIdx.x; i < ns * LANE_DIM; i += blockDim.x) {
+        const int j = i / LANE_DIM, r = i % LANE_DIM;
+        dn[(size_t) info[2 + j] * LANE_DIM + r] = __ldcv(&mail->y[j][r]);
+    }
+}
 // hybrid experts: the step's groups split into the hot ones (local expert < n_hot: the base quantization, VRAM slot =
 // local index) and the cold ones (their record addresses); each list gets its own compact slot list
 __global__ void k_split_tiers(const int* ng, const int* experts, const int* off, const int* slots, int n_hot,
