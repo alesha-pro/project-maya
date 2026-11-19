@@ -340,25 +340,25 @@ struct Model::Impl {
         return w;
     }
     DW up_full(Shard& s, const std::string& n) { return up_rows(s, n, 0, -1); }
-    void up_draft_head(Shard& s) {
+    void up_draft_head(Shard& s, int format, bool certificate) {
         const strata::GgufFile* file = nullptr;
         const auto* tensor = T("output.weight", &file);
         if (tensor->type != T_BF16 || tensor->shape.size() != 2 ||
             tensor->shape[0] != (size_t) E || tensor->shape[1] != (size_t) V)
             throw std::runtime_error("hy4f: draft head quantization requires a BF16 output.weight");
         const int rows = V / S;
-        const auto type = draft_head_type == T_Q8_0 ? GGML_TYPE_Q8_0 : GGML_TYPE_Q4_K;
+        const auto type = format == T_Q8_0 ? GGML_TYPE_Q8_0 : GGML_TYPE_Q4_K;
         if (E % ggml_blck_size(type))
             throw std::runtime_error("hy4f: incompatible draft head input width");
-        auto& weight = s.w["mtp.output.weight"];
-        weight.type = draft_head_type;
+        auto& weight = s.w[certificate ? "cert.output.weight" : "mtp.output.weight"];
+        weight.type = format;
         weight.ne[0] = E;
         weight.ne[1] = rows;
         weight.rb = ggml_row_size(type, E);
         weight.d = walloc(rows * weight.rb);
         float2* device_norms = nullptr;
-        if (cert_head) {
-            auto& norms = s.w["mtp.output.norms"];
+        if (certificate) {
+            auto& norms = s.w["cert.output.norms"];
             norms.d = walloc((size_t)rows*sizeof(float2));
             device_norms = static_cast<float2*>(norms.d);
         }
@@ -370,7 +370,7 @@ struct Model::Impl {
             const int n = std::min(rows-i, chunk);
             ggml_bf16_to_fp32_row(bf16 + (size_t) i * E, input.data(), (int64_t) n * E);
             bool valid[chunk] = {};
-            if (cert_head) {
+            if (certificate) {
                 for (int j=0;j<n;++j) {
                     float* row=input.data()+(size_t)j*E;
                     valid[j]=std::all_of(row,row+E,[](float v){return std::isfinite(v) && std::fabs(v)<=0x1p16f;});
@@ -380,7 +380,7 @@ struct Model::Impl {
             }
             const auto bytes = ggml_quantize_chunk(type, input.data(), packed.data(), 0, n, E, nullptr);
             if (bytes != n * weight.rb) throw std::runtime_error("hy4f: incomplete draft head quantization");
-            if (cert_head) {
+            if (certificate) {
                 float2 norms[chunk];
                 for (int j=0;j<n;++j) {
                     double residual=0, quant=0;
@@ -582,7 +582,9 @@ struct Model::Impl {
         for (const char* n : {"output_norm.weight", "output_hc_fn.weight", "output_hc_scale.weight", "output_hc_base.weight"})
             up_full(s, n);
         up_rows(s, "output.weight", (int64_t) g * V / S, (int64_t) (g + 1) * V / S);
-        if (draft_head_type && (has_mtp || cert_head)) up_draft_head(s);
+        if (cert_head) up_draft_head(s,T_Q8_0,true);
+        if (has_mtp && draft_head_type && !cert_mtp && !(cert_head && draft_head_type==T_Q8_0))
+            up_draft_head(s,draft_head_type,false);
         const char* project_env = std::getenv("HY4F_Q8_KV_PROJ");
         const int project_mask = project_env ? std::atoi(project_env) : 0;
         const bool pack_k = (project_mask & 1) && nope == 192 && kvl == 512;
@@ -1140,12 +1142,11 @@ bool Model::load(const Options& o, std::string& err) {
                 else if (!std::strcmp(bits, "4")) d.draft_head_type = T_Q4_K;
                 else throw std::runtime_error("hy4f: HY4F_MTP_HEAD_Q expects 8 or 4");
             }
-            d.cert_head = std::getenv("HY4F_CERT_HEAD") && d.compact_io && d.E == 3072;
-            if (d.cert_head) {
-                if (d.draft_head_type && d.draft_head_type != T_Q8_0)
-                    throw std::runtime_error("hy4f: certified argmax requires Q8_0");
-                d.draft_head_type = T_Q8_0;
-            }
+            const bool eligible = d.compact_io && d.E == 3072;
+            const bool both = std::getenv("HY4F_CERT_HEAD") != nullptr;
+            d.cert_target = eligible && (both || std::getenv("HY4F_CERT_TARGET"));
+            d.cert_mtp = eligible && (both || std::getenv("HY4F_CERT_MTP"));
+            d.cert_head = d.cert_target || d.cert_mtp;
             d.has_mtp = t && te && (int) te->type != 30 /*BF16 experts: requantize first (scripts/requant_mtp_q3k.py)*/ &&
                         (int) t->type == 8 && !std::getenv("HY4F_NO_MTP") && (o.dfly.empty() || std::getenv("HY4F_KEEP_MTP"));
         }
