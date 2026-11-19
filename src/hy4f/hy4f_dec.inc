@@ -1320,6 +1320,7 @@ bool encode_img(const vision::Image& img, std::vector<float>& rows, int& n_token
                                  std::to_string(b.arena_bytes >> 20) + " MiB (a larger prefill chunk or a smaller image)");
     HY_CK(cudaSetDevice(s.dev));
     vision::Arena ar;
+    packed_index_groups = -1;
     ar.dev_ptr = b.arena_base;
     ar.bytes = b.arena_bytes;
     ar.gpu = s.dev;
