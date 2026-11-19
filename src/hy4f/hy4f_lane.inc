@@ -47,10 +47,14 @@ struct Lane {
         for (size_t i = 0; i < n; i += 64) _mm_prefetch(reinterpret_cast<const char*>(p + i), _MM_HINT_T1);
     }
     bool prefetch = true;
+    bool parallel_quant = false;
     void run(const Task& t) {
         namespace kc = strata::kernels::cpu;
         const int gi = t.group;
-        if (phase == 0) {
+        if (phase == 2) {
+            for (int j = 0; j < nt[gi]; ++j)
+                kc::native_quant_h(*fmt, ff_p[gi][j], const_cast<void*>(hq_p[gi][j]));
+        } else if (phase == 0) {
             if (prefetch) {
                 fetch(rec[gi] + (size_t) t.r0 * fmt->gu_row, (size_t) (t.r1 - t.r0) * fmt->gu_row);
                 fetch(rec[gi] + half + (size_t) t.r0 * fmt->gu_row, (size_t) (t.r1 - t.r0) * fmt->gu_row);
@@ -124,8 +128,14 @@ struct Lane {
         const auto c1 = clk::now();
         run_phase(n);
         const auto c2 = clk::now();
-        for (int gi = 0; gi < ng; ++gi)
-            for (int j = 0; j < nt[gi]; ++j) kc::native_quant_h(*fmt, ff_p[gi][j], const_cast<void*>(hq_p[gi][j]));
+        if (parallel_quant && ng > 1) {
+            phase = 2;
+            for (int gi = 0; gi < ng; ++gi) tasks[gi] = {gi, 0, 0};
+            run_phase(ng);
+        } else {
+            for (int gi = 0; gi < ng; ++gi)
+                for (int j = 0; j < nt[gi]; ++j) kc::native_quant_h(*fmt, ff_p[gi][j], const_cast<void*>(hq_p[gi][j]));
+        }
         const auto c3 = clk::now();
         n = 0;
         phase = 1;
@@ -192,6 +202,7 @@ void lane_start() {
         ln->hq.resize((size_t) LANE_SLOTS * kc::kNativeHBytes);
         Lane* p = ln.get();
         if (const char* pf = std::getenv("HY4F_LANE_PREFETCH")) p->prefetch = std::atoi(pf) != 0;
+        p->parallel_quant = S == 1 && std::getenv("HY4F_SINGLE_PAR_QUANT");
         p->boss = std::thread([p] { p->boss_loop(); });
         for (int i = 1; i < per; ++i) p->crew.emplace_back([p] { p->crew_loop(); });
         // HY4F_LANE_PIN=1: one online CPU a thread, from CPU 1 up (the first hardware thread of each core comes first

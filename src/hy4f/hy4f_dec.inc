@@ -1027,9 +1027,11 @@ void d_ffn(Shard& s, DShard& d, int il, int T, bool mtp, bool ready = false, con
     // the groups the device runs (the lane takes the host ones out of the list)
     const int *g_n = d.mg_n, *g_exp = d.mg_exp, *g_off = d.mg_off, *g_slot = d.mg_slot;
     if (lane_on && !ofl->hybrid) {
+        const char* mapped_opt = S == 1 ? std::getenv("HY4F_SINGLE_PCIE_GROUPS") : nullptr;
+        const int single_mapped = mapped_opt ? std::clamp(std::atoi(mapped_opt), 0, n_used) : 0;
         k_split_lane<<<1, 256, 0, s.st>>>(d.mg_n, d.mg_exp, d.mg_off, d.mg_slot, ofl->n_res, ofl->n_res, ofl->vmap, nullptr,
                                           d.ha_n, d.ha_exp, d.ha_off, d.ha_slot, d.hb_n, d.ne_ptr, d.hb_off, d.hb_slot,
-                                          d.mail, d.lane_seq, d.lane_info, d.xm, xmc, T, il);
+                                          d.mail, d.lane_seq, d.lane_info, d.xm, xmc, T, il, single_mapped);
         g_n = d.ha_n, g_exp = d.ha_exp, g_off = d.ha_off, g_slot = d.ha_slot;
     }
     if (pipeline) {
