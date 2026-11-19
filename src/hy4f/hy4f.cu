@@ -1814,7 +1814,7 @@ void Model::transfer_host_prefix(HostPrefix& slot, int64_t pos, bool save, int64
 
 bool Model::save_host_prefix(int i, std::string& err, double* d2h_ms, int parent) {
     try {
-        if (i < 0 || i >= 8 || d_->pos_next < 4096 || d_->pos_next >= d_->o.max_context || d_->pos_next % 2048 || d_->bsh.empty())
+        if (i < 0 || i > 8 || d_->pos_next < 4096 || d_->pos_next >= d_->o.max_context || d_->pos_next % 2048 || d_->bsh.empty())
             throw std::runtime_error("invalid host prefix checkpoint");
         int64_t begin = 0;
         uint64_t parent_generation = 0;

@@ -286,10 +286,10 @@ class FairLock:
         self.leave(me)
         return False
 
-    def enqueue(self, units: int | None = None) -> object:
+    def enqueue(self, units: int | None = None, short_prefill=False) -> object:
         """A place in line (wait_turn waits for it, leave gives it up): a waiter that wakes up now and then (to send
         a heartbeat) keeps its place."""
-        me = [object(), self._units(units), time.monotonic(), False]    # (token, units, asked at: the queue watchdog's age, queued again by a fair slice)
+        me = [object(), self._units(units), time.monotonic(), False, short_prefill]    # (token, units, asked at: the queue watchdog's age, queued again by a fair slice)
         with self._cv:
             self._queue.append(me)
         return me
@@ -311,17 +311,32 @@ class FairLock:
                 return True
             return False
 
+    def claim_short_prefill(self):
+        """Claim only the first waiting, short request. Its displaced reader resumes immediately after it."""
+        with self._cv:
+            if self.capacity != 1 or self._used != 1 or self._yields or not self._queue:
+                return None
+            first = self._queue[0]
+            if len(first) < 5 or not first[4]:
+                return None
+            self._yields += 1
+            return first
+
     def unclaim_yield(self):
         with self._cv:
             self._yields = max(0, self._yields - 1)
 
-    def yield_place(self, units: int | None = 1) -> object:
+    def yield_place(self, units: int | None = 1, after_waiter=None) -> object:
         """A runner's place given up, and a place in line behind whoever waits now, in one step (the claim ends with it:
         the free place is counted from here)."""
         k = self._units(units)
         me = [object(), k, time.monotonic(), True]
         with self._cv:
-            self._queue.append(me)
+            if after_waiter is None:
+                self._queue.append(me)
+            else:
+                # A cancelled short waiter must not give an unrelated request this reader's turn.
+                self._queue.insert(int(bool(self._queue and self._queue[0] is after_waiter)), me)
             self._used -= min(k, self._used)
             self._yields = max(0, self._yields - 1)
             self._cv.notify_all()
@@ -1012,6 +1027,7 @@ class StrataEngine:
                 self.max_context = int(f[1])
                 self.can_stop = "stop" in f[2:]
                 self.can_pause = "pause" in f[2:]
+                self.can_prefill_yield = "prefill_yield" in f[2:]
                 self.multi = next((int(x[6:]) for x in f[2:] if x.startswith("multi=") and x[6:].isdigit()), 0)
                 break
         loading.set()
@@ -1275,6 +1291,9 @@ class StrataEngine:
         if len(f) >= 11:                                  # decode hit rate fields
             self.last.update(hits=int(f[9]), lookups=int(f[10]))
 
+        if self.last["finish"] == "prefill_yield" and len(f) == 12:
+            self.last["prefill_order"] = int(f[11])
+
     def _asked_end(self) -> int:
         """How many times the server told the engine to cut whatever runs (STOP for all, QUIT, WRAP): a request
         compares it with its own start's (_ended_itself)."""
@@ -1473,6 +1492,9 @@ class StrataEngine:
         # an image request takes the same sampling keys as text (#75: it used to decode greedily whatever was asked)
         head = f"GENI {int(max_new)}{self.sampling_keys(sampling or {})} {embeddings}" if embeddings else \
             f"GEN {int(max_new)}{self.sampling_keys(sampling or {})}"
+        order = (sampling or {}).get("_resume_prefill")
+        if getattr(self, "can_prefill_yield", False) and isinstance(order, int) and order > 0:
+            head += f" resume_prefill={order}"
         try:
             turn_mark("gen_start")
             if prompt_memo_on():
@@ -1785,6 +1807,10 @@ class StrataEngine:
                     del self._routes[rid]
             self.__dict__.get("_paused", set()).discard(rid)
             self._tls.rid = None
+
+    def yield_prefill(self):
+        self.proc.stdin.write("YIELD_PREFILL\n")
+        self.proc.stdin.flush()
 
     def pause(self, keep: bool = False):
         """End the request in flight at its next step and keep the conversation's state with what it wrote (the
@@ -3973,7 +3999,7 @@ class Service:
                 hold[0] = False
                 self.fifo.release(units=units)
 
-    def _queue_wait(self, hold, cancel, units=1) -> Iterator[tuple[str, object]]:
+    def _queue_wait(self, hold, cancel, units=1, short_prefill=False) -> Iterator[tuple[str, object]]:
         """A request's wait in the FIFO for its first turn, as ("ping", None) every QUEUE_PING_S - the streams write
         them as SSE comments (": keep-alive"), which every client's parser ignores (#483: a request queued behind a
         long answer sent nothing at all, and a client with a stream-idle timeout gave up on a turn that was only
@@ -3982,7 +4008,7 @@ class Service:
         if cancel is None:                              # (no way to leave the line: _turn waits as before)
             return
         every = queue_ping_seconds()
-        place = self.fifo.enqueue(units=units)
+        place = self.fifo.enqueue(units=units, short_prefill=True) if short_prefill else self.fifo.enqueue(units=units)
         try:
             last = time.monotonic()
             while not cancel.is_set():
@@ -4249,6 +4275,8 @@ class Service:
         of its own ends and the request's own sampling follows; or the answer ends there (LOOP_STOP).  Until then the
         engine calls and their sampling are the ones without it."""
         produced, cur, left, smp = [], list(ids), max_new, sampling
+        allow_prefill = getattr(self.engine, "can_prefill_yield", False) and not emb
+        prefill_tried = False
         segments = []                                   # each slice's DONE (engine.last), summed at the end
         sent = 0                                        # produced[:sent] went to the caller (the guard holds the rest)
         # the thinking budget closed at a sentence's or line's end (THINK_GRACE, #613): past `soft` tokens of
@@ -4263,6 +4291,7 @@ class Service:
             gen = self.engine.generate(cur, n_call, smp_call, cancel, embeddings=emb) if emb else \
                 self.engine.generate(cur, n_call, smp_call, cancel)
             slice_s, t0, cut, pausing, claimed = fair_slice_seconds(), None, False, False, False
+            short_waiter, prefill_order = None, None
             act, got, closed = None, 0, False           # the loop guard's action; this call's tokens; a soft close
             try:
                 for t in gen:
@@ -4273,6 +4302,13 @@ class Service:
                     elif t is None:
                         yield None
                     if t is None:
+                        if allow_prefill and not prefill_tried and not produced and not cancel.is_set() and not self.stopping:
+                            pp = getattr(self.engine, "progress", None)
+                            if pp and pp[1] == len(cur) and 2048 <= pp[0] <= pp[1] - 8192:
+                                short_waiter = self.fifo.claim_short_prefill()
+                                if short_waiter is not None:
+                                    prefill_tried = claimed = True
+                                    self.engine.yield_prefill()
                         continue
                     produced.append(t)
                     if soft_text is not None:
@@ -4294,7 +4330,7 @@ class Service:
                         break                           # (gen.close(): STOP + drain, still holding the FIFO)
                     if t0 is None:
                         t0 = time.monotonic()
-                    if slice_s > 0 and not pausing and not emb and not self.stopping and len(produced) < max_new \
+                    if slice_s > 0 and not claimed and not pausing and not emb and not self.stopping and len(produced) < max_new \
                             and self.fifo.waiting() and time.monotonic() - t0 >= slice_s \
                             and self.fifo.claim_yield(slice_s):     # (one runner a waiter, not every runner)
                         claimed = True
@@ -4306,6 +4342,11 @@ class Service:
                         else:
                             cut = True
                             break
+                if short_waiter is not None:
+                    done = getattr(self.engine, "last", None)
+                    if done is not last0 and (done or {}).get("finish") == "prefill_yield" and not produced:
+                        prefill_order = done["prefill_order"]
+                        cut = not cancel.is_set() and not self.stopping
                 if pausing:
                     done = getattr(self.engine, "last", None)
                     cut = len(produced) < max_new and (done is last0 or (done or {}).get("finish") == "cancel")
@@ -4316,6 +4357,13 @@ class Service:
                 fresh = getattr(self.engine, "last", None)
                 if fresh is not None and fresh is not last0:
                     segments.append(fresh)
+                if len(segments) > 1:                           # the request's figures, over all its slices
+                    first, last = segments[0], segments[-1]
+                    merged = dict(last, prompt_tokens=first.get("prompt_tokens"), reused=first.get("reused"))
+                    for k in ("generated", "prompt_ms", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups"):
+                        if all(k in sg for sg in segments):
+                            merged[k] = sum(sg[k] for sg in segments)
+                    self.engine.last = merged
             if closed:                                  # the budget, at a sentence's or line's end: the thinking ends
                 later = len(produced) - soft
                 canon = self._closed_as_rendered(ids, produced, think_end)
@@ -4362,7 +4410,8 @@ class Service:
                 self.status["busy"] = self.active > 0
                 self.status["queued"] += 1
             waiting = self.fifo.waiting()
-            place = self.fifo.yield_place(units=1)      # in line, and the place free, in one step: behind whoever waits now
+            place = (self.fifo.yield_place(units=1, after_waiter=short_waiter) if prefill_order else
+                     self.fifo.yield_place(units=1))
             hold[0] = False
             print(f"[maya] fair slice: {len(produced)} tokens written, the engine goes to the next request "
                   f"({waiting} waiting); this one continues after it", flush=True)
@@ -4390,14 +4439,8 @@ class Service:
                 print("[maya] the engine had stopped; starting it again (a minute or two) ...", flush=True)
                 self.engine.restart()
             cur, left = list(ids) + produced, max_new - len(produced)
-            smp = self._resumed_sampling(sampling, produced)   # (the thinking budget counts from where it got to)
-        if len(segments) > 1:                           # the request's figures, over all its slices
-            first, last = segments[0], segments[-1]
-            merged = dict(last, prompt_tokens=first.get("prompt_tokens"), reused=first.get("reused"))
-            for k in ("generated", "prompt_ms", "decode_ms", "drafts_accepted", "drafts_offered", "hits", "lookups"):
-                if all(k in sg for sg in segments):
-                    merged[k] = sum(sg[k] for sg in segments)
-            self.engine.last = merged
+            smp = ({**(sampling or {}), "_resume_prefill": prefill_order} if prefill_order else
+                   self._resumed_sampling(sampling, produced))
         lastd = getattr(self.engine, "last", None)
         if isinstance(lastd, dict) and (lastd.get("prompt_tokens") or 0) > len(ids):
             self.engine.last = own_prompt_figures(lastd, len(ids))   # (the first call's DONE was not seen)
@@ -4488,7 +4531,12 @@ class Service:
         hold = [False, False]                           # holds the FIFO (fair slices let go of it); counts as active
         asked = time.monotonic()
         try:
-            yield from self._queue_wait(hold, cancel)   # (#483: keep-alives while queued; the turn taken there)
+            short = (getattr(self.engine, "can_prefill_yield", False) and not emb and
+                     len(ids) <= 2048 and 0 < max_new <= 256)
+            if short:
+                yield from self._queue_wait(hold, cancel, short_prefill=True)
+            else:
+                yield from self._queue_wait(hold, cancel)
             with self._turn(hold, cancel):
                 with self.status_lock:
                     self.status["queued"] -= 1
@@ -4560,8 +4608,8 @@ class Service:
                                 sampling["_think_stops"] = stops
                 # MAYA_DS4_RESTORE_POINTS: where the DeepSeek engine keeps restore points for this prompt (never a
                 # client's own `_restore`; not with pictures, whose spans the engine reads whole)
-                if sampling and "_restore" in sampling:
-                    sampling = {k: v for k, v in sampling.items() if k != "_restore"}
+                if sampling and ("_restore" in sampling or "_resume_prefill" in sampling):
+                    sampling = {k: v for k, v in sampling.items() if k not in ("_restore", "_resume_prefill")}
                 on, tail = restore_point_settings()
                 if on and not emb and getattr(self.template, "deepseek", False):
                     pts = (deepseek_restore_points_fast if prompt_memo_on() and isinstance(ids, list)
@@ -4628,8 +4676,9 @@ class Service:
                 try:
                     for t in gen:
                         if t is None:                   # heartbeat while the engine is quiet
-                            last_print = self._progress(last_print)
-                            pr = getattr(self.engine, "progress", None)   # (read, total, reuse, ms), the PP parse
+                            if hold[0]:
+                                last_print = self._progress(last_print)
+                            pr = getattr(self.engine, "progress", None) if hold[0] else None   # (read, total, reuse, ms), the PP parse
                             yield "ping", ({"total": pr[1], "cache": pr[2], "processed": pr[0],
                                             "time_ms": round(pr[3])} if pr and len(pr) >= 4 else None)
                             continue

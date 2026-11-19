@@ -81,7 +81,7 @@ struct Req {
     long long max_new = 0;
     float temperature = 0.0f, top_p = 1.0f, min_p = 0.0f;
     int top_k = 64;
-    unsigned long long seed = 0;
+    unsigned long long seed = 0, resume_prefill = 0;
     int pen_n = 0;
     float pen_repeat = 1.0f, pen_freq = 0.0f, pen_present = 0.0f;
     long long think_budget = 0;
@@ -113,6 +113,7 @@ bool parse_gen(const std::string& line, Req& r) {
         else if (k == "top_p") r.top_p = std::strtof(v.c_str(), nullptr);
         else if (k == "top_k") r.top_k = std::atoi(v.c_str());
         else if (k == "min_p") r.min_p = std::strtof(v.c_str(), nullptr);
+        else if (k == "resume_prefill") r.resume_prefill = std::strtoull(v.c_str(), nullptr, 10);
         else if (k == "seed") r.seed = std::strtoull(v.c_str(), nullptr, 10);
         else if (k == "penalty_last_n") r.pen_n = std::atoi(v.c_str());
         else if (k == "penalty_repeat") r.pen_repeat = std::strtof(v.c_str(), nullptr);
@@ -185,7 +186,7 @@ struct Lines {
     std::condition_variable cv;
     std::deque<std::string> q;
     bool eof = false, running = false, pending_wrap = false;  // guarded by mu
-    std::atomic<bool> stop{false}, wrap{false};
+    std::atomic<bool> stop{false}, wrap{false}, yield_prefill{false};
     void start() {
         std::thread([this] {
             std::string buf;
@@ -203,6 +204,10 @@ struct Lines {
                         continue;
                     }
                     std::lock_guard<std::mutex> lk(mu);
+                    if (l == "YIELD_PREFILL") {
+                        if (running) yield_prefill.store(true);
+                        continue;
+                    }
                     if (l == "WRAP") {
                         if (running) wrap.store(true);
                         else if (!q.empty()) pending_wrap = true;  // GEN and WRAP may arrive in the same read.
@@ -224,6 +229,7 @@ struct Lines {
         cv.wait(lk, [&] { return !q.empty() || eof; });
         if (q.empty()) return false;
         running = true;
+        yield_prefill.store(false);
         wrap.store(pending_wrap);
         pending_wrap = false;
         out = std::move(q.front());
@@ -535,7 +541,9 @@ int serve(Model& m, const ServeOptions& so) {
                     "vision_merge=2 vision_min_pixels=4096 vision_max_pixels=4194304\n");
     else
         std::printf("INFO vision=off\n");
-    std::printf("READY %lld stop\n", C);
+    const char* yield_setting = std::getenv("HY4F_PREFILL_YIELD");
+    const bool allow_yield = host_slots && yield_setting && std::strcmp(yield_setting, "1") == 0;
+    std::printf("READY %lld stop%s\n", C, allow_yield ? " prefill_yield" : "");
     std::fflush(stdout);
     std::fprintf(stderr, "maya hy4f serve: GEN <max_new> [keys] <ids>; STOP, WRAP, QUIT\n");
 #if defined(SIGPIPE)
@@ -546,7 +554,10 @@ int serve(Model& m, const ServeOptions& so) {
     std::vector<int32_t> state;   // the tokens in the cache, positions 0 .. (m.position() == state.size())
     std::vector<float> lg((size_t) V);
     Sampler sampler;
-    unsigned long long counter = 0;
+    unsigned long long counter = 0, interrupted_order = 0;
+    std::vector<int32_t> interrupted_ids;
+    size_t interrupted_rows = 0;
+    constexpr int interrupted_slot = 8;   // independent of the three short + three deep + two fine slots
     bool mark_ok = true;
     const bool turn_mark = std::getenv("HY4F_PREFIX_TURN_MARK") != nullptr;
     size_t saved_prompt = 0;
@@ -639,10 +650,19 @@ int serve(Model& m, const ServeOptions& so) {
                                  "read from %lld\n", from, (long long) kept);
         from = (size_t) kept;
         const bool text_cache = host_keys.enabled() && r.file.empty();
-        const int host_slot = text_cache && !full_hit ? host_keys.lookup(r.ids, from) : -1;
+        int host_slot = text_cache && !full_hit ? host_keys.lookup(r.ids, from) : -1;
+        size_t host_rows = host_slot >= 0 ? host_keys.length(host_slot) : 0;
+        const bool resumed = allow_yield && text_cache && r.resume_prefill && r.resume_prefill == interrupted_order &&
+                             r.ids == interrupted_ids;
+        const unsigned long long resume_order = resumed ? interrupted_order : 0;
+        if (resumed && !full_hit && interrupted_rows > from && interrupted_rows > host_rows) {
+            host_slot = interrupted_slot;
+            host_rows = interrupted_rows;
+        }
+        if (resumed) { interrupted_order = 0; interrupted_ids.clear(); }
         bool host_restored = false;
         if (host_slot >= 0) {
-            const size_t pos = host_keys.length(host_slot);
+            const size_t pos = host_rows;
             const double started = now_ms();
             if (m.load_host_prefix(host_slot, pos, err)) {
                 from = pos;
@@ -654,7 +674,7 @@ int serve(Model& m, const ServeOptions& so) {
             } else {
                 // A failed H2D copy can leave a partly restored branch. Rebuild all state from the beginning.
                 std::fprintf(stderr, "maya hy4f serve: host prefix restore failed (%s), restarting cold\n", err.c_str());
-                host_keys.clear(host_slot);
+                if (host_slot != interrupted_slot) host_keys.clear(host_slot);
                 m.reset();
                 from = 0;
             }
@@ -703,7 +723,7 @@ int serve(Model& m, const ServeOptions& so) {
             std::fflush(stdout);
             continue;
         }
-        bool cancel = false;
+        bool cancel = false, yielded = false;
         auto pp_line = [&](size_t done) {
             const double ms = now_ms() - t0;
             std::printf("PP %zu %zu %.1f %.1f %zu\n", done, n, ms, ms > 0 ? 1000.0 * (double) (done - from) / ms : 0.0, from);
@@ -747,12 +767,34 @@ int serve(Model& m, const ServeOptions& so) {
                 cancel = true;
                 break;
             }
+            if (allow_yield && in.yield_prefill.exchange(false) && text_cache && cold_aligned && !resume_order &&
+                a >= 2 * size_t(CH) && a % CH == 0 && n - a >= 2 * size_t(CH)) {
+                double transfer_ms = 0;
+                const double started = now_ms();
+                interrupted_order = 0;
+                interrupted_ids.clear();
+                if (m.save_host_prefix(interrupted_slot, err, &transfer_ms)) {
+                    interrupted_rows = a;
+                    interrupted_ids = r.ids;
+                    interrupted_order = ++counter;   // reserve the original unseeded sequence before the short request
+                    yielded = true;
+                    std::fprintf(stderr, "maya hy4f serve: interrupted prefill rows=%zu total=%zu ms=%.1f d2h_ms=%.1f\n",
+                                 a, n, now_ms() - started, transfer_ms);
+                    break;
+                }
+                std::fprintf(stderr, "maya hy4f serve: prefill yield skipped (%s)\n", err.c_str());
+            }
         }
         const double t1 = now_ms();
         for (size_t i = 0; i < pics.size(); ++i)   // (the pictures now in the cache)
             if (pics[i].start + pn[i] <= (long long) state.size() &&
                 std::none_of(held.begin(), held.end(), [&](const Held& q) { return q.start == pics[i].start; }))
                 held.push_back({pics[i].start, (long long) pn[i], pics[i].hash});
+        if (yielded) {
+            std::printf("DONE 0 %zu %.1f 0.0 prefill_yield 0 0 %zu 0 0 %llu\n", n, t1 - t0, from, interrupted_order);
+            std::fflush(stdout);
+            continue;
+        }
         if (cancel) {
             std::printf("DONE 0 %zu %.1f 0.0 cancel 0 0 %zu 0 0\n", n, t1 - t0, from);
             std::fflush(stdout);
@@ -766,8 +808,8 @@ int serve(Model& m, const ServeOptions& so) {
         // An unaligned warm suffix and a cold prefill can select different GEMM
         // shapes. Preserve the established final-token replay for that lineage.
         if (turn_mark && mark_ok && (full_hit || cold_aligned)) saved_prompt = n;
-        ++counter;
-        std::mt19937_64 rng(r.seed != 0 ? r.seed : 0x9E3779B97F4A7C15ull * counter);
+        const auto order = resume_order ? resume_order : ++counter;
+        std::mt19937_64 rng(r.seed != 0 ? r.seed : 0x9E3779B97F4A7C15ull * order);
         long long produced = 0;
         const char* finish = "length";
         bool in_think = r.think_budget > 0 && r.think_end >= 0;
