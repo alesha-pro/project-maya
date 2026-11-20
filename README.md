@@ -9,6 +9,8 @@
 </p>
 
 > **Start with [docs/HY4-FLASH.md](docs/HY4-FLASH.md).** Speeds, memory per setup, how to switch the uncensored vector on and off, and every config.
+>
+> Boards without P2P (for example a Xeon E5 v4 / C612 with two RTX 3090s) work too: the engine falls back to host-mapped exchange buffers. See [Two GPUs without P2P](docs/HY4-FLASH.md#two-gpus-without-p2p).
 
 | | 4x RTX 3090 | 2x RTX 3090 | 1x RTX 3090 |
 |---|---:|---:|---:|

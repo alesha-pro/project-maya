@@ -273,20 +273,22 @@ void batch_alloc(Shard& s, BShard& b, int Tmax) {
         b.emask = m.take<int>(T);
         // exchanges: one buffer each (the alternation RS -> AG -> RS .. and the waits order every reuse)
         if (!sliced) {
-            b.ar_buf[0] = b.ar_buf[1] = m.take<float>((size_t) S * ts * E / 2 + 64);
-            b.ag_buf[0] = b.ag_buf[1] = m.take<float>((size_t) T * E / 2 + 64);
-            b.cb_buf[0] = b.cb_buf[1] = m.take<float>(std::getenv("HY4F_CB32") ? (size_t) S * TA * (Hd / S) * CBW()
-                                                                               : (size_t) S * TA * (Hd / S) * CB_SLOT / 4);
+            b.ar_buf[0] = b.ar_buf[1] = p2p_ok ? m.take<float>((size_t) S * ts * E / 2 + 64) : halloc((size_t) S * ts * E / 2 + 64);
+            b.ag_buf[0] = b.ag_buf[1] = p2p_ok ? m.take<float>((size_t) T * E / 2 + 64) : halloc((size_t) T * E / 2 + 64);
+            b.cb_buf[0] = b.cb_buf[1] = p2p_ok ? m.take<float>(std::getenv("HY4F_CB32") ? (size_t) S * TA * (Hd / S) * CBW()
+                                                                                   : (size_t) S * TA * (Hd / S) * CB_SLOT / 4)
+                                                : halloc(std::getenv("HY4F_CB32") ? (size_t) S * TA * (Hd / S) * CBW()
+                                                                                  : (size_t) S * TA * (Hd / S) * CB_SLOT / 4);
             b.yn = m.take<__half>((size_t) ts * E);
         }
-        b.ag_flag = m.take<int>(4);
-        b.ar_flag = m.take<int>(4);
-        b.cb_flag = m.take<int>(4);
+        b.ag_flag = p2p_ok ? m.take<int>(4) : ihalloc(4);
+        b.ar_flag = p2p_ok ? m.take<int>(4) : ihalloc(4);
+        b.cb_flag = p2p_ok ? m.take<int>(4) : ihalloc(4);
         b.ctr = m.take<int>(16);
-        b.cl_flag = m.take<int>(4);
+        b.cl_flag = p2p_ok ? m.take<int>(4) : ihalloc(4);
         if (S > 1) {
-            b.cellsx[0] = m.take<int>((size_t) TA * n_cap);
-            b.cellsx[1] = m.take<int>((size_t) TA * n_cap);
+            b.cellsx[0] = p2p_ok ? m.take<int>((size_t) TA * n_cap) : ihalloc((size_t) TA * n_cap);
+            b.cellsx[1] = p2p_ok ? m.take<int>((size_t) TA * n_cap) : ihalloc((size_t) TA * n_cap);
         }
         b.wdq = m.take<float>(std::max((size_t) Hd, (size_t) Hmax / S) * kvl * nope + (size_t) Hmax / S * vh * kvl);
         b.mr = has_mtp ? (compact_arena ? b.X : m.take<float>((size_t) T * E)) : nullptr;
@@ -465,9 +467,11 @@ void bgemm(BShard& b, int m, int n, int k, const float* A, int lda, long long sA
 void b_copy(Shard& s, BShard& b, Peers& P, int j, const void* src, size_t offset, size_t len) {
     auto dst = reinterpret_cast<uint8_t*>(P.buf[j][b.step & 1]) + offset;
     if (len && j == s.g)
-        HY_CK(cudaMemcpyAsync(dst, src, len, cudaMemcpyDeviceToDevice, b.st));
+        HY_CK(p2p_ok ? cudaMemcpyAsync(dst, src, len, cudaMemcpyDeviceToDevice, b.st)
+                     : cudaMemcpyAsync(dst, src, len, cudaMemcpyDeviceToHost, b.st));
     else if (len)
-        HY_CK(cudaMemcpyPeerAsync(dst, sh[j].dev, src, s.dev, len, b.st));
+        HY_CK(p2p_ok ? cudaMemcpyPeerAsync(dst, sh[j].dev, src, s.dev, len, b.st)
+                     : cudaMemcpyAsync(dst, src, len, cudaMemcpyDeviceToHost, b.st));
     kb_copy_done<<<1, 32, 0, b.st>>>(P.flag[j], s.g, b.step);
     if (paired && j != s.g) kb_wait_one<<<1, 32, 0, b.st>>>(P, s.g, j, b.step);
 }
