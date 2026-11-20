@@ -460,6 +460,20 @@ struct Model::Impl {
         HY_CK(cudaMemset(p, 0, n * sizeof(float)));
         return p;
     }
+
+    // (HY4F_HOSTWIRE: boards where SM posted writes across sockets don't land in peer device memory —
+    //  put the exchange wire regions and flags in pinned host memory; DMA/host paths work everywhere.)
+    static bool hostwire() { static bool h = std::getenv("HY4F_HOSTWIRE") != nullptr; return h; }
+    float* wall(size_t n) {
+        if (!hostwire()) return dalloc(n);
+        void* p = nullptr; HY_CK(cudaHostAlloc(&p, n * sizeof(float), cudaHostAllocMapped)); memset(p, 0, n * sizeof(float));
+        return (float*)p;
+    }
+    int* wall_i(size_t n) {
+        if (!hostwire()) { int* p = nullptr; HY_CK(cudaMalloc(&p, n * sizeof(int))); HY_CK(cudaMemset(p, 0, n * sizeof(int))); return p; }
+        void* p = nullptr; HY_CK(cudaHostAlloc(&p, n * sizeof(int), cudaHostAllocMapped)); memset(p, 0, n * sizeof(int));
+        return (int*)p;
+    }
     // a weight's device memory with a zeroed tail: MMQ reads whole 256-value k iterations, past the last row's end
     void* walloc(size_t bytes) {
         void* p = nullptr;
@@ -1324,6 +1338,19 @@ struct Model::Impl {
     void load_shard(Shard& s) {
         HY_CK(cudaSetDevice(s.dev));
         HY_CK(cudaStreamCreateWithFlags(&s.st, cudaStreamNonBlocking));
+        if (S > 1) {
+            // Volta peer writes from kernels need the peer explicitly enabled:
+            // without this the multi-GPU exchange's posted stores never land.
+            int nd = 0; cudaGetDeviceCount(&nd);
+            for (int h = 0; h < nd; ++h) if (h != (int)s.dev) {
+                int can = 0;
+                if (cudaDeviceCanAccessPeer(&can, s.dev, h) == cudaSuccess && can) {
+                    const cudaError_t e = cudaDeviceEnablePeerAccess(h, 0);
+                    if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) HY_CK(e);
+                    else if (e == cudaErrorPeerAccessAlreadyEnabled) (void)cudaGetLastError();
+                }
+            }
+        }
         const int g = s.g;
         const int64_t C = o.max_context;
         s.w["token_embd.weight"] = emb_host();
@@ -1526,13 +1553,13 @@ struct Model::Impl {
         s.head_x = dalloc(E);
         s.logits = dalloc(V / S);
         for (int p = 0; p < 2; ++p) {   // receive areas: [src shard][payload]
-            s.ar_buf[p] = dalloc((size_t) S * E);
-            s.cb_buf[p] = dalloc((size_t) S * (Hd / S) * (kvl + 2));
+            s.ar_buf[p] = wall((size_t) S * E);
+            s.cb_buf[p] = wall((size_t) S * (Hd / S) * (kvl + 2));
         }
-        HY_CK(cudaMalloc(&s.ar_flag, sizeof(int) * 4));
-        HY_CK(cudaMemset(s.ar_flag, 0, sizeof(int) * 4));
-        HY_CK(cudaMalloc(&s.cb_flag, sizeof(int) * 4));
-        HY_CK(cudaMemset(s.cb_flag, 0, sizeof(int) * 4));
+        s.ar_flag = wall_i(4);
+        if (!hostwire()) HY_CK(cudaMemset(s.ar_flag, 0, sizeof(int) * 4));
+        s.cb_flag = wall_i(4);
+        if (!hostwire()) HY_CK(cudaMemset(s.cb_flag, 0, sizeof(int) * 4));
         HY_CK(cudaMalloc(&s.ar_ctr, sizeof(int)));
         HY_CK(cudaMemset(s.ar_ctr, 0, sizeof(int)));
         HY_CK(cudaMalloc(&s.cb_ctr, sizeof(int)));
