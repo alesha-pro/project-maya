@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <mma.h>
 #include <type_traits>
 
 namespace strata::hy4f::packed_index {
@@ -29,10 +30,15 @@ __device__ __forceinline__ unsigned fp16_pair(const float* values) {
     return (unsigned(raw.y)<<16)|raw.x;
 }
 __device__ __forceinline__ void multiply(float (&c)[4], const uint4& a, unsigned b0, unsigned b1) {
+#if __CUDA_ARCH__ >= 750
     asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
         "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%0,%1,%2,%3};"
         : "+f"(c[0]),"+f"(c[1]),"+f"(c[2]),"+f"(c[3])
         : "r"(a.x),"r"(a.y),"r"(a.z),"r"(a.w),"r"(b0),"r"(b1));
+#else
+    // Volta (sm_70) has no m16n8k16 mma; score_tile_v below uses 16x16x16 WMMA instead.
+    (void)c; (void)a; (void)b0; (void)b1;
+#endif
 }
 
 template<int Tokens, int WarpTokens, bool Histogram>
@@ -54,6 +60,7 @@ __device__ __forceinline__ void score_impl(const float* query, int ldq, const __
             for (int i = lane; i < 256; i += 32) local_hist[warp][t][i] = 0;
         __syncwarp();
     }
+#if __CUDA_ARCH__ >= 750
     uint4 q[PerToken][8];
 #pragma unroll
     for(int t=0;t<PerToken;++t) {
@@ -65,6 +72,7 @@ __device__ __forceinline__ void score_impl(const float* query, int ldq, const __
                                fp16_pair(lo+8),fp16_pair(lo+8*128+8));
         }
     }
+#endif
     // The stride places eight independent 16-byte score reads in distinct banks.
     __shared__ __align__(16) float dots[Warps][8][20];
     __shared__ __align__(16) float scale[Warps][PerToken][16];
@@ -75,6 +83,7 @@ __device__ __forceinline__ void score_impl(const float* query, int ldq, const __
     __syncwarp();
     const Cache cache=*state;
     const int stride=gridDim.x*(Warps/WarpTokens);
+#if __CUDA_ARCH__ >= 750
     auto score_tile = [&](int tile, auto packed) {
 
         float accum[PerToken][4]={};
@@ -123,6 +132,62 @@ __device__ __forceinline__ void score_impl(const float* query, int ldq, const __
             __syncwarp();
         }
     };
+#else
+    // Volta (sm_70): mma.m16n8k16 needs sm_75+, so score the 16-head x 8-group tile in
+    // plain fp32 through shared memory instead. Same outputs as the fragment path above.
+    __shared__ float bsm[Warps][8][128];
+    auto score_tile = [&](int tile, auto packed) {
+#pragma unroll
+        for (int pass=0; pass<4; ++pass) {           // 8 groups x 128 dims / 32 lanes = 4 passes
+            const int i=lane+32*pass, group=i>>7, dim=i&127;
+            float v=0.f;
+            if constexpr(decltype(packed)::value) {
+                // Packed entries are m16n8k16 B fragments: lane group*4+t holds fp16 pairs for
+                // (dim&15)<8 in .x/.z and >=8 in .y/.w, .z/.w covering the second 16-dim half.
+                const uint4 u=cache.base[(size_t(tile)*4+(dim>>5))*32+group*4+((dim&7)>>1)];
+                const unsigned bits=((dim>>4)&1) ? ((dim&8) ? u.w : u.z) : ((dim&8) ? u.y : u.x);
+                const __half2 h=*reinterpret_cast<const __half2*>(&bits);
+                v=__half2float((dim&1) ? h.y : h.x);
+            } else {
+                const int row=8*tile+group;
+                if(row<groups) v=__half2float(raw[size_t(row)*128+dim]);
+            }
+            bsm[warp][group][dim]=v;
+        }
+        __syncwarp();
+#pragma unroll
+        for(int t=0;t<PerToken;++t) {
+#pragma unroll
+            for(int o=0;o<4;++o) {
+                const int idx=lane+32*o, col=idx/16, head=idx%16;
+                const float* qrow=query+size_t(first_token+t)*ldq+size_t(head)*128;
+                float s=0.f;
+                for(int d=0;d<128;++d) s=__fmaf_rn(qrow[d],bsm[warp][col][d],s);
+                dots[warp][col][head]=s;
+            }
+            __syncwarp();
+            const int tt=first_token+t,g=tile*8+lane;
+            if(lane<8 && g<(p+tt)/4 && p+tt+1>2048) {
+                float sum=0.f;
+#pragma unroll
+                for(int h=0;h<16;h+=4) {
+                    const float4 d=*reinterpret_cast<const float4*>(&dots[warp][lane][h]);
+                    const float4 w=*reinterpret_cast<const float4*>(&scale[warp][t][h]);
+                    sum+=fmaxf(d.x,0.f)*w.x;
+                    sum+=fmaxf(d.y,0.f)*w.y;
+                    sum+=fmaxf(d.z,0.f)*w.z;
+                    sum+=fmaxf(d.w,0.f)*w.w;
+                }
+                scores[size_t(tt)*lds+g]=sum;
+                if constexpr (Histogram) {
+                    const unsigned bin=kern::kd_score_coarse(sum);
+                    atomicAdd(&local_hist[warp][t][bin >> 1], 1u << (16 * (bin & 1u)));
+                }
+            }
+            __syncwarp();
+        }
+    };
+#endif
     int tile=first;
     for (; tile<min(cache.tiles,(groups+7)/8); tile+=stride) score_tile(tile,std::true_type{});
     for (; tile*8<groups; tile+=stride) score_tile(tile,std::false_type{});
