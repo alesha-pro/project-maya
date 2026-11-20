@@ -335,14 +335,14 @@ void dec_alloc(Shard& s, DShard& d) {
         // can wrap even when only one width has been running for a long time.
         const size_t extra = ar_ll4 && E % 4 == 0 ? (size_t)S * E * (3+4)
                            : ar_ll3 && E % 3 == 0 ? (size_t)S * (E/3) * (3+4) * 2 : 0;
-        d.ar_buf[p] = dalloc((size_t) S * DT * E + extra);
-        d.cb_buf[p] = dalloc((size_t) S * DT * (Hd / S) * CBW());
+        d.ar_buf[p] = p2p_ok ? dalloc((size_t) S * DT * E + extra) : halloc((size_t) S * DT * E + extra);
+        d.cb_buf[p] = p2p_ok ? dalloc((size_t) S * DT * (Hd / S) * CBW()) : halloc((size_t) S * DT * (Hd / S) * CBW());
     }
-    d.ar_flag = ia(4);
+    d.ar_flag = p2p_ok ? ia(4) : ihalloc(4);
     d.ysc = dalloc((size_t) DT * E);
     d.tpart = dalloc((size_t) DT * 16 * 32);
     d.tppost = dalloc((size_t) DT * 4);
-    d.cb_flag = ia(std::getenv("HY4F_HEAD_SEND") ? 4+DT*Hd : 4);
+    d.cb_flag = p2p_ok ? ia(std::getenv("HY4F_HEAD_SEND") ? 4+DT*Hd : 4) : ihalloc(std::getenv("HY4F_HEAD_SEND") ? 4+DT*Hd : 4);
     d.ar_ctr = ia(ar_ll3 || ar_ll4 ? 3 : 1);
     if (ar_ll4 && E % 4 == 0) {
         const size_t bytes = (size_t)(E/4) * (3+4) * 2;
@@ -1479,9 +1479,14 @@ void dec_launch(bool mtp, int T, bool chain, bool full_logits) {
                     const int count = (sparse_high + S - 1 - owner)/S;
                     if (count <= sparse_skip) continue;
                     const int base = replica_row_base(owner,s.g,sparse_base,sparse_pitch);
-                    HY_CK(cudaMemcpyPeerAsync(s.kv[il]+(size_t)(base+sparse_skip)*KV_RB,s.dev,
-                                              sh[owner].kv[il]+(size_t)sparse_skip*KV_RB,sh[owner].dev,
-                                              (size_t)(count-sparse_skip)*KV_RB,s.st));
+                    if (p2p_ok)
+                        HY_CK(cudaMemcpyPeerAsync(s.kv[il]+(size_t)(base+sparse_skip)*KV_RB, s.dev,
+                                                  sh[owner].kv[il]+(size_t)sparse_skip*KV_RB, sh[owner].dev,
+                                                  (size_t)(count-sparse_skip)*KV_RB, s.st));
+                    else
+                        peer_stage_copy(s.kv[il]+(size_t)(base+sparse_skip)*KV_RB, s.dev,
+                                        sh[owner].kv[il]+(size_t)sparse_skip*KV_RB, sh[owner].dev,
+                                        (size_t)(count-sparse_skip)*KV_RB);
                 }
             }
             HY_CK(cudaStreamSynchronize(s.st));

@@ -61,7 +61,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
-#include <immintrin.h>
+#include <xmmintrin.h>
 #include <sys/mman.h>
 #include <pthread.h>
 #include <sched.h>
@@ -225,6 +225,7 @@ struct Model::Impl {
     uint8_t* eg_table = nullptr;
     std::unique_ptr<EngramDisk> eg_disk;
     int S = 4;
+    bool p2p_ok = false;   // every pair of GPUs can access peer memory (device wire buffers)
     std::vector<int> ebound;   // shard g owns the experts [ebound[g], ebound[g+1])
     std::vector<int> mtp_ebound;
     const std::vector<int>& expert_bounds(int layer) const { return layer == L ? mtp_ebound : ebound; }
@@ -459,6 +460,48 @@ struct Model::Impl {
         HY_CK(cudaMalloc(&p, n * sizeof(float)));
         HY_CK(cudaMemset(p, 0, n * sizeof(float)));
         return p;
+    }
+    // Host-mapped, portable zero-copy buffer: a device pointer valid on every GPU (UVA), so tensor-parallel
+    // peer exchanges work without P2P (the board's chipset may not support it).  Used for the all-reduce and
+    // attention-combine wire buffers only; the kernels use __threadfence_system + volatile loads.
+    float* halloc(size_t n) {
+        void* p = nullptr;
+        HY_CK(cudaHostAlloc(&p, n * sizeof(float), cudaHostAllocMapped | cudaHostAllocPortable));
+        std::memset(p, 0, n * sizeof(float));
+        return static_cast<float*>(p);
+    }
+    int* ihalloc(size_t n) {
+        void* p = nullptr;
+        HY_CK(cudaHostAlloc(&p, n * sizeof(int), cudaHostAllocMapped | cudaHostAllocPortable));
+        std::memset(p, 0, n * sizeof(int));
+        return static_cast<int*>(p);
+    }
+    float* wire_alloc(size_t n) { return p2p_ok ? dalloc(n) : halloc(n); }
+    int* wire_ialloc(size_t n) {
+        if (!p2p_ok) return ihalloc(n);
+        int* p = nullptr;
+        HY_CK(cudaMalloc(&p, n * sizeof(int)));
+        HY_CK(cudaMemset(p, 0, n * sizeof(int)));
+        return p;
+    }
+    // Device-to-device copy between two GPUs with no P2P: stage through pinned host memory.  Used by the KV
+    // mirror restores (once per prefix change), not per token.
+    static void peer_stage_copy(void* dst, int dst_dev, const void* src, int src_dev, size_t bytes) {
+        if (!bytes) return;
+        thread_local void* h = nullptr;
+        thread_local size_t cap = 0;
+        if (bytes > cap) {
+            if (h) cudaFreeHost(h);
+            HY_CK(cudaHostAlloc(&h, bytes, cudaHostAllocPortable));
+            cap = bytes;
+        }
+        int cur = 0;
+        HY_CK(cudaGetDevice(&cur));
+        HY_CK(cudaSetDevice(src_dev));
+        HY_CK(cudaMemcpy(h, src, bytes, cudaMemcpyDeviceToHost));
+        HY_CK(cudaSetDevice(dst_dev));
+        HY_CK(cudaMemcpy(dst, h, bytes, cudaMemcpyHostToDevice));
+        HY_CK(cudaSetDevice(cur));
     }
     // a weight's device memory with a zeroed tail: MMQ reads whole 256-value k iterations, past the last row's end
     void* walloc(size_t bytes) {
@@ -1306,11 +1349,10 @@ struct Model::Impl {
         const char* mode = std::getenv("HY4F_ENGRAM_IO");
         if (mode && std::strcmp(mode,"ram") != 0) {
             if (std::strcmp(mode,"direct") != 0) throw std::runtime_error("HY4F_ENGRAM_IO expects ram or direct");
-            if (S != 1) throw std::runtime_error("Engram direct I/O currently supports one GPU");
             const uint64_t start = f->data_start() + t->offset;
             if (start > f->file_size() || bytes > f->file_size()-start || int(t->shape[0]) != eg_D)
                 throw std::runtime_error("invalid GGUF Engram tensor");
-            eg_disk = std::make_unique<EngramDisk>(f->path(), start, t->shape[1], eg_D, (eg_ngram-1)*eg_heads, device);
+            eg_disk = std::make_unique<EngramDisk>(f->path(), start, t->shape[1], eg_D, (eg_ngram-1)*eg_heads, device, (unsigned)(2*S));
             return;
         }
         const uint8_t* src = f->tensor_data(*t);
@@ -1525,14 +1567,12 @@ struct Model::Impl {
         s.head_cur = dalloc(E);
         s.head_x = dalloc(E);
         s.logits = dalloc(V / S);
-        for (int p = 0; p < 2; ++p) {   // receive areas: [src shard][payload]
-            s.ar_buf[p] = dalloc((size_t) S * E);
-            s.cb_buf[p] = dalloc((size_t) S * (Hd / S) * (kvl + 2));
+        for (int p = 0; p < 2; ++p) {   // receive areas: [src shard][payload] (host-mapped: no P2P needed)
+            s.ar_buf[p] = wire_alloc((size_t) S * E);
+            s.cb_buf[p] = wire_alloc((size_t) S * (Hd / S) * (kvl + 2));
         }
-        HY_CK(cudaMalloc(&s.ar_flag, sizeof(int) * 4));
-        HY_CK(cudaMemset(s.ar_flag, 0, sizeof(int) * 4));
-        HY_CK(cudaMalloc(&s.cb_flag, sizeof(int) * 4));
-        HY_CK(cudaMemset(s.cb_flag, 0, sizeof(int) * 4));
+        s.ar_flag = wire_ialloc(4);
+        s.cb_flag = wire_ialloc(4);
         HY_CK(cudaMalloc(&s.ar_ctr, sizeof(int)));
         HY_CK(cudaMemset(s.ar_ctr, 0, sizeof(int)));
         HY_CK(cudaMalloc(&s.cb_ctr, sizeof(int)));
@@ -1596,7 +1636,7 @@ struct Model::Impl {
         k_engram_hash<<<1, 32, 0, s.st>>>(s.hist, s.dio, s.eg_map, (int64_t) eg_map.size(), eg_pad,
                                           s.eg_mult + (size_t) e * ng, s.eg_vsz + (size_t) e * ncol,
                                           s.eg_off + (size_t) e * ncol, ng, nh, s.eg_ids);
-        const auto* table = eg_disk ? eg_disk->stage(s.eg_ids,1,1,s.st) : eg_table;
+        const auto* table = eg_disk ? eg_disk->stage(s.eg_ids,1,(unsigned)(s.g*2+1),s.st) : eg_table;
         const auto* ids = eg_disk ? eg_disk->indices() : s.eg_ids;
         k_engram_rows<<<ncol, 128, 0, s.st>>>(table, ids, f32(s, P + "engram_lookup_norm.weight"), s.eg_r, eg_D,
                                               1.1920929e-07f);
@@ -1757,18 +1797,15 @@ struct Model::Impl {
     }
 
     void setup_peers() {
-        for (auto& a : sh) {
-            HY_CK(cudaSetDevice(a.dev));
-            for (auto& b : sh)
-                if (a.dev != b.dev) {
-                    int can = 0;
-                    HY_CK(cudaDeviceCanAccessPeer(&can, a.dev, b.dev));
-                    if (!can) throw std::runtime_error("hy4f: no P2P between GPUs " + std::to_string(a.dev) + " and " +
-                                                       std::to_string(b.dev));
+        if (p2p_ok) {
+            for (auto& a : sh) {
+                HY_CK(cudaSetDevice(a.dev));
+                for (auto& b : sh) if (a.dev != b.dev) {
                     const cudaError_t e = cudaDeviceEnablePeerAccess(b.dev, 0);
                     if (e != cudaSuccess && e != cudaErrorPeerAccessAlreadyEnabled) HY_CK(e);
                     cudaGetLastError();
                 }
+            }
         }
         Peers ar{}, cb{};
         for (int j = 0; j < S; ++j) {
@@ -1933,6 +1970,13 @@ bool Model::load(const Options& o, std::string& err) {
             for (int i = 0; i < ndev; ++i) devs.push_back(i);
         d.S = (int) devs.size();
         if (d.S != 4 && d.S != 2 && d.S != 1) throw std::runtime_error("hy4f: 1, 2 or 4 GPUs");
+        d.p2p_ok = true;
+        for (int i = 0; i < d.S && d.p2p_ok; ++i)
+            for (int j = 0; j < d.S; ++j) if (i != j) {
+                int can = 0;
+                if (cudaDeviceCanAccessPeer(&can, devs[i], devs[j]) != cudaSuccess || !can) { d.p2p_ok = false; break; }
+            }
+        std::fprintf(stderr, "hy4f: peer transport: %s\n", d.p2p_ok ? "device P2P" : "host-mapped (no P2P)");
         d.geometry();
         d.load_draft_experts(std::getenv("HY4F_MTP_EXPERT_GGUF"), false);
         d.load_draft_experts(std::getenv("HY4F_MTP_DOWN_GGUF"), true);

@@ -42,7 +42,7 @@ class EngramDisk {
     int device_ = -1;
     uint64_t offset_, rows_;
     unsigned cols_;
-    std::array<Lane,2> lanes_;
+    std::vector<Lane> lanes_;
     int64_t* host_index_ = nullptr;
     int64_t* index_ = nullptr;
     std::vector<int64_t> keys_;
@@ -156,7 +156,7 @@ class EngramDisk {
     }
 public:
     static constexpr unsigned Batch = 2048;
-    EngramDisk(const std::string& path,uint64_t offset,uint64_t rows,unsigned width,unsigned cols,int dev)
+    EngramDisk(const std::string& path,uint64_t offset,uint64_t rows,unsigned width,unsigned cols,int dev,unsigned nlanes)
         : offset_(offset),rows_(rows),cols_(cols),keys_(CacheRows,-1),cache_(CacheRows) {
         if (width!=Width || !cols || cols>32) throw std::runtime_error("unsupported Engram row geometry");
         try {
@@ -172,9 +172,10 @@ public:
             ck(cudaHostAlloc(&host_index_,cap*sizeof(int64_t),cudaHostAllocMapped));
             std::iota(host_index_,host_index_+cap,int64_t(0));
             ck(cudaHostGetDevicePointer(reinterpret_cast<void**>(&index_),host_index_,0));
+            lanes_.resize(nlanes);
             for (unsigned i=0;i<lanes_.size();++i) {
                 auto& l=lanes_[i];
-                const unsigned limit=i?8:Batch;
+                const unsigned limit=(i&1)?8:Batch;
                 const size_t maxrows=limit*cols;
                 ck(cudaMallocHost(&l.ids,maxrows*sizeof(int64_t)));
                 ck(cudaHostAlloc(&l.packed,maxrows*Width,cudaHostAllocMapped));

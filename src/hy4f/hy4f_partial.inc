@@ -74,8 +74,14 @@ void restore_full_mirrors(int pos) {
                 const int last=(pos+S-1-owner)/S;
                 if (first>=last) continue;
                 const int base=replica_row_base(owner,s.g,0,full_stride());
-                HY_CK(cudaMemcpyPeerAsync(s.full_mirror[i]+(size_t)(base+first)*KV_RB,s.dev,
-                         sh[owner].kv.at(il)+(size_t)first*KV_RB,sh[owner].dev,(size_t)(last-first)*KV_RB,s.st));
+                if (p2p_ok)
+                    HY_CK(cudaMemcpyPeerAsync(s.full_mirror[i]+(size_t)(base+first)*KV_RB, s.dev,
+                                              sh[owner].kv.at(il)+(size_t)first*KV_RB, sh[owner].dev,
+                                              (size_t)(last-first)*KV_RB, s.st));
+                else
+                    peer_stage_copy(s.full_mirror[i]+(size_t)(base+first)*KV_RB, s.dev,
+                                    sh[owner].kv.at(il)+(size_t)first*KV_RB, sh[owner].dev,
+                                    (size_t)(last-first)*KV_RB);
             }
         }
         HY_CK(cudaStreamSynchronize(s.st));
