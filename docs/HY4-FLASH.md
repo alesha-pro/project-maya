@@ -51,6 +51,7 @@ hf download alesha-pro/Hy4-flash-Uncensored-GGUF --exclude "Hy4-flash-Q3_K-*" --
 |---|---|
 | 4x 24 GB | `hy4f-4gpu.json` |
 | 2x 24 GB, 160 GB RAM | `hy4f-2gpu.json` |
+| 2x 24 GB without P2P and an NVMe drive (about 61 GiB RSS measured) | `hy4f-2gpu-iq2-nvme.json` |
 | 1x 24 GB, 160 GB RAM | `hy4f-1gpu.json` |
 | 1x 24 GB, 64 GB RAM and an NVMe drive | `hy4f-1gpu-iq2-nvme.json` |
 
@@ -119,11 +120,28 @@ Context 262144, Q8 KV cache, MTP with 2 or 3 drafts. Tokens per second.
 | Decode | 95 to 123 | 58 | 54 to 68 |
 | Prefill, 49K to 57K prompt | 1999 | 1534 | 1184 to 1199 |
 
+### Two GPUs without P2P
+
+A board whose chipset reports CNS for P2P (for example a Xeon E5 v4 / C612 with two RTX 3090s) can still use both cards. The engine checks `cudaDeviceCanAccessPeer` at load. With P2P it keeps the device wire buffers and `EnablePeerAccess`; without it the exchange buffers move to `cudaHostAlloc(Mapped|Portable)` and the KV mirror restores stage through pinned host memory.
+
+Verified on: Ubuntu, 2x RTX 3090 (`nvidia-smi topo -p2p` = CNS), Xeon E5-2696 v4, 126 GB DDR4-2400, IQ2_XXS trunk, 262144 context, Engram on NVMe, thinking off.
+
+| Run | tok/s |
+|---|---:|
+| first answer | 54.6 to 65.2 |
+| warmed | 79.5 |
+| warmed | 87.3 |
+| warmed | 95.3 |
+| warmed | 100.0 |
+
+RSS is about 61 GiB. Only two GPUs and the IQ2_XXS set were tested this way, and long-prompt prefill was not benchmarked.
+
 | RAM pinned by the server | |
 |---|---:|
 | 1 or 2 GPUs, Q3_K | 137 GiB |
 | 1 GPU, Q3_K, Engram on NVMe | 78 GiB |
 | 1 GPU, IQ2, Engram on NVMe | 45 GiB (runs under a 56 GiB limit) |
+| 2 GPUs without P2P, IQ2, Engram on NVMe | about 61 GiB RSS |
 
 Quality against the 4 GPU base, 512 teacher-forced positions of long text:
 
@@ -170,6 +188,7 @@ On 1 and 2 cards decode speed depends on how many picked experts are already in 
 ## Limits
 
 * Tested on RTX 3090s only, with 1, 2 or 4 cards.
+* Two cards without P2P were tested with IQ2_XXS and Engram on NVMe only; the host-mapped transport adds PCIe latency, and long-prompt prefill was not benchmarked.
 * 2 cards don't have the big prefill chunk of the 1 card path yet, so their prefill is slower.
 * On 1 card a prompt extension of 130 to a few thousand tokens costs 2.4 to 6 s; turns up to 128 tokens skip that. Only about 0.5 GiB of VRAM stays free.
 * The vector turns off a few fused kernels, so decode with it may run a few percent slower.
