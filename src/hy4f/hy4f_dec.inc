@@ -335,14 +335,14 @@ void dec_alloc(Shard& s, DShard& d) {
         // can wrap even when only one width has been running for a long time.
         const size_t extra = ar_ll4 && E % 4 == 0 ? (size_t)S * E * (3+4)
                            : ar_ll3 && E % 3 == 0 ? (size_t)S * (E/3) * (3+4) * 2 : 0;
-        d.ar_buf[p] = dalloc((size_t) S * DT * E + extra);
-        d.cb_buf[p] = dalloc((size_t) S * DT * (Hd / S) * CBW());
+        d.ar_buf[p] = wall((size_t) S * DT * E + extra);
+        d.cb_buf[p] = wall((size_t) S * DT * (Hd / S) * CBW());
     }
-    d.ar_flag = ia(4);
+    d.ar_flag = wall_i(4);
     d.ysc = dalloc((size_t) DT * E);
     d.tpart = dalloc((size_t) DT * 16 * 32);
     d.tppost = dalloc((size_t) DT * 4);
-    d.cb_flag = ia(std::getenv("HY4F_HEAD_SEND") ? 4+DT*Hd : 4);
+    d.cb_flag = wall_i(std::getenv("HY4F_HEAD_SEND") ? 4+DT*Hd : 4);
     d.ar_ctr = ia(ar_ll3 || ar_ll4 ? 3 : 1);
     if (ar_ll4 && E % 4 == 0) {
         const size_t bytes = (size_t)(E/4) * (3+4) * 2;
