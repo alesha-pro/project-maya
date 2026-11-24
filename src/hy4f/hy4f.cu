@@ -223,6 +223,9 @@ struct Model::Impl {
     std::vector<int64_t> eg_map;
     int eg_ngram = 3, eg_heads = 8, eg_D = 96, eg_pad = 0;
     uint8_t* eg_table = nullptr;
+    void* eg_reg = nullptr;       // cudaHostRegister base to unregister in ~Impl
+    void* eg_mmap = nullptr;      // anonymous writable copy when read-only pinning is unsupported
+    size_t eg_mmap_bytes = 0;
     std::unique_ptr<EngramDisk> eg_disk;
     int S = 4;
     std::vector<int> ebound;   // shard g owns the experts [ebound[g], ebound[g+1])
@@ -1298,11 +1301,25 @@ struct Model::Impl {
         std::fclose(f);
     }
 
-    void load_engram(int device) {
+    static bool host_register_ro_supported(const std::vector<int>& devs) {
+        if (devs.empty()) return false;
+        for (int dev : devs) {
+            int supported = 0;
+            if (cudaDeviceGetAttribute(&supported, cudaDevAttrHostRegisterReadOnlySupported, dev) != cudaSuccess) {
+                (void) cudaGetLastError();
+                return false;
+            }
+            if (!supported) return false;
+        }
+        return true;
+    }
+
+    void load_engram(const std::vector<int>& devs) {
         const strata::GgufFile* f = nullptr;
         const strata::TensorInfo* t = T("per_layer_token_embd.weight", &f);
         if ((int) t->type != T_F8) throw std::runtime_error("hy4f: Engram table is not F8_E4M3");
         const size_t bytes = (size_t) t->shape[0] * (size_t) t->shape[1];
+        if (bytes == 0) throw std::runtime_error("hy4f: empty Engram table");
         const char* mode = std::getenv("HY4F_ENGRAM_IO");
         if (mode && std::strcmp(mode,"ram") != 0) {
             if (std::strcmp(mode,"direct") != 0) throw std::runtime_error("HY4F_ENGRAM_IO expects ram or direct");
@@ -1310,15 +1327,63 @@ struct Model::Impl {
             const uint64_t start = f->data_start() + t->offset;
             if (start > f->file_size() || bytes > f->file_size()-start || int(t->shape[0]) != eg_D)
                 throw std::runtime_error("invalid GGUF Engram tensor");
-            eg_disk = std::make_unique<EngramDisk>(f->path(), start, t->shape[1], eg_D, (eg_ngram-1)*eg_heads, device);
+            eg_disk = std::make_unique<EngramDisk>(f->path(), start, t->shape[1], eg_D, (eg_ngram-1)*eg_heads, devs.front());
             return;
         }
+        HY_CK(cudaSetDevice(devs.front()));
         const uint8_t* src = f->tensor_data(*t);
         const uintptr_t pg = 4096, a0 = reinterpret_cast<uintptr_t>(src) & ~(pg - 1);
         const size_t len = ((reinterpret_cast<uintptr_t>(src) + bytes + pg - 1) & ~(pg - 1)) - a0;
-        HY_CK(cudaHostRegister(reinterpret_cast<void*>(a0), len,
-                               cudaHostRegisterMapped | cudaHostRegisterPortable | cudaHostRegisterReadOnly));
-        eg_table = const_cast<uint8_t*>(src);
+        if (host_register_ro_supported(devs)) {
+            const cudaError_t e = cudaHostRegister(
+                reinterpret_cast<void*>(a0), len,
+                cudaHostRegisterMapped | cudaHostRegisterPortable | cudaHostRegisterReadOnly);
+            if (e == cudaSuccess) {
+                eg_reg = reinterpret_cast<void*>(a0);
+                eg_table = const_cast<uint8_t*>(src);
+                return;
+            }
+            if (e != cudaErrorNotSupported)
+                throw std::runtime_error(std::string("cudaHostRegister(engram, read-only): ") + cudaGetErrorString(e));
+            (void) cudaGetLastError();
+        }
+        // Read-only host pinning is unsupported on this GPU/driver stack (e.g. GeForce / open KMD):
+        // copy into writable page-aligned host RAM and pin without cudaHostRegisterReadOnly.
+        const size_t map_len = (bytes + pg - 1) & ~(pg - 1);
+        void* buf = mmap(nullptr, map_len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (buf == MAP_FAILED) throw std::runtime_error("hy4f: mmap of the Engram table failed");
+        try {
+            const int workers = 8;
+            const size_t chunk = std::max<size_t>(pg, ((bytes / (size_t) workers) + pg - 1) & ~(pg - 1));
+            std::vector<std::thread> th;
+            th.reserve(workers);
+            try {
+                for (int w = 0; w < workers; ++w) {
+                    const size_t p0 = std::min(bytes, (size_t) w * chunk);
+                    const size_t p1 = w + 1 == workers ? bytes : std::min(bytes, (size_t) (w + 1) * chunk);
+                    if (p1 > p0)
+                        th.emplace_back([=] { std::memcpy(static_cast<uint8_t*>(buf) + p0, src + p0, p1 - p0); });
+                }
+            } catch (...) {
+                for (auto& t_i : th)
+                    if (t_i.joinable()) t_i.join();
+                throw;
+            }
+            for (auto& t_i : th) t_i.join();
+            const uintptr_t d0 = (reinterpret_cast<uintptr_t>(src) + pg - 1) & ~(pg - 1);
+            const uintptr_t d1 = (reinterpret_cast<uintptr_t>(src) + bytes) & ~(pg - 1);
+            if (d1 > d0) madvise(reinterpret_cast<void*>(d0), d1 - d0, MADV_DONTNEED);
+            HY_CK(cudaHostRegister(buf, map_len, cudaHostRegisterMapped | cudaHostRegisterPortable));
+        } catch (...) {
+            munmap(buf, map_len);
+            throw;
+        }
+        eg_mmap = buf;
+        eg_mmap_bytes = map_len;
+        eg_reg = buf;
+        eg_table = static_cast<uint8_t*>(buf);
+        std::fprintf(stderr, "hy4f: Engram read-only pinning unsupported; copied %.2f GiB to writable pinned RAM\n",
+                     bytes / 1073741824.0);
     }
 
     void load_shard(Shard& s) {
@@ -1887,6 +1952,16 @@ struct Model::Impl {
             if (b.ag_complete) cudaEventDestroy(b.ag_complete);
             cudaStreamDestroy(b.ag_compute);
         }
+        if (eg_reg) {
+            cudaHostUnregister(eg_reg);
+            (void) cudaGetLastError();
+            eg_reg = nullptr;
+        }
+        if (eg_mmap) {
+            munmap(eg_mmap, eg_mmap_bytes);
+            eg_mmap = nullptr;
+            eg_mmap_bytes = 0;
+        }
     }
 
 #include "hy4f_batch.inc"
@@ -1937,7 +2012,7 @@ bool Model::load(const Options& o, std::string& err) {
         d.load_draft_experts(std::getenv("HY4F_MTP_EXPERT_GGUF"), false);
         d.load_draft_experts(std::getenv("HY4F_MTP_DOWN_GGUF"), true);
         d.load_trunk_experts(std::getenv("HY4F_EXPERT_GGUF"));
-        d.load_engram(devs.front());
+        d.load_engram(devs);
         HY_CK(cudaHostAlloc((void**) &d.hio, sizeof(Io), cudaHostAllocPortable));
         HY_CK(cudaHostAlloc((void**) &d.hlogits, sizeof(float) * d.V, cudaHostAllocPortable));
         {
